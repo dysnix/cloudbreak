@@ -38,6 +38,7 @@ pub struct CloudbreakRpcState {
     pub vote_accounts_supported: bool,
     pub stakes_cache: SharedStakesSnapshot,
     pub max_multiple_accounts: usize,
+    pub simulation_supported: bool,
 }
 
 impl CloudbreakRpcState {
@@ -57,6 +58,7 @@ impl CloudbreakRpcState {
         vote_accounts_supported: bool,
         stakes_cache: SharedStakesSnapshot,
         max_multiple_accounts: usize,
+        simulation_supported: bool,
     ) -> Self {
         Self {
             database,
@@ -73,6 +75,7 @@ impl CloudbreakRpcState {
             vote_accounts_supported,
             stakes_cache,
             max_multiple_accounts,
+            simulation_supported,
         }
     }
 }

@@ -237,6 +237,8 @@ pub async fn save_block(
     )
     .await;
 
+    db_queries::insert_recent_blockhash(slot, block.blockhash.clone(), db, &config).await;
+
     let elapsed = start_time.elapsed().as_secs_f64();
     metrics::record_block_processing(elapsed, "block");
 }

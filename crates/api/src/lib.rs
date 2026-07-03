@@ -85,6 +85,9 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     // Setup optional module cache
     let gpa_processor = GpaProcessor::new(config.gpa_cache.clone());
 
+    let simulation_supported = indexer_filter.supports_simulation();
+    info!("simulateTransaction: supported: {}", simulation_supported);
+
     let vote_accounts_supported = indexer_filter.supports_vote_accounts();
     let stakes_cache: vote_accounts_cache::SharedStakesSnapshot = Arc::new(RwLock::new(Arc::new(
         vote_accounts_cache::StakesSnapshot::empty(),
@@ -133,6 +136,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         vote_accounts_supported,
         stakes_cache,
         max_multiple_accounts,
+        simulation_supported,
     );
 
     info!("Server is starting...");

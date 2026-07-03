@@ -18,6 +18,7 @@ pub mod get_token_account_balance;
 pub mod mint;
 pub mod mint_accounts;
 pub mod program;
+pub mod simulate_transaction;
 pub mod slot;
 pub mod token;
 pub mod version;
