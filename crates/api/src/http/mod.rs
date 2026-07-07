@@ -9,13 +9,20 @@ use crate::modules::cache::GpaProcessor;
 use crate::modules::vote_accounts_cache::SharedStakesSnapshot;
 use crate::query_tracker_client::QueryTrackerClient;
 use crate::slot_syncronizer::SlotSyncronizerData;
+use agave_feature_set::FeatureSet;
 use hyper::StatusCode;
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use solana_rpc_client_api::response::Response as RpcResponse;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use cloudbreak_core::{AccountSelectorConfig, ProcessedCommitmentBehavior};
+
+#[derive(Clone)]
+pub struct CachedFeatureSet {
+    pub set: Arc<FeatureSet>,
+    pub built_at: Instant,
+}
 
 pub mod operational_endpoints;
 pub mod rpc;
@@ -39,6 +46,7 @@ pub struct CloudbreakRpcState {
     pub stakes_cache: SharedStakesSnapshot,
     pub max_multiple_accounts: usize,
     pub simulation_supported: bool,
+    pub feature_set_cache: Arc<RwLock<Option<CachedFeatureSet>>>,
 }
 
 impl CloudbreakRpcState {
@@ -76,6 +84,7 @@ impl CloudbreakRpcState {
             stakes_cache,
             max_multiple_accounts,
             simulation_supported,
+            feature_set_cache: Arc::new(RwLock::new(None)),
         }
     }
 }

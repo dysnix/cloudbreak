@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
-use agave_feature_set::FeatureSet;
+use agave_feature_set::{FEATURE_NAMES, FeatureSet};
 use agave_syscalls::create_program_runtime_environment_v1;
 use base64::Engine as _;
 use rust_decimal::prelude::ToPrimitive;
@@ -55,7 +56,7 @@ use cloudbreak_entity::slots;
 
 use crate::db_query;
 use crate::error::RpcError;
-use crate::http::CloudbreakRpcState;
+use crate::http::{CachedFeatureSet, CloudbreakRpcState};
 
 /// Default cluster lamports-per-signature
 const LAMPORTS_PER_SIGNATURE: u64 = 5000;
@@ -166,7 +167,8 @@ pub async fn simulate_transaction(
         (None, LAMPORTS_PER_SIGNATURE, false)
     };
 
-    let feature_set = FeatureSet::all_enabled();
+    // Real cluster feature set, not all_enabled(): the latter enables gates mainnet hasn't (e.g. direct mapping) and diverges from mainnet.
+    let feature_set = active_feature_set(state, slot).await?.as_ref().clone();
     let bank = SimulationBank::new(fetched, feature_set.clone());
 
     let compute_budget_limits = match process_compute_budget_instructions(
@@ -212,6 +214,66 @@ pub async fn simulate_transaction(
         slot,
     )?;
     Ok(response(slot, value))
+}
+
+const FEATURE_SET_TTL: Duration = Duration::from_secs(120);
+
+// Feature program id as raw bytes (avoids a cross-crate Pubkey version mismatch).
+const FEATURE_PROGRAM_ID: [u8; 32] = [
+    3, 192, 160, 205, 203, 6, 210, 218, 239, 174, 130, 209, 111, 238, 122, 207, 97, 236, 115, 123,
+    35, 72, 27, 33, 148, 106, 118, 112, 0, 0, 0, 0,
+];
+
+// Mirrors Bank::compute_active_feature_set; requires the full unfiltered index.
+async fn active_feature_set(
+    state: &CloudbreakRpcState,
+    slot: Slot,
+) -> Result<Arc<FeatureSet>, RpcError> {
+    // Scoped so the read guard is dropped before the await below.
+    {
+        let guard = state.feature_set_cache.read().unwrap();
+        if let Some(cached) = guard.as_ref()
+            && cached.built_at.elapsed() < FEATURE_SET_TTL
+        {
+            return Ok(cached.set.clone());
+        }
+    }
+
+    let feature_set = Arc::new(build_active_feature_set(state, slot).await?);
+    *state.feature_set_cache.write().unwrap() = Some(CachedFeatureSet {
+        set: feature_set.clone(),
+        built_at: Instant::now(),
+    });
+    Ok(feature_set)
+}
+
+async fn build_active_feature_set(
+    state: &CloudbreakRpcState,
+    slot: Slot,
+) -> Result<FeatureSet, RpcError> {
+    let feature_ids: Vec<Pubkey> = FEATURE_NAMES.keys().copied().collect();
+    let accounts = fetch_accounts(state, slot, &feature_ids).await?;
+
+    let mut feature_set = FeatureSet::default();
+    for (feature_id, (account, _account_slot)) in &accounts {
+        if account.owner().to_bytes() != FEATURE_PROGRAM_ID {
+            continue;
+        }
+        if let Some(activated_at) = parse_feature_activated_at(account.data())
+            && activated_at <= slot
+        {
+            feature_set.activate(feature_id, activated_at);
+        }
+    }
+    Ok(feature_set)
+}
+
+// Feature account `activated_at`: bincode `Option<u64>` — 1 tag byte, then LE slot.
+fn parse_feature_activated_at(data: &[u8]) -> Option<u64> {
+    if data.len() < 9 || data[0] == 0 {
+        return None;
+    }
+    Some(u64::from_le_bytes(data[1..9].try_into().ok()?))
 }
 
 async fn resolve_slot(
