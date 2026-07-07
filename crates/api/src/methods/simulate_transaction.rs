@@ -21,7 +21,9 @@ use solana_loader_v3_interface::state::UpgradeableLoaderState;
 use solana_message::v0::{LoadedAddresses, MessageAddressTableLookup};
 use solana_message::{AddressLoader, VersionedMessage};
 use solana_precompile_error::PrecompileError;
-use solana_program_runtime::execution_budget::SVMTransactionExecutionBudget;
+use solana_program_runtime::execution_budget::{
+    SVMTransactionExecutionBudget, SVMTransactionExecutionCost,
+};
 use solana_program_runtime::loaded_programs::{
     BlockRelation, ForkGraph, ProgramCacheEntry, ProgramRuntimeEnvironments,
 };
@@ -186,7 +188,7 @@ pub async fn simulate_transaction(
     let budget_and_limits = compute_budget_limits.get_compute_budget_and_limits(
         compute_budget_limits.loaded_accounts_bytes,
         fee_details,
-        false,
+        feature_set.is_active(&agave_feature_set::raise_cpi_nesting_limit_to_8::id()),
     );
 
     let check_result: TransactionCheckResult = if runnable {
@@ -831,10 +833,12 @@ fn execute(
     check_result: TransactionCheckResult,
 ) -> Result<LoadAndExecuteSanitizedTransactionsOutput, RpcError> {
     let svm_feature_set = feature_set.runtime_features();
+    let simd_0268 = feature_set.is_active(&agave_feature_set::raise_cpi_nesting_limit_to_8::id());
+    let simd_0339 = feature_set.is_active(&agave_feature_set::increase_cpi_account_info_limit::id());
 
     let program_runtime_v1 = create_program_runtime_environment_v1(
         &svm_feature_set,
-        &SVMTransactionExecutionBudget::new_with_defaults(false),
+        &SVMTransactionExecutionBudget::new_with_defaults(simd_0268),
         false,
         false,
     )
@@ -846,6 +850,7 @@ fn execute(
     let fork_graph = Arc::new(RwLock::new(SimulationForkGraph));
     let mut processor =
         TransactionBatchProcessor::<SimulationForkGraph>::new_uninitialized(slot, epoch);
+    processor.set_execution_cost(SVMTransactionExecutionCost::new_with_defaults(simd_0339));
     {
         let mut cache = processor.global_program_cache.write().unwrap();
         cache.set_fork_graph(Arc::downgrade(&fork_graph));
