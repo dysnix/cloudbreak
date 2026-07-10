@@ -181,6 +181,7 @@ pub fn compare_responses(
         RequestType::GetBalance | RequestType::GetTokenAccountBalance => {
             compare_value_direct(response1, response2)
         }
+        RequestType::SimulateTransaction => compare_simulate_responses(response1, response2),
     };
 
     CompareResponsesResult::new_with_matching_context(matches, compare_context_result)
@@ -192,6 +193,82 @@ fn compare_value_direct(response1: &JsonValue, response2: &JsonValue) -> bool {
     let v1 = response1.get("result").and_then(|r| r.get("value"));
     let v2 = response2.get("result").and_then(|r| r.get("value"));
     v1 == v2
+}
+
+static NULL_VALUE: JsonValue = JsonValue::Null;
+
+fn field<'a>(value: &'a JsonValue, key: &str) -> &'a JsonValue {
+    value.get(key).unwrap_or(&NULL_VALUE)
+}
+
+const SIMULATE_EXACT_FIELDS: [&str; 9] = [
+    "err",
+    "logs",
+    "unitsConsumed",
+    "loadedAccountsDataSize",
+    "returnData",
+    "fee",
+    "loadedAddresses",
+    "innerInstructions",
+    "accounts",
+];
+
+fn token_balance_map(balances: &JsonValue) -> Option<HashMap<String, &JsonValue>> {
+    let array = balances.as_array()?;
+    Some(
+        array
+            .iter()
+            .map(|b| {
+                let key = format!(
+                    "{}:{}",
+                    field(b, "accountIndex"),
+                    field(b, "mint"),
+                );
+                (key, b)
+            })
+            .collect(),
+    )
+}
+
+fn compare_token_balances(value1: &JsonValue, value2: &JsonValue, key: &str) -> bool {
+    let b1 = field(value1, key);
+    let b2 = field(value2, key);
+
+    match (token_balance_map(b1), token_balance_map(b2)) {
+        (Some(m1), Some(m2)) => m1 == m2,
+        (None, None) => b1 == b2,
+        _ => false,
+    }
+}
+
+fn compare_simulate_responses(response1: &JsonValue, response2: &JsonValue) -> bool {
+    let v1 = response1.get("result").and_then(|r| r.get("value"));
+    let v2 = response2.get("result").and_then(|r| r.get("value"));
+
+    let (v1, v2) = match (v1, v2) {
+        (Some(v1), Some(v2)) => (v1, v2),
+        _ => return v1 == v2,
+    };
+
+    if SIMULATE_EXACT_FIELDS
+        .iter()
+        .any(|key| field(v1, key) != field(v2, key))
+    {
+        return false;
+    }
+
+    if field(v1, "replacementBlockhash").is_null() != field(v2, "replacementBlockhash").is_null() {
+        return false;
+    }
+
+    if field(v1, "preBalances") != field(v2, "preBalances")
+        || field(v1, "postBalances") != field(v2, "postBalances")
+    {
+        return false;
+    }
+
+    compare_token_balances(v1, v2, "preTokenBalances")
+        && compare_token_balances(v1, v2, "postTokenBalances")
 }
 
 /// Compares two `result.value: UiAccount | null` responses (`getAccountInfo`).

@@ -15,7 +15,7 @@ use anyhow::Result;
 use clap::ValueEnum;
 use serde_json::Value as JsonValue;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
@@ -32,6 +32,7 @@ pub enum RequestType {
     GetMultipleAccounts,
     GetBalance,
     GetTokenAccountBalance,
+    SimulateTransaction,
 }
 
 pub async fn run(args: &BenchmarkArgs) -> Result<()> {
@@ -60,10 +61,12 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
         max_in_flight,
         duration_secs,
         timeout_secs,
+        start_on_first_request,
     } = benchmark;
 
     let retry_with_context = source.retry_with_context();
-    let requests_rx = sources::load_requests_from_source(&source, request_type).await?;
+    let replay_once = source.replay_once();
+    let mut requests_rx = sources::load_requests_from_source(&source, request_type).await?;
 
     let client = reqwest::Client::builder()
         // .pool_max_idle_per_host(0)
@@ -104,15 +107,33 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
 
     // Spawner loop (runs for `duration` seconds)
     tokio::spawn(async move {
-        let deadline = Instant::now() + Duration::from_secs(duration_secs);
+        let mut deadline = (!start_on_first_request)
+            .then(|| Instant::now() + Duration::from_secs(duration_secs));
         let mut idx: usize = 0;
+        let mut pending: VecDeque<serde_json::Value> = VecDeque::new();
+        let mut drained_initial = false;
 
         // Will make the requests loop infinitely until the deadline is reached
-        while Instant::now() < deadline {
+        loop {
+            if let Some(deadline) = deadline
+                && Instant::now() >= deadline
+            {
+                break;
+            }
             ticker.tick().await;
             let permit = semaphore.clone().try_acquire_owned();
 
-            let request = {
+            let request = if replay_once {
+                if pending.is_empty() && (!drained_initial || requests_rx.has_changed().unwrap_or(false))
+                {
+                    drained_initial = true;
+                    pending.extend(requests_rx.borrow_and_update().iter().cloned());
+                }
+                match pending.pop_front() {
+                    Some(req) => req,
+                    None => continue,
+                }
+            } else {
                 let requests = requests_rx.borrow();
                 if requests.is_empty() {
                     continue;
@@ -122,6 +143,14 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
 
                 req
             };
+
+            if deadline.is_none() {
+                tracing::info!(
+                    target: "bench_source",
+                    "First request picked up; starting {}s countdown", duration_secs
+                );
+                deadline = Some(Instant::now() + Duration::from_secs(duration_secs));
+            }
 
             match permit {
                 Ok(permit) => {

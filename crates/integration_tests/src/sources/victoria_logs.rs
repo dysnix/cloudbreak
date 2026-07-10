@@ -8,21 +8,31 @@ use serde_json::Value as JsonValue;
 use crate::benchmark::RequestType;
 use crate::utils;
 
+pub struct LoggedRequest {
+    pub req_id: Option<String>,
+    pub body: JsonValue,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn get_body_query(
     request_type: RequestType,
     min_filter: &str,
     max_filter: &str,
     encoding: Option<&str>,
     minutes: Option<u32>,
+    window_seconds: Option<u32>,
     limit: u32,
 ) -> String {
     let encoding_filter = encoding
         .map(|e| format!(r#" AND body:~`"encoding":\s*"{}"`"#, e))
         .unwrap_or_default();
 
-    let time_filter = minutes
-        .map(|m| format!("_time:>now-{m}m AND _time:<=now-{}m AND ", m - 1))
-        .unwrap_or_default();
+    let time_filter = match window_seconds {
+        Some(s) => format!("_time:>now-{s}s AND "),
+        None => minutes
+            .map(|m| format!("_time:>now-{m}m AND _time:<=now-{}m AND ", m - 1))
+            .unwrap_or_default(),
+    };
 
     match request_type {
         RequestType::Gtabo => format!(
@@ -52,6 +62,9 @@ pub fn get_body_query(
         RequestType::GetTokenAccountBalance => format!(
             "query={time_filter}rpc_call:=\"getTokenAccountBalance\" AND pool_dedicated:~\"liquid\" | limit {limit}"
         ),
+        RequestType::SimulateTransaction => format!(
+            "query={time_filter}rpc_call:=\"simulateTransaction\" AND pool_dedicated:~\"foundation\" AND body:* | limit {limit}"
+        ),
     }
 }
 
@@ -64,8 +77,9 @@ pub async fn get_requests(
     max_request_size: Option<u64>,
     encoding: Option<&str>,
     minutes: Option<u32>,
+    window_seconds: Option<u32>,
     limit: u32,
-) -> Result<Vec<JsonValue>, anyhow::Error> {
+) -> Result<Vec<LoggedRequest>, anyhow::Error> {
     let min_filter = if let Some(min_request_size) = min_request_size {
         format!(" AND bytes:>{}", min_request_size)
     } else {
@@ -84,6 +98,7 @@ pub async fn get_requests(
         &max_filter,
         encoding,
         minutes,
+        window_seconds,
         limit,
     );
 
@@ -97,7 +112,7 @@ pub async fn get_requests(
     let data = response.text().await?;
 
     // Parse NDJSON (Newline Delimited JSON)
-    let logs: Vec<JsonValue> = data
+    let logs: Vec<LoggedRequest> = data
         .trim()
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -114,6 +129,7 @@ pub async fn get_requests(
                 return None;
             }
 
+            let req_id = log["req_id"].as_str().map(String::from);
             let mut body: JsonValue = serde_json::from_str(log["body"].as_str().unwrap()).ok()?;
 
             if request_type == RequestType::GpaTokenMint
@@ -161,7 +177,7 @@ pub async fn get_requests(
                 }
             }
 
-            Some(body)
+            Some(LoggedRequest { req_id, body })
         })
         .collect();
 

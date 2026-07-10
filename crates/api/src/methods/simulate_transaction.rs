@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -62,8 +63,7 @@ use crate::http::{CachedFeatureSet, CloudbreakRpcState};
 
 /// Default cluster lamports-per-signature
 const LAMPORTS_PER_SIGNATURE: u64 = 5000;
-/// Cap on captured log bytes, mirroring Agave's simulation default.
-const LOG_MESSAGES_BYTES_LIMIT: usize = 100 * 1000;
+const MAX_PROCESSING_AGE: u64 = 150;
 
 #[tracing::instrument(name = "simtx_rpc", skip_all)]
 pub async fn simulate_transaction(
@@ -88,7 +88,7 @@ pub async fn simulate_transaction(
 
     let encoding = config.encoding.unwrap_or(UiTransactionEncoding::Base58);
     let tx_bytes = decode_transaction(&transaction, encoding)?;
-    let versioned_tx: VersionedTransaction = bincode::deserialize(&tx_bytes).map_err(|e| {
+    let mut versioned_tx: VersionedTransaction = bincode::deserialize(&tx_bytes).map_err(|e| {
         RpcError::InvalidParamsWithMessage(format!("failed to deserialize transaction: {e}"))
     })?;
 
@@ -98,10 +98,52 @@ pub async fn simulate_transaction(
         ));
     }
 
-    let recent_blockhash = *versioned_tx.message.recent_blockhash();
-    let env_blockhash = Hash::new_from_array(recent_blockhash.to_bytes());
+    let requested_addresses: Vec<Pubkey> = match &config.accounts {
+        Some(accounts_config) => {
+            let encoding = accounts_config.encoding.unwrap_or(UiAccountEncoding::Base64);
+            if matches!(
+                encoding,
+                UiAccountEncoding::Binary | UiAccountEncoding::Base58
+            ) {
+                return Err(RpcError::InvalidParamsWithMessage(
+                    "base58 encoding not supported".to_string(),
+                ));
+            }
+            accounts_config
+                .addresses
+                .iter()
+                .map(|addr| {
+                    addr.parse::<Pubkey>().map_err(|e| {
+                        RpcError::InvalidParamsWithMessage(format!("invalid account address: {e}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        None => Vec::new(),
+    };
+
+    let original_blockhash = *versioned_tx.message.recent_blockhash();
 
     let slot = resolve_slot(state, &config).await?;
+
+    let tip = latest_blockhash(state, slot).await?;
+    let replacement_blockhash = if config.replace_recent_blockhash {
+        let (hash, block_height) = tip.ok_or(RpcError::InternalError)?;
+        versioned_tx
+            .message
+            .set_recent_blockhash(hash.to_bytes().into());
+        Some(RpcBlockhash {
+            blockhash: hash.to_string(),
+            last_valid_block_height: block_height.saturating_add(MAX_PROCESSING_AGE),
+        })
+    } else {
+        None
+    };
+
+    let env_blockhash = match tip {
+        Some((hash, _)) => hash,
+        None => Hash::new_from_array(original_blockhash.to_bytes()),
+    };
 
     let address_table_lookups: Vec<MessageAddressTableLookup> = match &versioned_tx.message {
         VersionedMessage::V0(m) => m.address_table_lookups.clone(),
@@ -111,21 +153,25 @@ pub async fn simulate_transaction(
     let tables = fetch_lookup_tables(state, slot, &table_keys).await?;
     let address_loader = SimulationAddressLoader::new(tables);
 
-    // Resolve ALT addresses for the response's `loadedAddresses` (None for legacy).
-    let loaded_addresses = if address_table_lookups.is_empty() {
-        None
-    } else {
-        address_loader
-            .clone()
-            .load_addresses(&address_table_lookups)
-            .ok()
-            .map(|la| UiLoadedAddresses {
-                writable: la.writable.iter().map(|p| p.to_string()).collect(),
-                readonly: la.readonly.iter().map(|p| p.to_string()).collect(),
-            })
-    };
+    let loaded_addresses = address_loader
+        .clone()
+        .load_addresses(&address_table_lookups)
+        .map(|la| UiLoadedAddresses {
+            writable: la.writable.iter().map(|p| p.to_string()).collect(),
+            readonly: la.readonly.iter().map(|p| p.to_string()).collect(),
+        })
+        .unwrap_or_else(|_| UiLoadedAddresses {
+            writable: Vec::new(),
+            readonly: Vec::new(),
+        });
 
-    let reserved_keys: HashSet<Pubkey> = HashSet::new();
+    // Real cluster feature set, not all_enabled(): the latter enables gates mainnet hasn't (e.g. direct mapping) and diverges from mainnet.
+    let feature_set = active_feature_set(state, slot).await?.as_ref().clone();
+
+    let mut reserved = agave_reserved_account_keys::ReservedAccountKeys::default();
+    reserved.update_active_set(&feature_set);
+    let reserved_keys: HashSet<Pubkey> = reserved.active;
+
     let sanitized_tx = SanitizedTransaction::try_create(
         versioned_tx,
         MessageHash::Compute,
@@ -135,6 +181,13 @@ pub async fn simulate_transaction(
     )
     .map_err(|e| RpcError::InvalidParamsWithMessage(format!("invalid transaction: {e}")))?;
 
+    if requested_addresses.len() > sanitized_tx.message().account_keys().len() {
+        return Err(RpcError::InvalidParamsWithMessage(
+            "Too many accounts provided; max is the number of accounts in the transaction"
+                .to_string(),
+        ));
+    }
+
     let mut account_keys: Vec<Pubkey> = sanitized_tx
         .message()
         .account_keys()
@@ -142,25 +195,22 @@ pub async fn simulate_transaction(
         .copied()
         .collect();
     account_keys.extend(sysvar_account_ids());
+    account_keys.extend(requested_addresses.iter().copied());
     let mut fetched = fetch_accounts(state, slot, &account_keys).await?;
-
-    if let Some(accounts_config) = &config.accounts
-        && accounts_config.addresses.len() > sanitized_tx.message().account_keys().len()
-    {
-        return Err(RpcError::InvalidParamsWithMessage(
-            "Too many accounts provided; max is the number of accounts in the transaction"
-                .to_string(),
-        ));
-    }
 
     let programdata_keys = programdata_addresses(&fetched);
     if !programdata_keys.is_empty() {
         fetched.extend(fetch_accounts(state, slot, &programdata_keys).await?);
     }
 
+    let fallback_accounts: HashMap<Pubkey, (AccountSharedData, Slot)> = requested_addresses
+        .iter()
+        .filter_map(|key| fetched.get(key).map(|entry| (*key, entry.clone())))
+        .collect();
+
     let nonce = resolve_nonce(&sanitized_tx, &fetched);
     let blockhash_recent = config.replace_recent_blockhash
-        || blockhash_is_recent(state, &recent_blockhash.to_string()).await?;
+        || blockhash_is_recent(state, slot, &original_blockhash.to_string()).await?;
     let (nonce_address, blockhash_lamports_per_signature, runnable) = if blockhash_recent {
         (None, LAMPORTS_PER_SIGNATURE, true)
     } else if let Some((address, lamports_per_signature)) = nonce {
@@ -169,8 +219,6 @@ pub async fn simulate_transaction(
         (None, LAMPORTS_PER_SIGNATURE, false)
     };
 
-    // Real cluster feature set, not all_enabled(): the latter enables gates mainnet hasn't (e.g. direct mapping) and diverges from mainnet.
-    let feature_set = active_feature_set(state, slot).await?.as_ref().clone();
     let bank = SimulationBank::new(fetched, feature_set.clone());
 
     let compute_budget_limits = match process_compute_budget_instructions(
@@ -178,13 +226,21 @@ pub async fn simulate_transaction(
         &feature_set,
     ) {
         Ok(limits) => limits,
-        Err(e) => return Ok(response(slot, error_only(e))),
+        Err(e) => {
+            return Ok(response(
+                slot,
+                error_only(e, &config, loaded_addresses, replacement_blockhash),
+            ));
+        }
     };
 
     let signature_fee = sanitized_tx
         .num_transaction_signatures()
         .saturating_mul(blockhash_lamports_per_signature);
-    let fee_details = FeeDetails::new(signature_fee, compute_budget_limits.get_prioritization_fee());
+    let fee_details = FeeDetails::new(
+        signature_fee,
+        compute_budget_limits.get_prioritization_fee(),
+    );
     let budget_and_limits = compute_budget_limits.get_compute_budget_and_limits(
         compute_budget_limits.loaded_accounts_bytes,
         fee_details,
@@ -192,16 +248,20 @@ pub async fn simulate_transaction(
     );
 
     let check_result: TransactionCheckResult = if runnable {
-        Ok(CheckedTransactionDetails::new(nonce_address, budget_and_limits))
+        Ok(CheckedTransactionDetails::new(
+            nonce_address,
+            budget_and_limits,
+        ))
     } else {
         Err(TransactionError::BlockhashNotFound)
     };
 
+    let epoch = solana_epoch_schedule::EpochSchedule::default().get_epoch(slot);
     let output = execute(
         &bank,
         &sanitized_tx,
         slot,
-        0,
+        epoch,
         env_blockhash,
         blockhash_lamports_per_signature,
         &feature_set,
@@ -212,8 +272,8 @@ pub async fn simulate_transaction(
         output,
         &config,
         loaded_addresses,
-        recent_blockhash.to_string(),
-        slot,
+        replacement_blockhash,
+        &fallback_accounts,
     )?;
     Ok(response(slot, value))
 }
@@ -311,12 +371,21 @@ async fn resolve_slot(
     Ok(slot)
 }
 
-async fn blockhash_is_recent(state: &CloudbreakRpcState, blockhash: &str) -> Result<bool, RpcError> {
+async fn blockhash_is_recent(
+    state: &CloudbreakRpcState,
+    slot: Slot,
+    blockhash: &str,
+) -> Result<bool, RpcError> {
     let pool = state.database.get_postgres_connection_pool();
     timeout(state.queries_timeout, async {
         sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM recent_blockhashes WHERE blockhash = $1)",
+            "SELECT EXISTS(SELECT 1 FROM \
+             (SELECT blockhash FROM recent_blockhashes WHERE slot <= $1 \
+              ORDER BY slot DESC LIMIT $2) recent \
+             WHERE recent.blockhash = $3)",
         )
+        .bind(slot as i64)
+        .bind(MAX_PROCESSING_AGE as i64)
         .bind(blockhash)
         .fetch_one(pool)
         .await
@@ -330,6 +399,41 @@ async fn blockhash_is_recent(state: &CloudbreakRpcState, blockhash: &str) -> Res
         tracing::error!(target: "simtx", "recent_blockhashes query error: {e}");
         RpcError::InternalError
     })
+}
+
+async fn latest_blockhash(
+    state: &CloudbreakRpcState,
+    slot: Slot,
+) -> Result<Option<(Hash, u64)>, RpcError> {
+    let pool = state.database.get_postgres_connection_pool();
+    let row = timeout(state.queries_timeout, async {
+        sqlx::query(
+            "SELECT blockhash, COALESCE(block_height, slot) AS height \
+             FROM recent_blockhashes WHERE slot <= $1 ORDER BY slot DESC LIMIT 1",
+        )
+        .bind(slot as i64)
+        .fetch_optional(pool)
+        .await
+    })
+    .await
+    .map_err(|_| {
+        tracing::error!(target: "simtx", "latest_blockhash query timed out");
+        RpcError::InternalError
+    })?
+    .map_err(|e| {
+        tracing::error!(target: "simtx", "latest_blockhash query error: {e}");
+        RpcError::InternalError
+    })?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let blockhash: String = row
+        .try_get("blockhash")
+        .map_err(|_| RpcError::InternalError)?;
+    let height: i64 = row.try_get("height").map_err(|_| RpcError::InternalError)?;
+    let hash = Hash::from_str(&blockhash).map_err(|_| RpcError::InternalError)?;
+    Ok(Some((hash, height as u64)))
 }
 
 fn resolve_nonce(
@@ -361,7 +465,10 @@ fn decode_transaction(data: &str, encoding: UiTransactionEncoding) -> Result<Vec
     }
 }
 
-fn response(slot: u64, value: RpcSimulateTransactionResult) -> RpcResponse<RpcSimulateTransactionResult> {
+fn response(
+    slot: u64,
+    value: RpcSimulateTransactionResult,
+) -> RpcResponse<RpcSimulateTransactionResult> {
     RpcResponse {
         context: RpcResponseContext {
             slot,
@@ -371,22 +478,30 @@ fn response(slot: u64, value: RpcSimulateTransactionResult) -> RpcResponse<RpcSi
     }
 }
 
-fn error_only(err: TransactionError) -> RpcSimulateTransactionResult {
+fn error_only(
+    err: TransactionError,
+    config: &RpcSimulateTransactionConfig,
+    loaded_addresses: UiLoadedAddresses,
+    replacement_blockhash: Option<RpcBlockhash>,
+) -> RpcSimulateTransactionResult {
     RpcSimulateTransactionResult {
         err: Some(err.into()),
-        logs: None,
-        accounts: None,
-        units_consumed: None,
-        loaded_accounts_data_size: None,
+        logs: Some(Vec::new()),
+        accounts: config
+            .accounts
+            .as_ref()
+            .map(|c| vec![None; c.addresses.len()]),
+        units_consumed: Some(0),
+        loaded_accounts_data_size: Some(0),
         return_data: None,
         inner_instructions: None,
-        replacement_blockhash: None,
+        replacement_blockhash,
         fee: None,
         pre_balances: None,
         post_balances: None,
         pre_token_balances: None,
         post_token_balances: None,
-        loaded_addresses: None,
+        loaded_addresses: Some(loaded_addresses),
     }
 }
 
@@ -394,9 +509,9 @@ fn error_only(err: TransactionError) -> RpcSimulateTransactionResult {
 fn map_result(
     output: LoadAndExecuteSanitizedTransactionsOutput,
     config: &RpcSimulateTransactionConfig,
-    loaded_addresses: Option<UiLoadedAddresses>,
-    recent_blockhash: String,
-    slot: u64,
+    loaded_addresses: UiLoadedAddresses,
+    replacement_blockhash: Option<RpcBlockhash>,
+    fallback_accounts: &HashMap<Pubkey, (AccountSharedData, Slot)>,
 ) -> Result<RpcSimulateTransactionResult, RpcError> {
     let (pre_balances, post_balances, pre_token_balances, post_token_balances) =
         extract_balances(output.balance_collector);
@@ -407,19 +522,22 @@ fn map_result(
         .next()
         .ok_or(RpcError::InternalError)?;
 
-    let replacement_blockhash = config.replace_recent_blockhash.then(|| RpcBlockhash {
-        blockhash: recent_blockhash,
-        last_valid_block_height: slot.saturating_add(150),
-    });
-
-    // On any failure Agave returns all-`None` for the requested accounts.
     let none_accounts = config
         .accounts
         .as_ref()
         .map(|c| vec![None; c.addresses.len()]);
 
     #[allow(clippy::type_complexity)]
-    let (err, logs, accounts, units_consumed, loaded_accounts_data_size, fee, return_data, inner_instructions): (
+    let (
+        err,
+        logs,
+        accounts,
+        units_consumed,
+        loaded_accounts_data_size,
+        fee,
+        return_data,
+        inner_instructions,
+    ): (
         Option<UiTransactionError>,
         Option<Vec<String>>,
         Option<Vec<Option<UiAccount>>>,
@@ -434,21 +552,33 @@ fn map_result(
             let err: Option<UiTransactionError> =
                 details.status.as_ref().err().cloned().map(Into::into);
             let logs = Some(details.log_messages.clone().unwrap_or_default());
-            let return_data = details.return_data.as_ref().map(|rd| UiTransactionReturnData {
-                program_id: rd.program_id.to_string(),
-                data: (
-                    base64::prelude::BASE64_STANDARD.encode(&rd.data),
-                    UiReturnDataEncoding::Base64,
-                ),
-            });
+            let return_data = details
+                .return_data
+                .as_ref()
+                .map(|rd| UiTransactionReturnData {
+                    program_id: rd.program_id.to_string(),
+                    data: (
+                        base64::prelude::BASE64_STANDARD.encode(&rd.data),
+                        UiReturnDataEncoding::Base64,
+                    ),
+                });
             let inner_instructions = config
                 .inner_instructions
-                .then(|| details.inner_instructions.as_ref().map(map_inner_instructions))
+                .then(|| {
+                    details
+                        .inner_instructions
+                        .as_ref()
+                        .map(map_inner_instructions)
+                })
                 .flatten();
             let accounts = if err.is_some() {
                 none_accounts
             } else {
-                build_requested_accounts(config, &executed.loaded_transaction.accounts)
+                build_requested_accounts(
+                    config,
+                    &executed.loaded_transaction.accounts,
+                    fallback_accounts,
+                )
             };
             (
                 err,
@@ -462,11 +592,13 @@ fn map_result(
             )
         }
         Ok(ProcessedTransaction::FeesOnly(fees)) => (
-            Some(UiTransactionError::from(TransactionError::clone(&fees.load_error))),
+            Some(UiTransactionError::from(TransactionError::clone(
+                &fees.load_error,
+            ))),
             Some(Vec::new()),
             none_accounts,
-            None,
-            None,
+            Some(0),
+            Some(fees.rollback_accounts.data_size() as u32),
             Some(fees.fee_details.total_fee()),
             None,
             None,
@@ -475,8 +607,8 @@ fn map_result(
             Some(UiTransactionError::from(e)),
             Some(Vec::new()),
             none_accounts,
-            None,
-            None,
+            Some(0),
+            Some(0),
             None,
             None,
             None,
@@ -497,7 +629,7 @@ fn map_result(
         post_balances,
         pre_token_balances,
         post_token_balances,
-        loaded_addresses,
+        loaded_addresses: Some(loaded_addresses),
     })
 }
 
@@ -577,9 +709,12 @@ fn map_inner_instructions(
 fn build_requested_accounts(
     config: &RpcSimulateTransactionConfig,
     post_accounts: &[(Pubkey, AccountSharedData)],
+    fallback_accounts: &HashMap<Pubkey, (AccountSharedData, Slot)>,
 ) -> Option<Vec<Option<UiAccount>>> {
     let accounts_config = config.accounts.as_ref()?;
-    let encoding = accounts_config.encoding.unwrap_or(UiAccountEncoding::Base64);
+    let encoding = accounts_config
+        .encoding
+        .unwrap_or(UiAccountEncoding::Base64);
     let out = accounts_config
         .addresses
         .iter()
@@ -588,7 +723,8 @@ fn build_requested_accounts(
             let account = post_accounts
                 .iter()
                 .find(|(key, _)| key == &pubkey)
-                .map(|(_, acc)| acc)?;
+                .map(|(_, acc)| acc)
+                .or_else(|| fallback_accounts.get(&pubkey).map(|(acc, _)| acc))?;
             Some(encode_ui_account(&pubkey, account, encoding, None, None))
         })
         .collect();
@@ -730,7 +866,8 @@ async fn fetch_accounts(
             continue;
         };
         let owner_bytes: Vec<u8> = row.get("owner");
-        let owner = Pubkey::try_from(owner_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
+        let owner =
+            Pubkey::try_from(owner_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
         let lamports = row.get::<i64, _>("lamports") as u64;
         let slot = row.get::<i64, _>("slot") as u64;
         let executable: bool = row.get("executable");
@@ -834,7 +971,8 @@ fn execute(
 ) -> Result<LoadAndExecuteSanitizedTransactionsOutput, RpcError> {
     let svm_feature_set = feature_set.runtime_features();
     let simd_0268 = feature_set.is_active(&agave_feature_set::raise_cpi_nesting_limit_to_8::id());
-    let simd_0339 = feature_set.is_active(&agave_feature_set::increase_cpi_account_info_limit::id());
+    let simd_0339 =
+        feature_set.is_active(&agave_feature_set::increase_cpi_account_info_limit::id());
 
     let program_runtime_v1 = create_program_runtime_environment_v1(
         &svm_feature_set,
@@ -884,7 +1022,7 @@ fn execute(
     let config = TransactionProcessingConfig {
         account_overrides: None,
         check_program_deployment_slot: false,
-        log_messages_bytes_limit: Some(LOG_MESSAGES_BYTES_LIMIT),
+        log_messages_bytes_limit: None,
         limit_to_load_programs: true,
         recording_config: ExecutionRecordingConfig::new_single_setting(true),
         drop_on_failure: false,

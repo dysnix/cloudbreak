@@ -192,6 +192,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-reserved-account-keys"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "798e559c514af005950ea81586a3856f9297ecb80a7359057c19bf6717f5f537"
+dependencies = [
+ "agave-feature-set 4.0.0",
+ "solana-pubkey 4.1.0",
+ "solana-sdk-ids",
+]
+
+[[package]]
 name = "agave-snapshots"
 version = "3.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1572,6 +1583,7 @@ version = "0.1.0"
 dependencies = [
  "agave-feature-set 4.0.0",
  "agave-precompiles 4.0.0",
+ "agave-reserved-account-keys 4.0.0",
  "agave-syscalls 4.0.0",
  "anyhow",
  "async-stream",
@@ -1610,6 +1622,7 @@ dependencies = [
  "solana-commitment-config",
  "solana-compute-budget 4.0.0",
  "solana-compute-budget-instruction 4.0.0",
+ "solana-epoch-schedule",
  "solana-fee-structure",
  "solana-hash 4.2.0",
  "solana-loader-v3-interface",
@@ -8398,7 +8411,7 @@ dependencies = [
  "agave-feature-set 3.1.12",
  "agave-fs",
  "agave-precompiles 3.1.12",
- "agave-reserved-account-keys",
+ "agave-reserved-account-keys 3.1.12",
  "agave-snapshots",
  "agave-syscalls 3.1.12",
  "agave-votor-messages",

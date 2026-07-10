@@ -73,6 +73,8 @@ agave-syscalls = { workspace = true }
 solana-builtins = { workspace = true }
 solana-bpf-loader-program = { workspace = true }
 agave-feature-set = { workspace = true }
+agave-reserved-account-keys = { workspace = true }
+solana-epoch-schedule = { workspace = true }
 solana-compute-budget = { workspace = true }
 solana-compute-budget-instruction = { workspace = true }
 solana-svm-feature-set = { workspace = true }

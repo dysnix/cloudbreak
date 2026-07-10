@@ -361,6 +361,7 @@ const RECENT_BLOCKHASH_RETENTION_SLOTS: u64 = 900;
 pub async fn insert_recent_blockhash(
     slot: u64,
     blockhash: String,
+    block_height: Option<u64>,
     db: &DatabaseConnection,
     config: &IndexConfig,
 ) {
@@ -373,9 +374,14 @@ pub async fn insert_recent_blockhash(
 
     let insert = Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
-        "INSERT INTO recent_blockhashes (slot, blockhash) VALUES ($1, $2) \
-         ON CONFLICT (slot) DO UPDATE SET blockhash = EXCLUDED.blockhash",
-        [Value::from(slot as i64), Value::from(blockhash)],
+        "INSERT INTO recent_blockhashes (slot, blockhash, block_height) VALUES ($1, $2, $3) \
+         ON CONFLICT (slot) DO UPDATE SET blockhash = EXCLUDED.blockhash, \
+         block_height = EXCLUDED.block_height",
+        [
+            Value::from(slot as i64),
+            Value::from(blockhash),
+            Value::from(block_height.map(|h| h as i64)),
+        ],
     );
     let prune = Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
