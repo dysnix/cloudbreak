@@ -75,7 +75,7 @@ The **cluster tracker** is a [Blockdaemon `solcluster tracker`](https://github.c
 | `crates/api/`               | `cloudbreak-api`           | HTTP JSON-RPC server (Hyper). Serves `getProgramAccounts`, `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenAccountsByMint`, `getAccountInfo`, `getMultipleAccounts`, `getBalance`, `getTokenAccountBalance`, `getSlot`, `getHealth`, `getVersion`, `getGenesisHash`, and (when the Vote and Stake programs are indexed) `getVoteAccounts`. Streams `getProgramAccounts` and `getTokenAccountsByMint` responses as chunked JSON-RPC body frames, applies per-request `statement_timeout` and a total request timeout, supports batch requests with bounded concurrency, optionally caches results in memory (`[gpa-cache]`), and reports query usage to the query tracker.                                                                   |
 | `crates/index/`             | `cloudbreak-index`         | Live indexer. Subscribes to Yellowstone gRPC, applies program filters, writes account/slot state to Postgres. Includes finalize-slot pipeline, self-healing for slot gaps. Uses the `snapshot` crate to optionally load a full snapshot on startup for fast bootstrapping.                                                                                 |
 | `crates/snapshot/`          | `cloudbreak-snapshot`      | Batch loads Solana full and incremental snapshots. Queries a cluster tracker (`/v1/snapshots`) to find a covering snapshot pair, downloads the archives from the source reported by the tracker, unpacks them, reads Solana `AccountsFile` entries, bulk-upserts into Postgres, handles deduplication, optional partition clustering, and index creation. |
-| `crates/query-tracker/`     | `cloudbreak-query-tracker` | JSON-RPC sidecar service (jsonrpsee). Counts `getProgramAccounts`-shaped queries, maintains a priority queue, and optionally drives automatic `CREATE INDEX` on Postgres based on query frequency. Includes periodic query count resets.                                                                                                                   |
+| `crates/query-tracker/`     | `cloudbreak-query-tracker` | HTTP sidecar service (Hyper). Records `getProgramAccounts`-shaped demand in a durable `index_patterns` table, ranks candidates by a configurable priority mode, and optionally drives automatic `CREATE INDEX`/eviction on Postgres, reconciling API demand against Postgres `idx_scan` supply. Fully restartable; exposes `/track`, `/debug/*`, `/metrics`.                                                                                                                   |
 | `crates/core/`              | `cloudbreak-core`          | Shared library. Contains all configuration struct definitions (TOML deserialization), database connection helpers, the `AccountOwnerMap` abstraction, and the `AccountSelectorConfig` (include/exclude program filter logic synced to DB).                                                                                                                 |
 | `crates/entity/`            | `cloudbreak-entity`        | SeaORM entity definitions for Postgres tables: `accounts`, `snapshot_accounts`, `slots`, `service_health`. Also defines the `CommitmentLevel` enum and account conversion types. (The `environment_info` table is accessed via raw SQL in `cloudbreak-core`, not as a SeaORM entity.)                                                                       |
 | `crates/migration/`         | `cloudbreak-migration`     | Schema evolution via `sea-orm-migration`. Defines `accounts`/`snapshot_accounts` DDL helpers with TOML-configurable owner partitioning (none / HASH / LIST / LIST+HASH) and per-index toggles, plus bs58 encode/decode PL/pgSQL functions, the `service_health` table, and the `environment_info` table (program filter + Solana version). See [`crates/migration/README.md`](crates/migration/README.md).                                                                                                                |
@@ -502,7 +502,7 @@ OpenTelemetry tracing configuration. If this section is omitted, OTel is disable
 | Key               | Type     | Default     | Description                 |
 | ----------------- | -------- | ----------- | --------------------------- |
 | `host`            | `String` | `"0.0.0.0"` | Bind address.               |
-| `port`            | `u16`    | `4001`      | Listen port for JSON-RPC.   |
+| `port`            | `u16`    | `4001`      | Listen port for the HTTP API (`/track`, `/debug/*`). |
 | `max-connections` | `u32`    | `100`       | Max concurrent connections. |
 
 #### `[database]`
@@ -518,18 +518,35 @@ Same as other services.
 
 #### `[query-tracker]`
 
-Controls the automatic database index creation behavior.
+Controls demand recording, automatic index creation, usage-based eviction and
+discrepancy detection. All state lives in the `index_patterns` table, so the
+service is fully restartable; these keys only tune behavior. Defaults reproduce
+the previous behavior.
 
-| Key                           | Type          | Default      | Description                                                                                                                               |
-| ----------------------------- | ------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `create-database-indexes`     | `bool`        | `false`      | Enable automatic `CREATE INDEX` based on query frequency.                                                                                 |
-| `index-generation-threshold`  | `u32`         | `10`         | Number of times a unique query must be seen before it becomes eligible for indexing.                                                      |
-| `index-creation-delay`        | `Duration`    | `"10s"`      | Delay between `CREATE INDEX` operations to avoid overloading the database.                                                                |
-| `query-counts-reset-interval` | `Duration`    | `"24h"`      | Interval at which the query count queue is cleared.                                                                                       |
-| `included-programs`           | `Vec<String>` | `[]`         | Only create indexes for these program pubkeys. Empty means all programs are eligible.                                                     |
-| `excluded-programs`           | `Vec<String>` | `[]`         | Never create indexes for these program pubkeys.                                                                                           |
-| `indexer-metrics`             | `String`      | **required** | `host:port` of the indexer's Prometheus metrics endpoint (e.g. `"localhost:8875"`). Used to check indexer health before creating indexes. |
-| `indexer-metrics-threshold`   | `u64`         | `5`          | The `cloudbreak_finalize_slot_handler_queue_size` metric threshold; index creation is paused when the indexer queue exceeds this value.    |
+| Key                             | Type          | Default      | Description                                                                                                                               |
+| ------------------------------- | ------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `create-database-indexes`       | `bool`        | `false`      | Enable automatic `CREATE INDEX` from recorded demand. When off, demand is still recorded.                                                 |
+| `index-generation-threshold`    | `u32`         | `10`         | Minimum demand count before a pattern becomes a creation candidate.                                                                       |
+| `index-creation-delay`          | `Duration`    | `"10s"`      | Poll interval of the creation loop.                                                                                                       |
+| `priority-mode`                 | `String`      | `"frequency"`| Candidate ranking: `frequency`, `cost`, `cost-per-hit` (heaviest single queries first), or `weighted`.                                    |
+| `cost-eligibility-threshold-us` | `u64?`        | (none)       | Only patterns whose average cost-per-hit reaches this many µs are eligible.                                                               |
+| `cost-weight` / `failure-weight`| `f64`         | `0.0`        | Weights for `priority-mode = "weighted"` (blend of demand, cost and failed/timed-out requests).                                           |
+| `included-programs`             | `Vec<String>` | `[]`         | Only create indexes for these program pubkeys. Empty means all programs are eligible.                                                     |
+| `excluded-programs`             | `Vec<String>` | `[]`         | Never create indexes for these program pubkeys.                                                                                           |
+| `indexer-metrics`               | `String`      | **required** | `host:port` of the indexer's Prometheus metrics endpoint. Used to defer DDL (create/drop) when the indexer is behind.                     |
+| `indexer-metrics-threshold`     | `u64`         | `5`          | `cloudbreak_finalize_slot_handler_queue_size` threshold above which DDL is deferred.                                                       |
+| `max-auto-indexes`              | `usize?`      | (none)       | Optional cap on total indexes on the `snapshot_accounts` table.                                                                          |
+| `index-eviction-enabled`        | `bool`        | `false`      | Enable usage-based eviction of idle auto-indexes.                                                                                         |
+| `index-eviction-interval`       | `Duration`    | `"1h"`       | How often the eviction pass runs.                                                                                                        |
+| `index-min-age-grace`           | `Duration`    | `"1h"`       | Minimum age before an index is eligible for eviction.                                                                                    |
+| `index-min-idle`                | `Duration`    | `"24h"`      | An index must see neither demand nor `idx_scan` for this long to be idle.                                                                |
+| `eviction-fill-threshold`       | `f64`         | `0.9`        | Only evict once the capped table is this fraction full (needs `max-auto-indexes`).                                                        |
+| `drop-lock-timeout`             | `Duration`    | `"5s"`       | `lock_timeout` for each `DROP INDEX`; on timeout the drop is skipped and retried next pass.                                              |
+| `drop-retries`                  | `u32`         | `1`          | Extra `DROP INDEX` attempts on lock timeout within a pass.                                                                               |
+| `discrepancy-enabled`           | `bool`        | `true`       | Flag/metric when demand (API) and supply (`idx_scan`) diverge (e.g. Postgres ignoring an index).                                          |
+| `discrepancy-delta`             | `f64`         | `0.10`       | Relative gap between demand and supply beyond which a pattern is flagged.                                                                |
+| `explain-enabled`               | `bool`        | `false`      | Optional third signal: periodic `EXPLAIN` (plan only) sampling of each index.                                                            |
+| `explain-interval`              | `Duration`    | `"6h"`       | How often the EXPLAIN sampling pass runs when enabled.                                                                                   |
 
 ### Snapshot Processor (`cloudbreak.snapshot.toml`)
 

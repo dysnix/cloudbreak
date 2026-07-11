@@ -614,97 +614,202 @@ impl SlotSyncronizerConfig {
     }
 }
 
+/// How creation candidates are ranked when the tracker decides which index to
+/// build next. The score is computed on read from the stored demand columns, so
+/// changing this takes effect immediately without any data migration. See the
+/// query tracker's `prioritization` module for the exact `ORDER BY` mapping.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PriorityMode {
+    /// Rank by how many requests demanded the pattern (most frequent first).
+    #[default]
+    Frequency,
+    /// Rank by accumulated DB cost in microseconds (heaviest total load first).
+    Cost,
+    /// Rank by average cost per request, so individually expensive but rarer
+    /// patterns still rise to the top ("huge queries first").
+    CostPerHit,
+    /// Rank by a weighted blend of demand, cost and failures, tuned with
+    /// [`QueryTrackerConfig::cost_weight`] and
+    /// [`QueryTrackerConfig::failure_weight`].
+    Weighted,
+}
+
+/// Configuration for the query tracker service.
+///
+/// The tracker is persistence-first: all demand/supply state lives in the
+/// `index_patterns` table, so every knob here only tunes *behavior* (what to
+/// build, when to evict), never durability. Defaults reproduce the previous
+/// hardcoded behavior so existing deployments need no config changes.
 #[derive(Deserialize, Debug, Clone)]
 pub struct QueryTrackerConfig {
-    #[serde(
-        rename = "cost-eligibility-threshold-us",
-        default = "QueryTrackerConfig::default_cost_eligibility_threshold_us"
-    )]
-    pub cost_eligibility_threshold_us: Option<u64>,
-    #[serde(
-        rename = "cost-weighting",
-        default = "QueryTrackerConfig::default_cost_weighting"
-    )]
-    pub cost_weighting: bool,
+    // ---- creation ---------------------------------------------------------
+    /// Master switch for building database indexes. When false the creation
+    /// loop is not spawned; demand is still recorded so a later flip has
+    /// history to act on.
     #[serde(
         rename = "create-database-indexes",
         default = "QueryTrackerConfig::default_create_database_indexes"
     )]
     pub create_database_indexes: bool,
+    /// Minimum demand count a pattern must reach before it becomes a creation
+    /// candidate. Filters out one-off queries.
     #[serde(
         rename = "index-generation-threshold",
         default = "QueryTrackerConfig::default_index_generation_threshold"
     )]
     pub index_generation_threshold: u32,
+    /// Poll interval of the creation loop: how often it wakes to pick the next
+    /// highest-priority candidate.
     #[serde(
         rename = "index-creation-delay",
         default = "QueryTrackerConfig::default_index_creation_delay",
         deserialize_with = "deserialize_duration_required"
     )]
     pub index_creation_delay: Duration,
+
+    // ---- prioritization ---------------------------------------------------
+    /// How candidates are ranked. See [`PriorityMode`].
+    #[serde(rename = "priority-mode", default)]
+    pub priority_mode: PriorityMode,
+    /// Only patterns whose average cost-per-hit reaches this many microseconds
+    /// are eligible for creation. `None` disables the gate.
     #[serde(
-        rename = "query-counts-reset-interval",
-        default = "QueryTrackerConfig::default_query_counts_reset_interval",
-        deserialize_with = "deserialize_duration_required"
+        rename = "cost-eligibility-threshold-us",
+        default = "QueryTrackerConfig::default_cost_eligibility_threshold_us"
     )]
-    pub query_counts_reset_interval: Duration,
-    /// Programs to include in the index creation, if empty, all programs will be included
-    /// In general this is meant to be used either this or excluded-programs (not both), for fine-grained control
-    /// This is different from what data is being saved in the database, which is controlled by the `index` cmd,
-    /// but it's closely related (because it only makes sense to index programs that are being saved in the database)
+    pub cost_eligibility_threshold_us: Option<u64>,
+    /// Weight applied to accumulated cost in [`PriorityMode::Weighted`].
+    #[serde(
+        rename = "cost-weight",
+        default = "QueryTrackerConfig::default_cost_weight"
+    )]
+    pub cost_weight: f64,
+    /// Weight applied to failed/timed-out request count in
+    /// [`PriorityMode::Weighted`], letting operators prioritize patterns that
+    /// currently *cannot* be served without an index.
+    #[serde(
+        rename = "failure-weight",
+        default = "QueryTrackerConfig::default_failure_weight"
+    )]
+    pub failure_weight: f64,
+
+    // ---- program scoping --------------------------------------------------
+    /// Programs to include in index creation; empty means "all". Use either
+    /// this or `excluded-programs`, not both.
     #[serde(rename = "included-programs", default)]
     pub included_programs: Vec<PubkeyDef>,
-    /// Programs to exclude from the index creation
+    /// Programs to exclude from index creation.
     #[serde(rename = "excluded-programs", default)]
     pub excluded_programs: Vec<PubkeyDef>,
-    /// The URL of the indexer metrics
+
+    // ---- backpressure -----------------------------------------------------
+    /// URL of the indexer metrics endpoint used to gate DDL under ingest load.
     #[serde(
         rename = "indexer-metrics",
         deserialize_with = "QueryTrackerConfig::deserialize_indexer_metrics"
     )]
     pub indexer_metrics: String,
-    /// The threshold for the indexer metrics to trigger index creation,
-    /// the used metric is `cloudbreak_finalize_slot_handler_queue_size`
+    /// If `cloudbreak_finalize_slot_handler_queue_size` exceeds this, CREATE and
+    /// DROP INDEX are deferred (they take heavy locks on hot tables).
     #[serde(
         rename = "indexer-metrics-threshold",
         default = "QueryTrackerConfig::default_indexer_metrics_threshold"
     )]
     pub indexer_metrics_threshold: u64,
-    /// Optional cap on the total number of indexes on the `snapshot_accounts` table
+    /// Optional cap on the total number of indexes on the target table.
     #[serde(rename = "max-auto-indexes", default)]
     pub max_auto_indexes: Option<usize>,
-    /// Minimum age an auto-created index must reach before it is eligible for eviction at all,
-    /// so a freshly built index is never dropped before it has had a chance to be used. Default: 1h.
+
+    // ---- eviction ---------------------------------------------------------
+    /// Master switch for usage-based eviction. Off by default; when off the
+    /// eviction task is not spawned.
     #[serde(
-        rename = "index-min-age-grace",
-        default = "QueryTrackerConfig::default_index_min_age_grace",
-        deserialize_with = "deserialize_duration_required"
+        rename = "index-eviction-enabled",
+        default = "QueryTrackerConfig::default_index_eviction_enabled"
     )]
-    pub index_min_age_grace: Duration,
-    /// How often the eviction pass runs. Keep this comfortably larger than the rate at which the
-    /// build loop creates indexes to avoid churn. Default: 1h.
+    pub index_eviction_enabled: bool,
+    /// How often the eviction pass runs. Keep comfortably larger than the
+    /// creation rate to avoid drop/rebuild churn. Default: 1h.
     #[serde(
         rename = "index-eviction-interval",
         default = "QueryTrackerConfig::default_index_eviction_interval",
         deserialize_with = "deserialize_duration_required"
     )]
     pub index_eviction_interval: Duration,
-    /// Master switch for usage-based eviction of auto-created indexes. Off by default; when off,
-    /// the eviction task is not even spawned and index management behaves exactly as before.
+    /// Minimum age before an index is eligible for eviction, so a freshly built
+    /// index is never dropped before it has had a chance to be used. Default: 1h.
     #[serde(
-        rename = "index-eviction-enabled",
-        default = "QueryTrackerConfig::default_index_eviction_enabled"
+        rename = "index-min-age-grace",
+        default = "QueryTrackerConfig::default_index_min_age_grace",
+        deserialize_with = "deserialize_duration_required"
     )]
-    pub index_eviction_enabled: bool,
-    /// How long an index must go unused (no new `idx_scan`) before it is considered idle and
-    /// droppable. Intentionally conservative — too small a window risks evicting indexes that are
-    /// used in bursts, and pairs with the eviction interval to avoid drop/rebuild churn. Default: 24h.
+    pub index_min_age_grace: Duration,
+    /// How long a pattern must see neither DB usage nor API demand before it is
+    /// considered idle and droppable. Default: 24h.
     #[serde(
         rename = "index-min-idle",
         default = "QueryTrackerConfig::default_index_min_idle",
         deserialize_with = "deserialize_duration_required"
     )]
     pub index_min_idle: Duration,
+    /// Fraction (0.0–1.0) of `max-auto-indexes` fill above which eviction is
+    /// allowed to run. Below it we prefer keeping possibly-useful indexes and
+    /// simply let creation slow down. Requires `max-auto-indexes`. Default: 0.9.
+    #[serde(
+        rename = "eviction-fill-threshold",
+        default = "QueryTrackerConfig::default_eviction_fill_threshold"
+    )]
+    pub eviction_fill_threshold: f64,
+    /// `lock_timeout` applied to each DROP INDEX. If the lock cannot be taken in
+    /// this window the drop is skipped (with a warning) and retried next pass.
+    #[serde(
+        rename = "drop-lock-timeout",
+        default = "QueryTrackerConfig::default_drop_lock_timeout",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub drop_lock_timeout: Duration,
+    /// Number of extra attempts for a DROP INDEX that fails on lock timeout
+    /// within the same pass. Default: 1.
+    #[serde(
+        rename = "drop-retries",
+        default = "QueryTrackerConfig::default_drop_retries"
+    )]
+    pub drop_retries: u32,
+
+    // ---- discrepancy detection -------------------------------------------
+    /// Emit a metric/log when demand (API) and supply (`idx_scan`) diverge,
+    /// surfacing indexes Postgres is ignoring despite live demand.
+    #[serde(
+        rename = "discrepancy-enabled",
+        default = "QueryTrackerConfig::default_discrepancy_enabled"
+    )]
+    pub discrepancy_enabled: bool,
+    /// Relative gap (0.0–1.0) between normalized demand and supply beyond which
+    /// a pattern is flagged as discrepant. Default: 0.10 (10%).
+    #[serde(
+        rename = "discrepancy-delta",
+        default = "QueryTrackerConfig::default_discrepancy_delta"
+    )]
+    pub discrepancy_delta: f64,
+
+    // ---- optional: EXPLAIN sampling --------------------------------------
+    /// Opt-in third signal: periodically `EXPLAIN` (not ANALYZE) a synthetic
+    /// probe of each created index to see whether the planner *would* use it
+    /// right now — the only signal that cleanly tells "no traffic" apart from
+    /// "planner refuses". Off by default.
+    #[serde(
+        rename = "explain-enabled",
+        default = "QueryTrackerConfig::default_explain_enabled"
+    )]
+    pub explain_enabled: bool,
+    /// How often the EXPLAIN sampling pass runs when enabled. Default: 6h.
+    #[serde(
+        rename = "explain-interval",
+        default = "QueryTrackerConfig::default_explain_interval",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub explain_interval: Duration,
 }
 
 impl QueryTrackerConfig {
@@ -716,7 +821,7 @@ impl QueryTrackerConfig {
         Duration::from_secs(3600)
     }
 
-    fn default_index_eviction_enabled() -> bool {
+    const fn default_index_eviction_enabled() -> bool {
         false
     }
 
@@ -724,12 +829,44 @@ impl QueryTrackerConfig {
         Duration::from_secs(3600 * 24)
     }
 
+    const fn default_eviction_fill_threshold() -> f64 {
+        0.9
+    }
+
+    fn default_drop_lock_timeout() -> Duration {
+        Duration::from_secs(5)
+    }
+
+    const fn default_drop_retries() -> u32 {
+        1
+    }
+
+    const fn default_discrepancy_enabled() -> bool {
+        true
+    }
+
+    const fn default_discrepancy_delta() -> f64 {
+        0.10
+    }
+
+    const fn default_explain_enabled() -> bool {
+        false
+    }
+
+    fn default_explain_interval() -> Duration {
+        Duration::from_secs(3600 * 6)
+    }
+
     const fn default_cost_eligibility_threshold_us() -> Option<u64> {
         None
     }
 
-    const fn default_cost_weighting() -> bool {
-        false
+    const fn default_cost_weight() -> f64 {
+        0.0
+    }
+
+    const fn default_failure_weight() -> f64 {
+        0.0
     }
 
     const fn default_create_database_indexes() -> bool {
@@ -741,11 +878,7 @@ impl QueryTrackerConfig {
     }
 
     fn default_index_creation_delay() -> Duration {
-        Duration::from_secs(10) // 10 seconds
-    }
-
-    fn default_query_counts_reset_interval() -> Duration {
-        Duration::from_secs(86400) // 24 hours
+        Duration::from_secs(10)
     }
 
     fn default_indexer_metrics_threshold() -> u64 {
@@ -770,20 +903,28 @@ impl Default for QueryTrackerConfig {
     fn default() -> Self {
         Self {
             create_database_indexes: Self::default_create_database_indexes(),
-            index_min_age_grace: Self::default_index_min_age_grace(),
-            index_eviction_interval: Self::default_index_eviction_interval(),
-            index_eviction_enabled: Self::default_index_eviction_enabled(),
-            index_min_idle: Self::default_index_min_idle(),
-            cost_eligibility_threshold_us: Self::default_cost_eligibility_threshold_us(),
-            cost_weighting: Self::default_cost_weighting(),
             index_generation_threshold: Self::default_index_generation_threshold(),
             index_creation_delay: Self::default_index_creation_delay(),
-            query_counts_reset_interval: Self::default_query_counts_reset_interval(),
+            priority_mode: PriorityMode::default(),
+            cost_eligibility_threshold_us: Self::default_cost_eligibility_threshold_us(),
+            cost_weight: Self::default_cost_weight(),
+            failure_weight: Self::default_failure_weight(),
             included_programs: Vec::new(),
             excluded_programs: Vec::new(),
             indexer_metrics: String::default(),
             indexer_metrics_threshold: Self::default_indexer_metrics_threshold(),
             max_auto_indexes: None,
+            index_eviction_enabled: Self::default_index_eviction_enabled(),
+            index_eviction_interval: Self::default_index_eviction_interval(),
+            index_min_age_grace: Self::default_index_min_age_grace(),
+            index_min_idle: Self::default_index_min_idle(),
+            eviction_fill_threshold: Self::default_eviction_fill_threshold(),
+            drop_lock_timeout: Self::default_drop_lock_timeout(),
+            drop_retries: Self::default_drop_retries(),
+            discrepancy_enabled: Self::default_discrepancy_enabled(),
+            discrepancy_delta: Self::default_discrepancy_delta(),
+            explain_enabled: Self::default_explain_enabled(),
+            explain_interval: Self::default_explain_interval(),
         }
     }
 }
@@ -841,17 +982,50 @@ impl QueryTrackerServiceConfig {
     }
 }
 
+/// API-side client that buffers observed GPA patterns and flushes them to the
+/// tracker over HTTP. Buffering is keyed by `IndexIdentity` (so many raw queries
+/// collapse into one entry) and is bounded so a slow/unreachable tracker can
+/// never grow memory without limit.
 #[derive(Deserialize, Debug, Clone)]
 pub struct QueryTrackerClientConfig {
+    /// Base URL of the tracker's HTTP `/track` endpoint host, e.g.
+    /// `http://query-tracker:4001`.
     pub endpoint: String,
+    /// Per-request HTTP timeout when flushing a batch.
     #[serde(default, deserialize_with = "deserialize_duration")]
     pub timeout: Option<Duration>,
+    /// How often the buffer is flushed to the tracker.
     #[serde(
         rename = "flush-interval",
         default,
         deserialize_with = "deserialize_duration"
     )]
     pub flush_interval: Option<Duration>,
+    /// Max number of distinct identities held in the buffer. When full, new
+    /// identities are dropped (with a counter) rather than growing unbounded;
+    /// already-buffered identities keep aggregating. Default: 10_000.
+    #[serde(
+        rename = "max-buffered-identities",
+        default = "QueryTrackerClientConfig::default_max_buffered_identities"
+    )]
+    pub max_buffered_identities: usize,
+    /// Max identities sent per flush request; larger buffers are split across
+    /// several requests so a single POST body stays bounded. Default: 1_000.
+    #[serde(
+        rename = "max-batch-size",
+        default = "QueryTrackerClientConfig::default_max_batch_size"
+    )]
+    pub max_batch_size: usize,
+}
+
+impl QueryTrackerClientConfig {
+    const fn default_max_buffered_identities() -> usize {
+        10_000
+    }
+
+    const fn default_max_batch_size() -> usize {
+        1_000
+    }
 }
 
 pub const DEFAULT_QUERY_TRACKER_SERVER_PORT: u16 = 4001;

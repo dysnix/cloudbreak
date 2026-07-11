@@ -11,15 +11,49 @@ host = "0.0.0.0"
 port = 8876
 
 [query-tracker]
+# --- creation ---
 create-database-indexes = true
 index-generation-threshold = 10
 index-creation-delay = "10s"
-query-counts-reset-interval = "24h"
+
+# --- prioritization ---
+# How creation candidates are ranked: "frequency" (default), "cost",
+# "cost-per-hit" (heaviest single queries first), or "weighted".
+priority-mode = "frequency"
+# Only index patterns whose average cost-per-hit reaches this many microseconds
+# (omit to disable the gate).
+# cost-eligibility-threshold-us = 50000
+# Weights used only by priority-mode = "weighted".
+cost-weight = 0.0
+failure-weight = 0.0
+
+# --- program scoping ---
 included-programs = []
 excluded-programs = [
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
   "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
 ]
+
+# --- backpressure ---
 indexer-metrics = "localhost:8875"
 indexer-metrics-threshold = 5
 max-auto-indexes = 100
+
+# --- eviction (usage-based; off by default) ---
+index-eviction-enabled = false
+index-eviction-interval = "1h"
+index-min-age-grace = "1h"
+index-min-idle = "24h"
+# Only start dropping once the capped table is this fraction full (needs
+# max-auto-indexes). Below it, creation just slows instead of evicting.
+eviction-fill-threshold = 0.9
+drop-lock-timeout = "5s"
+drop-retries = 1
+
+# --- discrepancy detection (demand vs. supply) ---
+discrepancy-enabled = true
+discrepancy-delta = 0.10
+
+# --- optional: EXPLAIN sampling (planner-level third signal; off by default) ---
+explain-enabled = false
+explain-interval = "6h"

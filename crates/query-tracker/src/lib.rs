@@ -3,177 +3,79 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use cloudbreak_core::{QueryTrackerServiceConfig, TryLoadConfig};
-use jsonrpsee::server::{Server, ServerConfig};
-use sea_orm::{ConnectOptions, Database};
-use std::str::FromStr;
-use tracing::info;
+//! Query tracker service.
+//!
+//! Persistence-first, demand-driven auto-indexer. All decision state lives in
+//! the `index_patterns` table (see the migration), so the service is fully
+//! restartable and never loses history. The crate is organised as:
+//!
+//! - `server`          — HTTP edge: ingest (`/track`), debug, metrics/health.
+//! - `modules`         — the core pipeline (identity → store → ingest →
+//!   prioritization → creation/eviction/discrepancy → metrics).
+//! - `optional_modules`— opt-in observers (EXPLAIN sampling).
+//!
+//! `run` wires them together: it loads config, connects the DB, starts the two
+//! HTTP servers, and spawns the background loops enabled by config.
 
 pub mod error;
-pub mod index_listener;
-pub mod metrics;
-pub mod rpc;
-pub mod tracker;
-
-use crate::index_listener::{index_eviction_task, index_listener};
-use crate::rpc::{QueryBatchEntry, QueryTrackerRpcServer, QueryTrackerStatus};
-use crate::tracker::{
-    get_queue_size, get_tracked_query_count, init_query_tracker, query_counts_reset_task,
-    track_program_accounts_query,
-};
+pub mod modules;
+pub mod optional_modules;
+pub mod server;
 
 pub use error::{QueryTrackerError, QueryTrackerResult};
 
-pub struct QueryTrackerRpcImpl {
-    index_creation_enabled: bool,
-}
-
-impl QueryTrackerRpcImpl {
-    pub fn new(index_creation_enabled: bool) -> Self {
-        Self {
-            index_creation_enabled,
-        }
-    }
-}
-
-#[jsonrpsee::core::async_trait]
-impl rpc::QueryTrackerRpcServer for QueryTrackerRpcImpl {
-    async fn track_query(
-        &self,
-        program: String,
-        config: Option<cloudbreak_core::modules::rpc_filter_type::RpcProgramAccountsConfig>,
-    ) -> Result<(), jsonrpsee_types::ErrorObject<'static>> {
-        let pubkey = solana_pubkey::Pubkey::from_str(&program).map_err(|e| {
-            jsonrpsee_types::ErrorObject::owned(
-                -32602,
-                format!("Invalid pubkey: {}", e),
-                None::<()>,
-            )
-        })?;
-
-        track_program_accounts_query(pubkey, config.as_ref(), 1, 0);
-
-        Ok(())
-    }
-
-    async fn track_queries(
-        &self,
-        queries: Vec<QueryBatchEntry>,
-    ) -> Result<(), jsonrpsee_types::ErrorObject<'static>> {
-        for entry in queries {
-            let pubkey = solana_pubkey::Pubkey::from_str(&entry.program).map_err(|e| {
-                jsonrpsee_types::ErrorObject::owned(
-                    -32602,
-                    format!("Invalid pubkey: {}", e),
-                    None::<()>,
-                )
-            })?;
-
-            track_program_accounts_query(pubkey, entry.config.as_ref(), entry.count, entry.total_cost_us);
-        }
-
-        Ok(())
-    }
-
-    async fn get_status(
-        &self,
-    ) -> Result<QueryTrackerStatus, jsonrpsee_types::ErrorObject<'static>> {
-        Ok(QueryTrackerStatus {
-            healthy: true,
-            tracked_queries: get_tracked_query_count(),
-            queue_size: get_queue_size(),
-            index_creation_enabled: self.index_creation_enabled,
-        })
-    }
-
-    async fn get_queue_size(&self) -> Result<u32, jsonrpsee_types::ErrorObject<'static>> {
-        Ok(get_queue_size() as u32)
-    }
-
-    async fn get_health(&self) -> Result<String, jsonrpsee_types::ErrorObject<'static>> {
-        Ok("ok".to_string())
-    }
-}
+use crate::modules::store::Store;
+use crate::server::AppState;
+use cloudbreak_core::{QueryTrackerServiceConfig, TryLoadConfig};
+use sea_orm::{ConnectOptions, Database};
+use std::sync::Arc;
+use tracing::info;
 
 pub async fn run(config_path: &str) -> cloudbreak_core::Result<()> {
     let config = QueryTrackerServiceConfig::try_load(config_path)?;
-
     let server_addr = config.server_addr();
     let metrics_addr = config.metrics_addr();
 
-    tokio::spawn(async move {
-        metrics::serve_metrics(metrics_addr).await;
-    });
+    modules::metrics::init();
+    tokio::spawn(async move { server::operational::serve(metrics_addr).await });
 
     let database = Database::connect(ConnectOptions::from(config.database.clone())).await?;
-
-    let query_tracker_config = config.query_tracker.clone();
+    let store = Store::new(database);
+    let qt = config.query_tracker.clone();
 
     info!(
-        "Query tracker service initialized (threshold: {}, auto-create indexes: {}, delay: {}, reset interval: {})",
-        query_tracker_config.index_generation_threshold,
-        query_tracker_config.create_database_indexes,
-        humantime::format_duration(query_tracker_config.index_creation_delay),
-        humantime::format_duration(query_tracker_config.query_counts_reset_interval)
+        target: "query_tracker",
+        "query tracker starting (create-indexes: {}, priority: {:?}, threshold: {}, eviction: {}, explain: {})",
+        qt.create_database_indexes, qt.priority_mode, qt.index_generation_threshold,
+        qt.index_eviction_enabled, qt.explain_enabled
     );
 
-    init_query_tracker(
-        query_tracker_config.index_generation_threshold,
-        query_tracker_config.cost_eligibility_threshold_us,
-        query_tracker_config.cost_weighting,
-    );
-
-    let reset_interval = query_tracker_config.query_counts_reset_interval;
-    let index_creation_enabled = query_tracker_config.create_database_indexes;
-
-    let eviction_db = database.clone();
-    let eviction_config = query_tracker_config.clone();
-
-    let listener_db = database.clone();
-    tokio::spawn(async move {
-        index_listener(listener_db, query_tracker_config).await;
-    });
-
-    tokio::spawn(async move {
-        query_counts_reset_task(reset_interval).await;
-    });
-
-    if eviction_config.index_eviction_enabled {
-        tokio::spawn(async move {
-            index_eviction_task(eviction_db, eviction_config).await;
-        });
+    if qt.create_database_indexes {
+        let (store, cfg) = (store.clone(), qt.clone());
+        tokio::spawn(async move { modules::creation::run(store, cfg).await });
+    } else {
+        info!(target: "query_tracker", "index creation disabled; recording demand only");
     }
 
-    let server = Server::builder()
-        .set_config(
-            ServerConfig::builder()
-                .max_connections(config.server.max_connections)
-                .max_request_body_size(u32::MAX)
-                .max_response_body_size(u32::MAX)
-                .build(),
-        )
-        .build(server_addr)
-        .await?;
+    if qt.index_eviction_enabled {
+        let (store, cfg) = (store.clone(), qt.clone());
+        tokio::spawn(async move { modules::eviction::run(store, cfg).await });
+    }
 
-    let rpc = QueryTrackerRpcImpl::new(index_creation_enabled);
+    if qt.explain_enabled {
+        let (store, cfg) = (store.clone(), qt.clone());
+        tokio::spawn(async move { optional_modules::explain::run(store, cfg).await });
+    }
 
-    info!("Query Tracker service is starting...");
+    let state = Arc::new(AppState {
+        store,
+        config: qt,
+    });
+    tokio::spawn(async move { server::serve(server_addr, state).await });
 
-    let server_handle = server.start(rpc.into_rpc());
-
-    info!(
-        "Query Tracker service is running at http://{}. Press Ctrl+C to stop.",
-        server_addr
-    );
-
+    info!(target: "query_tracker", "query tracker running on http://{server_addr}. Press Ctrl+C to stop.");
     tokio::signal::ctrl_c().await?;
-
-    info!("Shutdown signal received. Stopping Query Tracker service...");
-
-    server_handle.stop()?;
-    server_handle.stopped().await;
-
-    info!("Query Tracker service has been stopped.");
+    info!(target: "query_tracker", "shutdown signal received; stopping query tracker");
 
     Ok(())
 }
