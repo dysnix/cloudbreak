@@ -114,15 +114,13 @@ impl Store {
         if !fingerprints.is_empty() {
             let mut sketch = VarietySketch::from_bytes(existing_hll.as_deref());
             sketch.insert_many(fingerprints);
+            let hll_bytes = sketch.to_bytes();
+            let estimate = sketch.estimate() as i64;
             txn.execute(Statement::from_sql_and_values(
                 backend,
                 "UPDATE index_patterns SET variety_hll = $2, variety_estimate = $3 \
                  WHERE pattern_id = $1",
-                [
-                    pattern_id.into(),
-                    sketch.to_bytes().into(),
-                    (sketch.estimate() as i64).into(),
-                ],
+                [pattern_id.into(), hll_bytes.into(), estimate.into()],
             ))
             .await?;
         }

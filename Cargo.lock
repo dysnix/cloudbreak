@@ -1592,6 +1592,7 @@ dependencies = [
  "humantime",
  "hyper 1.8.1",
  "hyper-util",
+ "hyperloglogplus",
  "lazy_static",
  "prometheus",
  "reqwest 0.12.28",
@@ -3222,6 +3223,15 @@ dependencies = [
  "tower-service",
  "tracing",
  "windows-registry",
+]
+
+[[package]]
+name = "hyperloglogplus"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "621debdf94dcac33e50475fdd76d34d5ea9c0362a834b9db08c3024696c1fbe3"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

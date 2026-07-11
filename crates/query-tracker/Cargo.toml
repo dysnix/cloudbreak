@@ -35,3 +35,4 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 hex = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
+hyperloglogplus = "0.4.1"
