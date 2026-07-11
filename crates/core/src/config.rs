@@ -673,9 +673,57 @@ pub struct QueryTrackerConfig {
     /// Optional cap on the total number of indexes on the `snapshot_accounts` table
     #[serde(rename = "max-auto-indexes", default)]
     pub max_auto_indexes: Option<usize>,
+    /// Minimum age an auto-created index must reach before it is eligible for eviction at all,
+    /// so a freshly built index is never dropped before it has had a chance to be used. Default: 1h.
+    #[serde(
+        rename = "index-min-age-grace",
+        default = "QueryTrackerConfig::default_index_min_age_grace",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub index_min_age_grace: Duration,
+    /// How often the eviction pass runs. Keep this comfortably larger than the rate at which the
+    /// build loop creates indexes to avoid churn. Default: 1h.
+    #[serde(
+        rename = "index-eviction-interval",
+        default = "QueryTrackerConfig::default_index_eviction_interval",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub index_eviction_interval: Duration,
+    /// Master switch for usage-based eviction of auto-created indexes. Off by default; when off,
+    /// the eviction task is not even spawned and index management behaves exactly as before.
+    #[serde(
+        rename = "index-eviction-enabled",
+        default = "QueryTrackerConfig::default_index_eviction_enabled"
+    )]
+    pub index_eviction_enabled: bool,
+    /// How long an index must go unused (no new `idx_scan`) before it is considered idle and
+    /// droppable. Intentionally conservative — too small a window risks evicting indexes that are
+    /// used in bursts, and pairs with the eviction interval to avoid drop/rebuild churn. Default: 24h.
+    #[serde(
+        rename = "index-min-idle",
+        default = "QueryTrackerConfig::default_index_min_idle",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub index_min_idle: Duration,
 }
 
 impl QueryTrackerConfig {
+    fn default_index_min_age_grace() -> Duration {
+        Duration::from_secs(3600)
+    }
+
+    fn default_index_eviction_interval() -> Duration {
+        Duration::from_secs(3600)
+    }
+
+    fn default_index_eviction_enabled() -> bool {
+        false
+    }
+
+    fn default_index_min_idle() -> Duration {
+        Duration::from_secs(3600 * 24)
+    }
+
     const fn default_cost_eligibility_threshold_us() -> Option<u64> {
         None
     }
@@ -722,6 +770,10 @@ impl Default for QueryTrackerConfig {
     fn default() -> Self {
         Self {
             create_database_indexes: Self::default_create_database_indexes(),
+            index_min_age_grace: Self::default_index_min_age_grace(),
+            index_eviction_interval: Self::default_index_eviction_interval(),
+            index_eviction_enabled: Self::default_index_eviction_enabled(),
+            index_min_idle: Self::default_index_min_idle(),
             cost_eligibility_threshold_us: Self::default_cost_eligibility_threshold_us(),
             cost_weighting: Self::default_cost_weighting(),
             index_generation_threshold: Self::default_index_generation_threshold(),
@@ -959,4 +1011,21 @@ where
             e
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The eviction feature drops database indexes, so its defaults are a safety contract: it must
+    // be off unless explicitly enabled, with conservative windows. Lock these so a refactor can't
+    // silently flip them.
+    #[test]
+    fn query_tracker_eviction_defaults_are_safe() {
+        let c = QueryTrackerConfig::default();
+        assert!(!c.index_eviction_enabled, "eviction must be off by default");
+        assert_eq!(c.index_min_idle, Duration::from_secs(86400));
+        assert_eq!(c.index_min_age_grace, Duration::from_secs(3600));
+        assert_eq!(c.index_eviction_interval, Duration::from_secs(3600));
+    }
 }

@@ -15,7 +15,7 @@ pub mod metrics;
 pub mod rpc;
 pub mod tracker;
 
-use crate::index_listener::index_listener;
+use crate::index_listener::{index_eviction_task, index_listener};
 use crate::rpc::{QueryBatchEntry, QueryTrackerRpcServer, QueryTrackerStatus};
 use crate::tracker::{
     get_queue_size, get_tracked_query_count, init_query_tracker, query_counts_reset_task,
@@ -126,6 +126,9 @@ pub async fn run(config_path: &str) -> cloudbreak_core::Result<()> {
     let reset_interval = query_tracker_config.query_counts_reset_interval;
     let index_creation_enabled = query_tracker_config.create_database_indexes;
 
+    let eviction_db = database.clone();
+    let eviction_config = query_tracker_config.clone();
+
     let listener_db = database.clone();
     tokio::spawn(async move {
         index_listener(listener_db, query_tracker_config).await;
@@ -134,6 +137,12 @@ pub async fn run(config_path: &str) -> cloudbreak_core::Result<()> {
     tokio::spawn(async move {
         query_counts_reset_task(reset_interval).await;
     });
+
+    if eviction_config.index_eviction_enabled {
+        tokio::spawn(async move {
+            index_eviction_task(eviction_db, eviction_config).await;
+        });
+    }
 
     let server = Server::builder()
         .set_config(
