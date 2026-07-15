@@ -366,6 +366,10 @@ pub async fn insert_recent_blockhash(
     config: &IndexConfig,
 ) {
     if blockhash.is_empty() {
+        tracing::warn!(
+            "insert_recent_blockhash: empty blockhash for slot {}. Expected only for snapshot-repaired self-healing blocks",
+            slot
+        );
         return;
     }
 
