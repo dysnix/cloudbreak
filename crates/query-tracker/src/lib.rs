@@ -3,11 +3,11 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use cloudbreak_core::{QueryTrackerServiceConfig, TryLoadConfig};
 use jsonrpsee::server::{Server, ServerConfig};
 use sea_orm::{ConnectOptions, Database};
 use std::str::FromStr;
 use tracing::info;
-use cloudbreak_core::{QueryTrackerServiceConfig, TryLoadConfig};
 
 pub mod error;
 pub mod index_listener;
@@ -15,7 +15,7 @@ pub mod metrics;
 pub mod rpc;
 pub mod tracker;
 
-use crate::index_listener::index_listener;
+use crate::index_listener::{index_eviction_task, index_listener};
 use crate::rpc::{QueryBatchEntry, QueryTrackerRpcServer, QueryTrackerStatus};
 use crate::tracker::{
     get_queue_size, get_tracked_query_count, init_query_tracker, query_counts_reset_task,
@@ -51,7 +51,7 @@ impl rpc::QueryTrackerRpcServer for QueryTrackerRpcImpl {
             )
         })?;
 
-        track_program_accounts_query(pubkey, config.as_ref(), 1);
+        track_program_accounts_query(pubkey, config.as_ref(), 1, 0);
 
         Ok(())
     }
@@ -69,7 +69,7 @@ impl rpc::QueryTrackerRpcServer for QueryTrackerRpcImpl {
                 )
             })?;
 
-            track_program_accounts_query(pubkey, entry.config.as_ref(), entry.count);
+            track_program_accounts_query(pubkey, entry.config.as_ref(), entry.count, entry.total_cost_us);
         }
 
         Ok(())
@@ -117,10 +117,17 @@ pub async fn run(config_path: &str) -> cloudbreak_core::Result<()> {
         humantime::format_duration(query_tracker_config.query_counts_reset_interval)
     );
 
-    init_query_tracker(query_tracker_config.index_generation_threshold);
+    init_query_tracker(
+        query_tracker_config.index_generation_threshold,
+        query_tracker_config.cost_eligibility_threshold_us,
+        query_tracker_config.cost_weighting,
+    );
 
     let reset_interval = query_tracker_config.query_counts_reset_interval;
     let index_creation_enabled = query_tracker_config.create_database_indexes;
+
+    let eviction_db = database.clone();
+    let eviction_config = query_tracker_config.clone();
 
     let listener_db = database.clone();
     tokio::spawn(async move {
@@ -130,6 +137,12 @@ pub async fn run(config_path: &str) -> cloudbreak_core::Result<()> {
     tokio::spawn(async move {
         query_counts_reset_task(reset_interval).await;
     });
+
+    if eviction_config.index_eviction_enabled {
+        tokio::spawn(async move {
+            index_eviction_task(eviction_db, eviction_config).await;
+        });
+    }
 
     let server = Server::builder()
         .set_config(
