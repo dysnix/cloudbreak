@@ -79,6 +79,7 @@ cargo run --bin integration_tests -- benchmark -c custom.toml gpa
 | `get-multiple-accounts`      | `getMultipleAccounts` (up to `[server].max-multiple-accounts` pubkeys, default `100`; positional comparison) |
 | `get-balance`                | `getBalance` (returns `u64`, no encoding)                                                |
 | `get-token-account-balance`  | `getTokenAccountBalance` (returns `UiTokenAmount`, no encoding, no `minContextSlot`)    |
+| `simulate-transaction`       | `simulateTransaction` (replays real captured requests; see [Replaying simulateTransaction](#replaying-simulatetransaction)) |
 
 **Per-method response comparison** (when `[comparison]` is configured):
 
@@ -89,6 +90,7 @@ cargo run --bin integration_tests -- benchmark -c custom.toml gpa
 | `get-account-info`            | Single `UiAccount \| null` — direct compare with zstd-aware account-equality                                    |
 | `get-balance`                 | `u64` — direct JSON equality                                                                                    |
 | `get-token-account-balance`   | `UiTokenAmount` object — direct JSON equality                                                                    |
+| `simulate-transaction`        | `result.value` field-by-field: `err`, `logs`, `unitsConsumed`, `loadedAccountsDataSize`, `returnData`, `fee`, `loadedAddresses`, `innerInstructions`, `accounts`, `pre`/`postBalances`; `pre`/`postTokenBalances` are `(accountIndex, mint)`-keyed so ordering is ignored. `replacementBlockhash` is compared only for presence, since each endpoint substitutes its own blockhash. |
 
 **Default encodings used by `extract_encoding_from_request` when the request omits `encoding`** (mirrors Agave's per-method defaults):
 
@@ -164,17 +166,42 @@ Loads a static array of JSON-RPC request bodies from a file. Requests cycle inde
 
 #### `type = "victoria_logs"`
 
-Fetches real request bodies from a VictoriaLogs instance. Refreshes automatically every 60 seconds during the benchmark run with fresh logs.
+Fetches real request bodies from a VictoriaLogs instance. Refreshes automatically every `poll_interval_secs` (default 60) during the benchmark run with fresh logs.
 
-| Field              | Default      | Description                                                                                                                                                                                                                                                        |
-| ------------------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `url`              | _(required)_ | VictoriaLogs query endpoint URL                                                                                                                                                                                                                                    |
-| `minutes`          | _(none)_     | Time window in minutes for the log query. If omitted, no time constraint is applied                                                                                                                                                                                |
-| `limit`            | `1000`       | Maximum number of log entries to fetch per query                                                                                                                                                                                                                   |
-| `min_request_size` | _(none)_     | Only include requests where the response was at least this many bytes                                                                                                                                                                                              |
-| `max_request_size` | _(none)_     | Only include requests where the response was at most this many bytes                                                                                                                                                                                               |
-| `encoding`         | _(none)_     | Filter requests by encoding. See [VictoriaLogs encoding filter](#victorialogs-encoding-filter) below. Supports `\|` for multiple (e.g. `"base58\|jsonParsed"`) |
-| `inject_context`   | `false`      | If `true`, when a no-context mismatch is detected, re-sends the request with `withContext: true` injected and runs slot compensation before deciding if it's a real mismatch. Eliminates false positives from slot lag on requests originally sent without context |
+| Field                | Default      | Description                                                                                                                                                                                                                                                        |
+| -------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `url`                | _(required)_ | VictoriaLogs query endpoint URL                                                                                                                                                                                                                                    |
+| `minutes`            | _(none)_     | Time window in minutes for the log query. If omitted, no time constraint is applied                                                                                                                                                                                |
+| `window_seconds`     | _(none)_     | Trailing time window in seconds (`_time:>now-Ns`). Takes precedence over `minutes`. Use for request types that expire quickly                                                                                                                                       |
+| `limit`              | `1000`       | Maximum number of log entries to fetch per query                                                                                                                                                                                                                   |
+| `min_request_size`   | _(none)_     | Only include requests where the response was at least this many bytes                                                                                                                                                                                              |
+| `max_request_size`   | _(none)_     | Only include requests where the response was at most this many bytes                                                                                                                                                                                               |
+| `encoding`           | _(none)_     | Filter requests by encoding. See [VictoriaLogs encoding filter](#victorialogs-encoding-filter) below. Supports `\|` for multiple (e.g. `"base58\|jsonParsed"`) |
+| `inject_context`     | `false`      | If `true`, when a no-context mismatch is detected, re-sends the request with `withContext: true` injected and runs slot compensation before deciding if it's a real mismatch. Eliminates false positives from slot lag on requests originally sent without context |
+| `poll_interval_secs` | `60`         | How often the background fetcher re-queries VictoriaLogs                                                                                                                                                                                                            |
+| `replay_once`        | `false`      | Deduplicate by the log's `req_id` and send each request exactly once instead of cycling the pool. Required for requests that expire                                                                                                                                 |
+
+##### Replaying simulateTransaction
+
+A `simulateTransaction` request carries a `recentBlockhash` that the cluster only accepts for
+~150 blocks (~60s). VictoriaLogs ingestion lag is 1–9s, so a request must be replayed within
+seconds of being logged. Three settings make that work, and all three are required:
+
+- `window_seconds = 30` — a short trailing window instead of whole minutes.
+- `poll_interval_secs = 5` — fetch new arrivals promptly.
+- `replay_once = true` — send each `req_id` once. Without it the spawner cycles the pool at
+  `target_rps`, replaying the same transactions until their blockhashes expire.
+
+Pair with `[benchmark].start_on_first_request = true` so the `duration_secs` countdown begins
+when the first request is picked up rather than while waiting for the first poll.
+
+Two known, non-bug divergence classes when comparing against an Agave validator:
+
+- **`AlreadyProcessed` on the Agave side.** Clients typically submit the transaction a second
+  after simulating it, so by replay time it has landed and Agave's signature status cache
+  rejects it. Cloudbreak has no status cache and re-executes. Only affects requests that do
+  *not* set `replaceRecentBlockhash: true` (replacing the blockhash changes the status-cache key).
+- **`BlockhashNotFound` on one side only** when a request's original blockhash expires mid-run.
 
 ##### VictoriaLogs tips
 

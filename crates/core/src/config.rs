@@ -117,6 +117,11 @@ impl AccountSelectorConfig {
     pub fn supports_vote_accounts(&self) -> bool {
         self.is_program_selected(&VOTE_PROGRAM_ID) && self.is_program_selected(&STAKE_PROGRAM_ID)
     }
+
+    /// `simulateTransaction` requires a full unfiltered index
+    pub fn supports_simulation(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
 }
 
 pub const VOTE_PROGRAM_ID: Pubkey =

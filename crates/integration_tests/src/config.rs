@@ -62,6 +62,9 @@ pub struct BenchmarkConfig {
 
     #[serde(default = "defaults::timeout_secs")]
     pub timeout_secs: u64,
+
+    #[serde(default)]
+    pub start_on_first_request: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -75,6 +78,7 @@ pub enum SourceConfig {
         url: String,
         /// Time window in minutes. If omitted, no time constraint is applied.
         minutes: Option<u32>,
+        window_seconds: Option<u32>,
         #[serde(default = "defaults::vlogs_limit")]
         limit: u32,
         min_request_size: Option<u64>,
@@ -85,6 +89,10 @@ pub enum SourceConfig {
         /// deciding whether it's a real mismatch.
         #[serde(default)]
         inject_context: bool,
+        #[serde(default = "defaults::poll_interval_secs")]
+        poll_interval_secs: u64,
+        #[serde(default)]
+        replay_once: bool,
     },
 
     #[serde(rename = "mismatch_dir")]
@@ -105,6 +113,13 @@ impl SourceConfig {
     pub fn retry_with_context(&self) -> bool {
         match self {
             SourceConfig::VictoriaLogs { inject_context, .. } => *inject_context,
+            _ => false,
+        }
+    }
+
+    pub fn replay_once(&self) -> bool {
+        match self {
+            SourceConfig::VictoriaLogs { replay_once, .. } => *replay_once,
             _ => false,
         }
     }
@@ -170,6 +185,9 @@ mod defaults {
     }
     pub fn vlogs_limit() -> u32 {
         1000
+    }
+    pub fn poll_interval_secs() -> u64 {
+        60
     }
     pub fn compare_ratio() -> f64 {
         1.0

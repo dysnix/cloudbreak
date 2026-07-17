@@ -10,7 +10,7 @@ use hyper::body::Incoming;
 use hyper::{Request, StatusCode};
 use serde::Serialize;
 use solana_commitment_config::CommitmentConfig;
-use solana_rpc_client_api::config::{RpcAccountInfoConfig, RpcContextConfig};
+use solana_rpc_client_api::config::{RpcAccountInfoConfig, RpcContextConfig, RpcSimulateTransactionConfig};
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::time::Instant;
@@ -157,6 +157,18 @@ async fn process_single_request(
             let config: Option<methods::vote_accounts::GetVoteAccountsConfig> =
                 extract_param(&rpc_request.params, 0).ok().flatten();
             let result = methods::vote_accounts::get_vote_accounts(state, config).await;
+            json_serialize_response(id, result).await
+        }
+        "simulateTransaction" => {
+            let transaction: String = match extract_param(&rpc_request.params, 0) {
+                Ok(p) => p,
+                Err(e) => return make_error_response(id, -32602, e),
+            };
+            let config: Option<RpcSimulateTransactionConfig> =
+                extract_param(&rpc_request.params, 1).ok().flatten();
+            let result =
+                methods::simulate_transaction::simulate_transaction(state, transaction, config)
+                    .await;
             json_serialize_response(id, result).await
         }
         "getAccountInfo" => {
