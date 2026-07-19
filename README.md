@@ -75,7 +75,7 @@ The **cluster tracker** is a [Blockdaemon `solcluster tracker`](https://github.c
 | `crates/api/`               | `cloudbreak-api`           | HTTP JSON-RPC server (Hyper). Serves `getProgramAccounts`, `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenAccountsByMint`, `getAccountInfo`, `getMultipleAccounts`, `getBalance`, `getTokenAccountBalance`, `getSlot`, `getHealth`, `getVersion`, `getGenesisHash`, and (when the Vote and Stake programs are indexed) `getVoteAccounts`. Streams `getProgramAccounts` and `getTokenAccountsByMint` responses as chunked JSON-RPC body frames, applies per-request `statement_timeout` and a total request timeout, supports batch requests with bounded concurrency, optionally caches results in memory (`[gpa-cache]`), and reports query usage to the query tracker.                                                                   |
 | `crates/index/`             | `cloudbreak-index`         | Live indexer. Subscribes to Yellowstone gRPC, applies program filters, writes account/slot state to Postgres. Includes finalize-slot pipeline, self-healing for slot gaps. Uses the `snapshot` crate to optionally load a full snapshot on startup for fast bootstrapping.                                                                                 |
 | `crates/snapshot/`          | `cloudbreak-snapshot`      | Batch loads Solana full and incremental snapshots. Queries a cluster tracker (`/v1/snapshots`) to find a covering snapshot pair, downloads the archives from the source reported by the tracker, unpacks them, reads Solana `AccountsFile` entries, bulk-upserts into Postgres, handles deduplication, optional partition clustering, and index creation. |
-| `crates/query-tracker/`     | `cloudbreak-query-tracker` | JSON-RPC sidecar service (jsonrpsee). Counts `getProgramAccounts`-shaped queries, maintains a priority queue, and optionally drives automatic `CREATE INDEX` on Postgres based on query frequency. Includes periodic query count resets.                                                                                                                   |
+| `crates/query-tracker/`     | `cloudbreak-query-tracker` | HTTP sidecar service (Hyper). Records `getProgramAccounts`-shaped demand in a durable `index_patterns` table, ranks candidates by a configurable priority mode, and optionally drives automatic `CREATE INDEX`/eviction on Postgres, reconciling API demand against Postgres `idx_scan` supply. Fully restartable; exposes `/track`, `/debug/*`, `/metrics`, `/health` on a single port.                                                                                                                   |
 | `crates/core/`              | `cloudbreak-core`          | Shared library. Contains all configuration struct definitions (TOML deserialization), database connection helpers, the `AccountOwnerMap` abstraction, and the `AccountSelectorConfig` (include/exclude program filter logic synced to DB).                                                                                                                 |
 | `crates/entity/`            | `cloudbreak-entity`        | SeaORM entity definitions for Postgres tables: `accounts`, `snapshot_accounts`, `slots`, `service_health`. Also defines the `CommitmentLevel` enum and account conversion types. (The `environment_info` table is accessed via raw SQL in `cloudbreak-core`, not as a SeaORM entity.)                                                                       |
 | `crates/migration/`         | `cloudbreak-migration`     | Schema evolution via `sea-orm-migration`. Defines `accounts`/`snapshot_accounts` DDL helpers with TOML-configurable owner partitioning (none / HASH / LIST / LIST+HASH) and per-index toggles, plus bs58 encode/decode PL/pgSQL functions, the `service_health` table, and the `environment_info` table (program filter + Solana version). See [`crates/migration/README.md`](crates/migration/README.md).                                                                                                                |
@@ -502,34 +502,44 @@ OpenTelemetry tracing configuration. If this section is omitted, OTel is disable
 | Key               | Type     | Default     | Description                 |
 | ----------------- | -------- | ----------- | --------------------------- |
 | `host`            | `String` | `"0.0.0.0"` | Bind address.               |
-| `port`            | `u16`    | `4001`      | Listen port for JSON-RPC.   |
+| `port`            | `u16`    | `4001`      | Listen port for the single HTTP server, which serves both the functional endpoints (`/track`, `/debug/*`) and the operational endpoints (`/metrics`, `/health`). |
 | `max-connections` | `u32`    | `100`       | Max concurrent connections. |
 
 #### `[database]`
 
 Same as other services.
 
-#### `[metrics]`
-
-| Key    | Type     | Default     | Description                                              |
-| ------ | -------- | ----------- | -------------------------------------------------------- |
-| `host` | `String` | `"0.0.0.0"` | Metrics bind address.                                    |
-| `port` | `u16`    | `8876`      | Metrics port (note: different default from API/indexer). |
-
 #### `[query-tracker]`
 
-Controls the automatic database index creation behavior.
+Controls demand recording, automatic index creation, usage-based eviction and
+discrepancy detection. All state lives in the `index_patterns` table, so the
+service is fully restartable; these keys only tune behavior. Defaults reproduce
+the previous behavior.
 
-| Key                           | Type          | Default      | Description                                                                                                                               |
-| ----------------------------- | ------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `create-database-indexes`     | `bool`        | `false`      | Enable automatic `CREATE INDEX` based on query frequency.                                                                                 |
-| `index-generation-threshold`  | `u32`         | `10`         | Number of times a unique query must be seen before it becomes eligible for indexing.                                                      |
-| `index-creation-delay`        | `Duration`    | `"10s"`      | Delay between `CREATE INDEX` operations to avoid overloading the database.                                                                |
-| `query-counts-reset-interval` | `Duration`    | `"24h"`      | Interval at which the query count queue is cleared.                                                                                       |
-| `included-programs`           | `Vec<String>` | `[]`         | Only create indexes for these program pubkeys. Empty means all programs are eligible.                                                     |
-| `excluded-programs`           | `Vec<String>` | `[]`         | Never create indexes for these program pubkeys.                                                                                           |
-| `indexer-metrics`             | `String`      | **required** | `host:port` of the indexer's Prometheus metrics endpoint (e.g. `"localhost:8875"`). Used to check indexer health before creating indexes. |
-| `indexer-metrics-threshold`   | `u64`         | `5`          | The `cloudbreak_finalize_slot_handler_queue_size` metric threshold; index creation is paused when the indexer queue exceeds this value.    |
+| Key                             | Type          | Default      | Description                                                                                                                               |
+| ------------------------------- | ------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `create-database-indexes`       | `bool`        | `false`      | Enable automatic `CREATE INDEX` from recorded demand. When off, demand is still recorded.                                                 |
+| `index-generation-threshold`    | `u32`         | `10`         | Minimum demand count before a pattern becomes a creation candidate.                                                                       |
+| `index-creation-delay`          | `Duration`    | `"10s"`      | Poll interval of the creation loop.                                                                                                       |
+| `priority-mode`                 | `String`      | `"frequency"`| Candidate ranking: `frequency`, `cost`, `cost-per-hit` (heaviest single queries first), or `weighted`.                                    |
+| `cost-eligibility-threshold-us` | `u64?`        | (none)       | Only patterns whose average cost-per-hit reaches this many µs are eligible.                                                               |
+| `cost-weight` / `failure-weight`| `f64`         | `0.0`        | Weights for `priority-mode = "weighted"` (blend of demand, cost and failed/timed-out requests).                                           |
+| `included-programs`             | `Vec<String>` | `[]`         | Only create indexes for these program pubkeys. Empty means all programs are eligible.                                                     |
+| `excluded-programs`             | `Vec<String>` | `[]`         | Never create indexes for these program pubkeys.                                                                                           |
+| `indexer-metrics`               | `String`      | **required** | `host:port` of the indexer's Prometheus metrics endpoint. Used to defer DDL (create/drop) when the indexer is behind.                     |
+| `indexer-metrics-threshold`     | `u64`         | `5`          | `cloudbreak_finalize_slot_handler_queue_size` threshold above which DDL is deferred.                                                       |
+| `max-auto-indexes`              | `usize?`      | (none)       | Optional cap on total indexes on the `snapshot_accounts` table.                                                                          |
+| `index-eviction-enabled`        | `bool`        | `false`      | Enable usage-based eviction of idle auto-indexes.                                                                                         |
+| `index-eviction-interval`       | `Duration`    | `"1h"`       | How often the eviction pass runs.                                                                                                        |
+| `index-min-age-grace`           | `Duration`    | `"1h"`       | Minimum age before an index is eligible for eviction.                                                                                    |
+| `index-min-idle`                | `Duration`    | `"24h"`      | An index must see neither demand nor `idx_scan` for this long to be idle.                                                                |
+| `eviction-fill-threshold`       | `f64`         | `0.9`        | Only evict once the capped table is this fraction full (needs `max-auto-indexes`).                                                        |
+| `drop-lock-timeout`             | `Duration`    | `"5s"`       | `lock_timeout` for each `DROP INDEX`; on timeout the drop is skipped and retried next pass.                                              |
+| `drop-retries`                  | `u32`         | `1`          | Extra `DROP INDEX` attempts on lock timeout within a pass.                                                                               |
+| `discrepancy-enabled`           | `bool`        | `true`       | Flag/metric when demand (API) and supply (`idx_scan`) diverge (e.g. Postgres ignoring an index).                                          |
+| `discrepancy-delta`             | `f64`         | `0.10`       | Relative gap between demand and supply beyond which a pattern is flagged.                                                                |
+| `explain-enabled`               | `bool`        | `false`      | Optional third signal: periodic `EXPLAIN` (plan only) sampling of each index.                                                            |
+| `explain-interval`              | `Duration`    | `"6h"`       | How often the EXPLAIN sampling pass runs when enabled.                                                                                   |
 
 ### Snapshot Processor (`cloudbreak.snapshot.toml`)
 
@@ -569,15 +579,28 @@ Same as other services.
 
 ## Automatic Database Index Creation
 
-The query tracker enables automatic creation of database indexes based on observed query patterns. This is how it works:
+The query tracker enables automatic creation of database indexes based on observed query patterns. All decision state is persisted in the durable `index_patterns` table, so the service is fully restartable and never loses recorded demand. This is how it works:
 
-1. The API server counts unique `getProgramAccounts`-shaped queries and reports them to the query tracker service.
-2. When a query pattern exceeds `index-generation-threshold` within a reset interval, it becomes eligible for indexing.
-3. A background task in the query tracker pops the highest-count query from the priority queue and runs `CREATE INDEX` on the database.
-4. Only one index is created at a time, with a configurable delay (`index-creation-delay`) between operations to avoid overloading the database.
-5. Before creating an index, the query tracker checks the indexer's `cloudbreak_finalize_slot_handler_queue_size` metric. If the queue size exceeds `indexer-metrics-threshold`, index creation is paused until the indexer catches up.
-6. The query count queue is cleared every `query-counts-reset-interval` to avoid stale patterns driving index creation.
+1. The API server reports `getProgramAccounts`-shaped query demand (request counts, cost, failures) to the query tracker at the `/track` endpoint, which folds it into each pattern's row in `index_patterns`.
+2. When a pattern's cumulative demand reaches `index-generation-threshold`, it becomes a creation candidate. Demand is cumulative and persisted — there is no reset interval.
+3. The creation loop wakes every `index-creation-delay`, ranks the candidates on read according to `priority-mode` (`frequency`, `cost`, `cost-per-hit`, or `weighted`), and builds the highest-priority one. Indexes are always created as a **pair** on the `accounts` and `snapshot_accounts` tables.
+4. Only one index pair is created per tick, to avoid overloading the database.
+5. Before creating (or dropping) an index, the query tracker checks the indexer's `cloudbreak_finalize_slot_handler_queue_size` metric. If it exceeds `indexer-metrics-threshold`, DDL is deferred until the indexer catches up.
+6. If `max-auto-indexes` is set and the `snapshot_accounts` table has reached that cap, index creation is **paused** until eviction makes room again. Candidates are kept queued in `index_patterns` with no loss of data.
 7. Use `included-programs` and `excluded-programs` to control which programs are eligible for automatic indexing.
+
+### Eviction and observability
+
+When `index-eviction-enabled` is set, a periodic pass (`index-eviction-interval`) reclaims index budget, but conservatively. An index pair is only ever dropped when **all** of these hold (any one failing defers the drop, never losing the pattern):
+
+- `track_counts` is on in Postgres — otherwise `idx_scan` is frozen and the whole pass is skipped, so stale stats can never drive a drop;
+- `max-auto-indexes` is set **and** the `snapshot_accounts` table is at/above `eviction-fill-threshold` — below the fill line nothing is dropped;
+- the pair has seen neither demand nor `idx_scan` growth for `index-min-idle`, and is older than `index-min-age-grace` — requiring *both* demand and scans to be quiet is what stops a still-wanted index from being dropped and avoids the drop→rebuild churn loop;
+- the indexer is not under backpressure.
+
+When over the fill line(`eviction-fill-threshold`), the least-useful eligible pairs (fewest scans, then least demand) are dropped just until the table is back at the target.
+
+Discrepancy detection (`discrepancy-enabled`) and `EXPLAIN` sampling (`explain-enabled`) are **observational only**: they flag/log when API demand and Postgres `idx_scan` diverge, or when the planner would not use an index, surfacing problems on `/debug/*` and `/metrics`. They never create or drop anything and do not gate eviction.
 
 ## Self-Healing (Slot Gap Detection and Repair)
 
@@ -659,7 +682,7 @@ Add a `[tracing]` section to any service config to enable OTLP trace export. Whe
 
 ## HTTP Endpoints
 
-Each service exposes HTTP endpoints on its metrics port (or server port for the API). Below is a breakdown per service.
+Each service exposes HTTP endpoints on its metrics port (or server port for the API and query tracker). Below is a breakdown per service.
 
 ### API Server (default `:4000`)
 
@@ -680,12 +703,18 @@ Each service exposes HTTP endpoints on its metrics port (or server port for the 
 | `/debug/modules/self_healing` | GET    | Inspects self-healing gap state. Returns JSON with the DB chain tips and the still-missing slots grouped into gaps (each with `boundary_slot`, `start`/`end`, `len`, and `slots_behind_confirmed`). Supports `?detail=summary\|slots\|full` (`summary` returns only the `stats` counts, omitting the gap list), plus `?min_slot`, `?max_slot`, `?limit` to filter the gap view. See the rustdoc on `handle` in `crates/index/src/operational_endpoints/self_healing.rs`.                                                                                                                   |
 | `/debug/accounts_owner_map`   | GET    | Returns debug info about the in-memory account-to-owner map. Only populated when `accounts-owner-map-enabled = true` in the indexer config.                                                                                            |
 
-### Query Tracker (default metrics port `:8876`)
+### Query Tracker (default `:4001`)
 
-| Endpoint   | Method | Description                                 |
-| ---------- | ------ | ------------------------------------------- |
-| `/metrics` | GET    | Prometheus metrics.                         |
-| `/health`  | GET    | Returns `200 OK` if the service is running. |
+All endpoints — functional and operational — are served on the single server port.
+
+| Endpoint                 | Method | Description                                                                             |
+| ------------------------ | ------ | --------------------------------------------------------------------------------------- |
+| `/track`                 | POST   | Ingest a batch of observed `getProgramAccounts`-shaped demand (body is a `TrackBatch`). |
+| `/debug/candidates`      | GET    | The ranked creation queue, each candidate annotated with its priority score.            |
+| `/debug/created`         | GET    | Currently active auto-created indexes with demand (API) vs. supply (`idx_scan`).        |
+| `/debug/discrepancies`   | GET    | Created indexes where demand and supply disagree (e.g. planner ignoring an index).      |
+| `/metrics`               | GET    | Prometheus metrics.                                                                     |
+| `/health`                | GET    | Returns `200 OK` if the service is running.                                             |
 
 ## Metrics Reference
 
@@ -747,7 +776,21 @@ Snapshot metrics are emitted whenever snapshot processing runs — either embedd
 
 ### Query Tracker (`cloudbreak-query-tracker`)
 
-The query-tracker service exposes `/metrics` for protocol compatibility but does not currently register any service-specific metrics. The endpoint returns an empty Prometheus payload. Use `/health` for liveness probes.
+The query tracker exposes its metrics on `/metrics` (same port as `/track` and `/debug/*`). Aggregate gauges and the lifecycle counters are refreshed by the eviction pass; the per-index gauges are labelled with the human-readable index name so a dashboard can show demand (API) against supply (`idx_scan`) per active index. Use `/health` for liveness probes.
+
+| Metric                                          | Type        | Labels  | Description                                                                                                          |
+| ----------------------------------------------- | ----------- | ------- | ------------------------------------------------------------------------------------------------------------------ |
+| `query_tracker_snapshot_accounts_indexes_total` | IntGauge    | —       | Current number of indexes present on the capped `snapshot_accounts` table (the value the `max-auto-indexes` cap and `eviction-fill-threshold` are measured against). |
+| `query_tracker_patterns_total`                  | IntGauge    | —       | Number of distinct index patterns tracked, in any status (candidate/created/evicted).                              |
+| `query_tracker_created_indexes`                 | IntGauge    | —       | Number of auto-index patterns currently in the `created` state.                                                    |
+| `query_tracker_discrepant_indexes`              | IntGauge    | —       | Number of created indexes where demand (API) and supply (`idx_scan`) currently diverge (see `discrepancy-enabled`). |
+| `query_tracker_index_created_total`             | IntCounter  | —       | Cumulative number of auto-index pairs created.                                                                     |
+| `query_tracker_index_evicted_total`             | IntCounter  | —       | Cumulative number of auto-index pairs evicted.                                                                     |
+| `query_tracker_index_create_failures_total`     | IntCounter  | —       | Cumulative number of failed auto-index creation attempts.                                                          |
+| `query_tracker_observations_total`              | IntCounter  | —       | Cumulative number of accepted demand observations ingested via `/track`.                                           |
+| `query_tracker_index_demand`                    | IntGaugeVec | `index` | Cumulative API demand (request count) per created index.                                                           |
+| `query_tracker_index_idx_scan`                  | IntGaugeVec | `index` | Postgres `idx_scan` (supply) per created index.                                                                    |
+| `query_tracker_index_variety`                   | IntGaugeVec | `index` | Estimated distinct filter values served per created index (HyperLogLog variety estimate).                          |
 
 ## dbtools CLI
 

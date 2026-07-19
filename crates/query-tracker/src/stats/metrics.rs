@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+/*
+ * Copyright 2025-2026 Triton One Limited. All rights reserved.
+ */
+
+//! Metrics — Prometheus registry and the gauges/counters the tracker exposes.
+//!
+//! This module only *defines and holds* the metrics; the `/metrics` endpoint is
+//! served by `server::operational`. Per-index gauges are labelled with the
+//! human-readable index name (see `IndexIdentity::human_name`) so a dashboard
+//! can show, per active index, both its demand (API) and its supply
+//! (`idx_scan`) — which is exactly what makes discrepancies visible.
+
+use prometheus::{IntCounter, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
+
+lazy_static::lazy_static! {
+    pub static ref REGISTRY: Registry = Registry::new();
+
+    /// Current number of indexes present on the capped table.
+    pub static ref SNAPSHOT_ACCOUNTS_INDEXES: IntGauge = register_gauge(
+        "query_tracker_snapshot_accounts_indexes_total",
+        "Current number of indexes on the snapshot_accounts table",
+    );
+
+    /// Total distinct patterns known (any status).
+    pub static ref PATTERNS_TOTAL: IntGauge = register_gauge(
+        "query_tracker_patterns_total",
+        "Number of distinct index patterns tracked",
+    );
+
+    /// Patterns currently in the `created` state.
+    pub static ref CREATED_INDEXES: IntGauge = register_gauge(
+        "query_tracker_created_indexes",
+        "Number of auto-index patterns currently in the created state",
+    );
+
+    /// Patterns currently flagged as demand/supply discrepant.
+    pub static ref DISCREPANT_INDEXES: IntGauge = register_gauge(
+        "query_tracker_discrepant_indexes",
+        "Number of created indexes where demand and supply currently diverge",
+    );
+
+    /// Cumulative index-pair creations.
+    pub static ref INDEX_CREATED_TOTAL: IntCounter = register_counter(
+        "query_tracker_index_created_total",
+        "Cumulative number of auto-index pairs created",
+    );
+
+    /// Cumulative index-pair evictions.
+    pub static ref INDEX_EVICTED_TOTAL: IntCounter = register_counter(
+        "query_tracker_index_evicted_total",
+        "Cumulative number of auto-index pairs evicted",
+    );
+
+    /// Cumulative failed creation attempts.
+    pub static ref INDEX_CREATE_FAILURES_TOTAL: IntCounter = register_counter(
+        "query_tracker_index_create_failures_total",
+        "Cumulative number of failed auto-index creation attempts",
+    );
+
+    /// Cumulative accepted track observations.
+    pub static ref OBSERVATIONS_TOTAL: IntCounter = register_counter(
+        "query_tracker_observations_total",
+        "Cumulative number of accepted demand observations",
+    );
+
+    /// Per-index demand (cumulative API request count), labelled by index name.
+    pub static ref INDEX_DEMAND: IntGaugeVec = register_gauge_vec(
+        "query_tracker_index_demand",
+        "Cumulative API demand (request count) per created index",
+    );
+
+    /// Per-index supply (`idx_scan`), labelled by index name.
+    pub static ref INDEX_IDX_SCAN: IntGaugeVec = register_gauge_vec(
+        "query_tracker_index_idx_scan",
+        "Postgres idx_scan (supply) per created index",
+    );
+
+    /// Per-index distinct-value variety estimate, labelled by index name.
+    pub static ref INDEX_VARIETY: IntGaugeVec = register_gauge_vec(
+        "query_tracker_index_variety",
+        "Estimated distinct filter values served per created index",
+    );
+}
+
+fn register_gauge(name: &str, help: &str) -> IntGauge {
+    let g = IntGauge::new(name, help).expect("failed to create gauge");
+    REGISTRY
+        .register(Box::new(g.clone()))
+        .expect("failed to register gauge");
+    g
+}
+
+fn register_counter(name: &str, help: &str) -> IntCounter {
+    let c = IntCounter::new(name, help).expect("failed to create counter");
+    REGISTRY
+        .register(Box::new(c.clone()))
+        .expect("failed to register counter");
+    c
+}
+
+fn register_gauge_vec(name: &str, help: &str) -> IntGaugeVec {
+    let g = IntGaugeVec::new(Opts::new(name, help), &["index"]).expect("failed to create gaugevec");
+    REGISTRY
+        .register(Box::new(g.clone()))
+        .expect("failed to register gaugevec");
+    g
+}
+
+/// Render the registry in Prometheus text format.
+pub fn encode() -> String {
+    TextEncoder::new()
+        .encode_to_string(&REGISTRY.gather())
+        .unwrap_or_else(|error| {
+            tracing::error!(target: "query_tracker_metrics", "could not encode metrics: {error}");
+            String::new()
+        })
+}
+
+/// Force-initialise the lazy statics so metrics appear before the first update.
+pub fn init() {
+    lazy_static::initialize(&SNAPSHOT_ACCOUNTS_INDEXES);
+    lazy_static::initialize(&PATTERNS_TOTAL);
+    lazy_static::initialize(&CREATED_INDEXES);
+    lazy_static::initialize(&DISCREPANT_INDEXES);
+    lazy_static::initialize(&INDEX_CREATED_TOTAL);
+    lazy_static::initialize(&INDEX_EVICTED_TOTAL);
+    lazy_static::initialize(&INDEX_CREATE_FAILURES_TOTAL);
+    lazy_static::initialize(&OBSERVATIONS_TOTAL);
+    lazy_static::initialize(&INDEX_DEMAND);
+    lazy_static::initialize(&INDEX_IDX_SCAN);
+    lazy_static::initialize(&INDEX_VARIETY);
+}
