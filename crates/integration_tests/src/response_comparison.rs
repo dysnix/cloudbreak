@@ -6,7 +6,7 @@
 use anyhow::Result;
 use base64::Engine as _;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::benchmark::RequestType;
@@ -182,6 +182,7 @@ pub fn compare_responses(
             compare_value_direct(response1, response2)
         }
         RequestType::SimulateTransaction => compare_simulate_responses(response1, response2),
+        RequestType::GetSupply => compare_supply_responses(response1, response2),
     };
 
     CompareResponsesResult::new_with_matching_context(matches, compare_context_result)
@@ -196,6 +197,35 @@ fn compare_value_direct(response1: &JsonValue, response2: &JsonValue) -> bool {
 }
 
 static NULL_VALUE: JsonValue = JsonValue::Null;
+
+fn compare_supply_responses(response1: &JsonValue, response2: &JsonValue) -> bool {
+    let v1 = response1.get("result").and_then(|r| r.get("value"));
+    let v2 = response2.get("result").and_then(|r| r.get("value"));
+
+    let (v1, v2) = match (v1, v2) {
+        (Some(v1), Some(v2)) => (v1, v2),
+        _ => return v1 == v2,
+    };
+
+    if ["total", "circulating", "nonCirculating"]
+        .iter()
+        .any(|key| field(v1, key) != field(v2, key))
+    {
+        return false;
+    }
+
+    let accounts_set = |value: &JsonValue| -> Option<HashSet<String>> {
+        field(value, "nonCirculatingAccounts")
+            .as_array()
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|a| a.as_str().map(String::from))
+                    .collect()
+            })
+    };
+    accounts_set(v1) == accounts_set(v2)
+}
 
 fn field<'a>(value: &'a JsonValue, key: &str) -> &'a JsonValue {
     value.get(key).unwrap_or(&NULL_VALUE)

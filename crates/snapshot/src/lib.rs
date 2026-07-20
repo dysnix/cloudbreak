@@ -15,7 +15,8 @@ use yellowstone_grpc_proto::geyser::{
     SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
 };
 use cloudbreak_core::{
-    Result, SnapshotConfig, modules::account_owner_map::AccountOwnerMap,
+    Result, SnapshotConfig,
+    modules::{account_owner_map::AccountOwnerMap, supply_tracker::SupplyTracker},
 };
 
 use crate::{
@@ -45,6 +46,7 @@ pub async fn run(
     metrics_registry: Option<prometheus::Registry>,
     buffer_size: Option<Arc<Mutex<usize>>>,
     accounts_owner_map: AccountOwnerMap,
+    supply_tracker: SupplyTracker,
 ) -> Result<()> {
     let start_time = Instant::now();
 
@@ -72,6 +74,7 @@ pub async fn run(
         &database,
         config.clone(),
         accounts_owner_map.clone(),
+        supply_tracker.clone(),
     );
 
     // Process incremental snapshot only if needed
@@ -83,6 +86,7 @@ pub async fn run(
             &database,
             config.clone(),
             accounts_owner_map.clone(),
+            supply_tracker.clone(),
         )
         .await??;
 
@@ -92,6 +96,12 @@ pub async fn run(
     full_snapshot_handle.await??;
 
     tracing::info!(target: "full_snapshot_completed", "Full snapshot completed successfully in {} secs", start_time.elapsed().as_secs_f64());
+
+    if let Some(commit) = supply_tracker.finish_bootstrap()
+        && let Err(e) = db_queries::persist_supply_total(&database, &commit).await
+    {
+        tracing::error!("Failed to persist bootstrapped supply total: {:?}", e);
+    }
 
     if let Some(buffer_size) = buffer_size {
         db_queries::cluster_snapshot_accounts_table(
@@ -121,6 +131,7 @@ fn download_and_process_snapshot(
     database: &DatabaseConnection,
     config: SnapshotConfig,
     accounts_owner_map: AccountOwnerMap,
+    supply_tracker: SupplyTracker,
 ) -> JoinHandle<Result<()>> {
     let db_clone = database.clone();
 
@@ -137,7 +148,14 @@ fn download_and_process_snapshot(
             tracing::error!("Failed to download snapshot: {:?} ({:?})", e, snapshot_type);
         })?;
 
-        process_downloaded_snapshot(&db_clone, snapshot_data, config, accounts_owner_map).await?;
+        process_downloaded_snapshot(
+            &db_clone,
+            snapshot_data,
+            config,
+            accounts_owner_map,
+            supply_tracker,
+        )
+        .await?;
 
         Ok(())
     })
@@ -149,6 +167,7 @@ async fn process_downloaded_snapshot(
     snapshot_data: SnapshotData,
     config: SnapshotConfig,
     accounts_owner_map: AccountOwnerMap,
+    supply_tracker: SupplyTracker,
 ) -> Result<()> {
     let start_time = Instant::now();
     let total_accounts_files_opening_time_micros = Arc::new(Mutex::new(0));
@@ -158,10 +177,18 @@ async fn process_downloaded_snapshot(
     let sidecar::UnpackedSnapshot {
         account_files: solana_snapshot,
         stake_data,
+        bank_info,
     } = sidecar::unpack_compressed_snapshot(path, &base_dir, snapshot_data.slot)?;
 
     if let Err(e) = db_queries::persist_epoch_stakes(database, &stake_data).await {
         tracing::error!("Failed to persist epoch stakes from snapshot: {:?}", e);
+    }
+
+    if supply_tracker.is_enabled() {
+        supply_tracker.note_anchor(bank_info.slot);
+        if let Err(e) = db_queries::persist_supply_seed(database, &bank_info).await {
+            tracing::error!("Failed to persist supply seed from snapshot: {:?}", e);
+        }
     }
 
     let mut account_file_workers: JoinSet<Result<()>> = JoinSet::new();
@@ -229,6 +256,7 @@ async fn process_downloaded_snapshot(
             insert_into_temp_snapshot_account_versions_tx.clone();
 
         let accounts_owner_map = accounts_owner_map.clone();
+        let supply_tracker = supply_tracker.clone();
 
         account_file_workers.spawn(async move {
             let start_time = Instant::now();
@@ -278,6 +306,11 @@ async fn process_downloaded_snapshot(
                     // Add non closed accounts to the accounts owner map (if enabled)
                     if account.lamports > 0 {
                         accounts_owner_map.upsert_account(&pubkey, &owner, account_file_slot);
+                        supply_tracker.observe_snapshot_account(
+                            account.pubkey,
+                            account_file_slot,
+                            account.lamports,
+                        );
                     }
 
                     let account_update = SubscribeUpdateAccount {
@@ -428,13 +461,14 @@ pub async fn process_downloaded_snapshot_with_gap_filling(
     config: SnapshotConfig,
     gaps_list: Vec<u64>,
     block_sender: Sender<SubscribeUpdateBlock>,
+    supply_tracker: SupplyTracker,
 ) -> Result<()> {
     let start_time = Instant::now();
 
     let path = base_dir.join(&incremental_snapshot_file_name);
     let sidecar::UnpackedSnapshot {
         account_files: solana_snapshot,
-        stake_data: _,
+        ..
     } = sidecar::unpack_compressed_snapshot(path, &base_dir, snapshot_slot)?;
     let mut account_file_workers: JoinSet<Result<()>> = JoinSet::new();
     let accounts_file_concurency = config.accounts_file_concurency.unwrap_or(32);
@@ -493,6 +527,7 @@ pub async fn process_downloaded_snapshot_with_gap_filling(
         }
 
         let block_sender = block_sender.clone();
+        let supply_tracker = supply_tracker.clone();
         account_file_workers.spawn(async move {
             let accounts = AccountsFile::new_for_startup(
                 path,
@@ -518,6 +553,14 @@ pub async fn process_downloaded_snapshot_with_gap_filling(
                         }
                     } else if programs_exclude.contains(account.owner) {
                         return;
+                    }
+
+                    if account.lamports > 0 {
+                        supply_tracker.observe_snapshot_account(
+                            account.pubkey,
+                            account_file_slot,
+                            account.lamports,
+                        );
                     }
 
                     let account_update = SubscribeUpdateAccountInfo {

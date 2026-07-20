@@ -3,7 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use cloudbreak_core::{IndexConfig, SnapshotConfig};
+use cloudbreak_core::{IndexConfig, SnapshotConfig, modules::supply_tracker::SupplyTracker};
 use cloudbreak_snapshot::sidecar::{SnapshotPair, SnapshotType};
 use sea_orm::DatabaseConnection;
 use std::{
@@ -38,15 +38,21 @@ pub struct SelfHealingState {
     /// [`SlotFinalizer::enqueue_gap_boundary`]).
     pub gap_boundaries: Arc<Mutex<BTreeSet<u64>>>,
     pub finalizer: SlotFinalizer,
+    pub supply_tracker: SupplyTracker,
 }
 
 impl SelfHealingState {
-    pub fn new(_config: &IndexConfig, finalizer: SlotFinalizer) -> Self {
+    pub fn new(
+        _config: &IndexConfig,
+        finalizer: SlotFinalizer,
+        supply_tracker: SupplyTracker,
+    ) -> Self {
         Self {
             last_slot_received: Arc::new(Mutex::new(0)),
             gaps_list: Arc::new(Mutex::new(Vec::new())),
             gap_boundaries: Arc::new(Mutex::new(BTreeSet::new())),
             finalizer,
+            supply_tracker,
         }
     }
 
@@ -130,6 +136,10 @@ impl SelfHealingState {
                 // startup pauses the very worker that completes startup; that is intentionally
                 // unsupported and `fill_gaps` fails fast in that case.
                 self.finalizer.pause().await;
+
+                if self.supply_tracker.mark_stale() {
+                    metrics::SUPPLY_STALE.set(1);
+                }
             }
         }
 
@@ -286,6 +296,7 @@ impl SelfHealingState {
                     snapshot_pair,
                     snapshot_config,
                     covered_gaps_list.clone(),
+                    self.supply_tracker.clone(),
                 ) {
                     Ok((handle, rx)) => (handle, rx),
                     Err(e) => {
@@ -376,6 +387,7 @@ impl SelfHealingState {
                     .expect("Failed to lock gaps_list")
                     .is_empty();
                 if !gaps_remaining {
+                    self.supply_tracker.request_reanchor();
                     self.finalizer.resume().await;
                 }
             }
@@ -451,6 +463,7 @@ fn download_and_process_snapshot_for_gap_filling(
     snapshot_pair: SnapshotPair,
     config: SnapshotConfig,
     gaps_list: Vec<u64>,
+    supply_tracker: SupplyTracker,
 ) -> Result<
     (
         JoinHandle<Result<(), anyhow::Error>>,
@@ -486,6 +499,7 @@ fn download_and_process_snapshot_for_gap_filling(
             config,
             gaps_list,
             tx,
+            supply_tracker,
         )
         .await?;
 

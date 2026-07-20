@@ -5,3 +5,4 @@
 
 pub mod account_owner_map;
 pub mod rpc_filter_type;
+pub mod supply_tracker;

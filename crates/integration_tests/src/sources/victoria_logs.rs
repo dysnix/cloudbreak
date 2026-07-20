@@ -65,6 +65,9 @@ pub fn get_body_query(
         RequestType::SimulateTransaction => format!(
             "query={time_filter}rpc_call:=\"simulateTransaction\" AND pool_dedicated:~\"foundation\" AND body:* | limit {limit}"
         ),
+        RequestType::GetSupply => format!(
+            "query={time_filter}rpc_call:=\"getSupply\" AND body:* | limit {limit}"
+        ),
     }
 }
 

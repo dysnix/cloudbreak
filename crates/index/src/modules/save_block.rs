@@ -37,6 +37,7 @@ pub async fn save_block(
         buffer_channel_rx_len: _,
         finalize_slot_buffer_size,
         accounts_owner_map,
+        supply_tracker,
     } = indexer_state;
 
     let start_time = Instant::now();
@@ -51,6 +52,7 @@ pub async fn save_block(
         snapshot_processing_state.clone(),
         finalize_slot_buffer_size.clone(),
         accounts_owner_map.clone(),
+        supply_tracker.clone(),
     )
     .await;
 
@@ -80,6 +82,8 @@ pub async fn save_block(
     // Create the chunks for updating the "accounts" table
     let system_program_id = [0u8; 32].to_vec();
     for account in block.accounts {
+        supply_tracker.observe_account(&account.pubkey, slot, account.lamports);
+
         // If the account is being closed we still add it to the hashmap for cleanup
         //  but we don't add it to the "accounts" table in a normal fashion, instead we added using [`db_queries::insert_closed_accounts`]
         if account.lamports == 0 {
@@ -245,6 +249,13 @@ pub async fn save_block(
         &config,
     )
     .await;
+
+    if let Some(commit) = supply_tracker.commit_block(slot) {
+        db_queries::upsert_supply_row(db, &commit, &config).await;
+        metrics::SUPPLY_TOTAL_LAMPORTS.set(commit.total as i64);
+        metrics::SUPPLY_SLOT.set(commit.slot as i64);
+        metrics::SUPPLY_STALE.set(0);
+    }
 
     let elapsed = start_time.elapsed().as_secs_f64();
     metrics::record_block_processing(elapsed, "block");

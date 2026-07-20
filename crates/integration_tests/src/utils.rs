@@ -100,6 +100,7 @@ pub fn extract_commitment_from_request(request: &JsonValue, request_type: Reques
         | RequestType::GetTokenAccountBalance
         | RequestType::SimulateTransaction => 1,
         RequestType::Gtabo | RequestType::Gtabd => 2,
+        RequestType::GetSupply => 0,
     };
     request
         .get("params")
@@ -129,7 +130,7 @@ pub fn extract_encoding_from_request(request: &JsonValue, request_type: RequestT
     // getBalance / getTokenAccountBalance have no encoding concept.
     if matches!(
         request_type,
-        RequestType::GetBalance | RequestType::GetTokenAccountBalance
+        RequestType::GetBalance | RequestType::GetTokenAccountBalance | RequestType::GetSupply
     ) {
         return "none".to_string();
     }
@@ -142,7 +143,9 @@ pub fn extract_encoding_from_request(request: &JsonValue, request_type: RequestT
         | RequestType::GetMultipleAccounts
         | RequestType::SimulateTransaction => 1,
         RequestType::Gtabo | RequestType::Gtabd => 2,
-        RequestType::GetBalance | RequestType::GetTokenAccountBalance => unreachable!(),
+        RequestType::GetBalance | RequestType::GetTokenAccountBalance | RequestType::GetSupply => {
+            unreachable!()
+        }
     };
     let encoding = request
         .get("params")
@@ -161,7 +164,9 @@ pub fn extract_encoding_from_request(request: &JsonValue, request_type: RequestT
             RequestType::GetAccountInfo => "binary".to_string(),
             RequestType::GetMultipleAccounts => "base64".to_string(),
             RequestType::SimulateTransaction => "base58".to_string(),
-            RequestType::GetBalance | RequestType::GetTokenAccountBalance => unreachable!(),
+            RequestType::GetBalance
+            | RequestType::GetTokenAccountBalance
+            | RequestType::GetSupply => unreachable!(),
         },
     }
 }

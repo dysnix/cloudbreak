@@ -33,6 +33,7 @@ pub enum RequestType {
     GetBalance,
     GetTokenAccountBalance,
     SimulateTransaction,
+    GetSupply,
 }
 
 pub async fn run(args: &BenchmarkArgs) -> Result<()> {

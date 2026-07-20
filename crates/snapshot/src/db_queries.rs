@@ -16,7 +16,10 @@ use sea_orm::{
 };
 use tokio::time::Instant;
 use yellowstone_grpc_proto::geyser::SubscribeUpdateAccount;
-use cloudbreak_core::SnapshotPgIndexesConfig;
+use cloudbreak_core::{
+    SnapshotPgIndexesConfig,
+    modules::supply_tracker::{SUPPLY_RING_SLOTS, SupplyCommit},
+};
 use cloudbreak_entity::snapshot_accounts::{self};
 
 use crate::metrics;
@@ -554,3 +557,52 @@ pub async fn persist_epoch_stakes(
     Ok(())
 }
 
+pub async fn persist_supply_seed(
+    db: &DatabaseConnection,
+    bank_info: &crate::sidecar::SnapshotBankInfo,
+) -> Result<(), anyhow::Error> {
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "WITH upsert AS ( \
+            INSERT INTO supply (slot, total) VALUES ($1, $2) \
+            ON CONFLICT (slot) DO UPDATE SET total = EXCLUDED.total, updated_at = now() \
+         ) \
+         DELETE FROM supply WHERE slot < $3",
+        [
+            Value::from(bank_info.slot as i64),
+            Value::from(Decimal::from(bank_info.capitalization)),
+            Value::from(bank_info.slot.saturating_sub(SUPPLY_RING_SLOTS) as i64),
+        ],
+    ))
+    .await?;
+
+    tracing::info!(
+        target: "persist_supply_seed",
+        "seeded supply from snapshot: slot {} capitalization {}",
+        bank_info.slot,
+        bank_info.capitalization
+    );
+
+    Ok(())
+}
+
+pub async fn persist_supply_total(
+    db: &DatabaseConnection,
+    commit: &SupplyCommit,
+) -> Result<(), anyhow::Error> {
+    db.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO supply (slot, total, non_circulating_lamports) VALUES ($1, $2, $3) \
+         ON CONFLICT (slot) DO UPDATE SET \
+            total = EXCLUDED.total, \
+            non_circulating_lamports = EXCLUDED.non_circulating_lamports, \
+            updated_at = now()",
+        [
+            Value::from(commit.slot as i64),
+            Value::from(Decimal::from(commit.total)),
+            Value::from(commit.non_circulating.map(Decimal::from)),
+        ],
+    ))
+    .await?;
+    Ok(())
+}

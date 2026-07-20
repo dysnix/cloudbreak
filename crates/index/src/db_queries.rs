@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+use rust_decimal::Decimal;
+use solana_pubkey::Pubkey;
 use sea_orm::{
     ActiveValue::{NotSet, Set},
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
@@ -20,7 +22,13 @@ use tokio::{
     time::{Instant, timeout},
 };
 use yellowstone_grpc_proto::{geyser::CommitmentLevel, prelude::UnixTimestamp};
-use cloudbreak_core::{IndexConfig, modules::account_owner_map::AccountOwnerMap};
+use cloudbreak_core::{
+    IndexConfig,
+    modules::{
+        account_owner_map::AccountOwnerMap,
+        supply_tracker::{SUPPLY_RING_SLOTS, SupplyCommit},
+    },
+};
 use cloudbreak_entity::{accounts, service_health, slots};
 
 use crate::metrics;
@@ -406,6 +414,71 @@ pub async fn insert_recent_blockhash(
 
     if let Err(e) = result {
         tracing::error!("insert_recent_blockhash: failed for slot {}: {}", slot, e);
+        metrics::increment_db_errors();
+    }
+}
+
+pub async fn upsert_supply_row(db: &DatabaseConnection, commit: &SupplyCommit, config: &IndexConfig) {
+    let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
+    let supply = Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "WITH upsert AS ( \
+            INSERT INTO supply (slot, total, non_circulating_lamports) VALUES ($1, $2, $3) \
+            ON CONFLICT (slot) DO UPDATE SET \
+                total = EXCLUDED.total, \
+                non_circulating_lamports = EXCLUDED.non_circulating_lamports, \
+                updated_at = now() \
+         ) \
+         DELETE FROM supply WHERE slot < $4",
+        [
+            Value::from(commit.slot as i64),
+            Value::from(Decimal::from(commit.total)),
+            Value::from(commit.non_circulating.map(Decimal::from)),
+            Value::from(commit.slot.saturating_sub(SUPPLY_RING_SLOTS) as i64),
+        ],
+    );
+    let result = timeout(query_timeout, db.execute(supply))
+        .await
+        .unwrap_or_else(|elapsed| {
+            tracing::error!("upsert_supply_row timeout ERROR: {}", elapsed);
+            Err(sea_orm::DbErr::RecordNotInserted)
+        });
+
+    if let Err(e) = result {
+        tracing::error!("upsert_supply_row failed for slot {}: {}", commit.slot, e);
+        metrics::increment_db_errors();
+    }
+}
+
+pub async fn upsert_non_circulating_accounts(
+    db: &DatabaseConnection,
+    slot: u64,
+    accounts: &[Pubkey],
+) {
+    let accounts: Vec<Value> = accounts
+        .iter()
+        .map(|p| Value::Bytes(Some(Box::new(p.to_bytes().to_vec()))))
+        .collect();
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO non_circulating_accounts (id, slot, accounts, updated_at) \
+             VALUES (1, $1, $2, now()) \
+             ON CONFLICT (id) DO UPDATE SET \
+                slot = EXCLUDED.slot, \
+                accounts = EXCLUDED.accounts, \
+                updated_at = now()",
+            [
+                Value::from(slot as i64),
+                Value::Array(
+                    sea_orm::sea_query::ArrayType::Bytes,
+                    Some(Box::new(accounts)),
+                ),
+            ],
+        ))
+        .await;
+    if let Err(e) = result {
+        tracing::error!("upsert_non_circulating_accounts failed for slot {}: {}", slot, e);
         metrics::increment_db_errors();
     }
 }
