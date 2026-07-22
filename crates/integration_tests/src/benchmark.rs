@@ -65,10 +65,10 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
         target_gbits,
     } = benchmark;
 
-    // Shared bandwidth meter: always totals rpc1 received bytes (for the summary
-    // average) and, when `target_gbits` is set, enforces the cap via a debt-based
-    // token bucket. `burst_secs = 1.0` allows up to ~1s worth of budget to accrue.
-    let bw_meter = Arc::new(crate::bandwidth::BwMeter::new(target_gbits, 1.0));
+    // Shared bandwidth meter: always totals both estimated and actual rpc1 bytes
+    // (for the summary) and, when `target_gbits` is set, paces dispatch with a
+    // zero-burst token bucket charged off each request's estimated size.
+    let bw_meter = Arc::new(crate::bandwidth::BwMeter::new(target_gbits));
 
     let retry_with_context = source.retry_with_context();
     let replay_once = source.replay_once();
@@ -117,7 +117,7 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
         let mut deadline = (!start_on_first_request)
             .then(|| Instant::now() + Duration::from_secs(duration_secs));
         let mut idx: usize = 0;
-        let mut pending: VecDeque<serde_json::Value> = VecDeque::new();
+        let mut pending: VecDeque<sources::BenchRequest> = VecDeque::new();
         let mut drained_initial = false;
 
         // Will make the requests loop infinitely until the deadline is reached
@@ -128,11 +128,6 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
                 break;
             }
             ticker.tick().await;
-
-            // Bandwidth gate: when a Gbit/s cap is configured this blocks while
-            // the token bucket is in debt, throttling effective RPS below
-            // `target_rps` exactly when bandwidth is the binding constraint.
-            bw_meter_spawner.acquire().await;
 
             let permit = semaphore.clone().try_acquire_owned();
 
@@ -157,6 +152,11 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
                 req
             };
 
+            // Split off the bandwidth estimate; the rest of the pipeline only
+            // needs the request body (`JsonValue`), so shadow `request`.
+            let est_bytes = request.est_bytes;
+            let request = request.body;
+
             if deadline.is_none() {
                 tracing::info!(
                     target: "bench_source",
@@ -167,6 +167,12 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
 
             match permit {
                 Ok(permit) => {
+                    // Bandwidth gate: charge this dispatch's estimate and, when a
+                    // Gbit/s cap is configured, block until the zero-burst bucket
+                    // has refilled. Only dispatched (non-dropped) requests are
+                    // charged. No-op for requests without an estimate.
+                    bw_meter_spawner.acquire_for(est_bytes).await;
+
                     let tx = tx.clone();
                     let client = client.clone();
                     let rpc1 = rpc1.clone();
@@ -218,7 +224,8 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
     stats.print_summary(
         dropped,
         retry_in_place_enabled,
-        bw_meter.total_bytes(),
+        bw_meter.est_bytes(),
+        bw_meter.actual_bytes(),
         target_gbits,
     );
 
@@ -809,13 +816,18 @@ impl BenchStats {
         &mut self,
         dropped: u64,
         retry_in_place_enabled: bool,
-        total_rpc1_bytes: u64,
+        est_rpc1_bytes: u64,
+        actual_rpc1_bytes: u64,
         target_gbits: Option<f64>,
     ) {
         let elapsed = self.start_time.elapsed();
 
-        // Average rpc1 throughput over the run, from actual received wire bytes.
-        let avg_gbits = total_rpc1_bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1e9;
+        // Average rpc1 throughput over the run. `est` is what pacing used (the
+        // VLogs `bytes` estimate); `real` is the actual received wire bytes —
+        // shown side by side so estimate drift is visible.
+        let secs = elapsed.as_secs_f64();
+        let est_gbits = est_rpc1_bytes as f64 * 8.0 / secs / 1e9;
+        let real_gbits = actual_rpc1_bytes as f64 * 8.0 / secs / 1e9;
 
         println!("\n{}", "=".repeat(90));
         println!("BENCHMARK SUMMARY");
@@ -825,12 +837,13 @@ impl BenchStats {
             .map(|g| format!(" (cap {g:.3} Gbit/s)"))
             .unwrap_or_default();
         println!(
-            "Duration: {:.1}s | Total requests: {} | Effective RPS: {:.1} | Avg: {:.3} Gbit/s{}",
-            elapsed.as_secs_f64(),
+            "Duration: {:.1}s | Total requests: {} | Effective RPS: {:.1} | Est: {:.3} Gbit/s{} | Real: {:.3} Gbit/s",
+            secs,
             self.total_requests,
-            self.total_requests as f64 / elapsed.as_secs_f64(),
-            avg_gbits,
+            self.total_requests as f64 / secs,
+            est_gbits,
             gbits_cap,
+            real_gbits,
         );
 
         if dropped > 0 {

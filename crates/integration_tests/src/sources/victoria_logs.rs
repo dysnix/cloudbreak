@@ -11,6 +11,9 @@ use crate::utils;
 pub struct LoggedRequest {
     pub req_id: Option<String>,
     pub body: JsonValue,
+    /// Logged response size in bytes (the VictoriaLogs `bytes` field), used as
+    /// the bandwidth-cap estimate. `None` when the field is absent/unparseable.
+    pub bytes: Option<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -130,6 +133,10 @@ pub async fn get_requests(
             }
 
             let req_id = log["req_id"].as_str().map(String::from);
+            // VictoriaLogs may emit `bytes` as a JSON number or a string.
+            let bytes = log["bytes"]
+                .as_u64()
+                .or_else(|| log["bytes"].as_str().and_then(|s| s.parse::<u64>().ok()));
             let mut body: JsonValue = serde_json::from_str(log["body"].as_str().unwrap()).ok()?;
 
             if request_type == RequestType::GpaTokenMint
@@ -177,7 +184,11 @@ pub async fn get_requests(
                 }
             }
 
-            Some(LoggedRequest { req_id, body })
+            Some(LoggedRequest {
+                req_id,
+                body,
+                bytes,
+            })
         })
         .collect();
 
