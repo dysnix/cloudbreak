@@ -601,9 +601,27 @@ pub fn bytea_array(items: Vec<Vec<u8>>) -> Value {
     )
 }
 
+pub fn pubkey_bytea_array(pubkeys: &[Pubkey]) -> Value {
+    bytea_array(
+        pubkeys
+            .iter()
+            .map(|pubkey| pubkey.to_bytes().to_vec())
+            .collect(),
+    )
+}
+
 pub fn parse_pubkey(bytes: Vec<u8>) -> Result<Pubkey, sea_orm::DbErr> {
     Pubkey::try_from(bytes.as_slice())
         .map_err(|_| sea_orm::DbErr::Custom("invalid pubkey bytes in query result".to_string()))
+}
+
+async fn query_all_with_timeout(
+    name: &str,
+    query: impl Future<Output = Result<Vec<sea_orm::QueryResult>, sea_orm::DbErr>>,
+) -> Result<Vec<sea_orm::QueryResult>, sea_orm::DbErr> {
+    timeout(STARTUP_BALANCES_QUERY_TIMEOUT, query)
+        .await
+        .map_err(|elapsed| sea_orm::DbErr::Custom(format!("{name} timeout: {elapsed}")))?
 }
 
 pub fn owner_pubkey_arrays(pairs: &[(Pubkey, Pubkey)]) -> (Value, Value) {
@@ -653,14 +671,7 @@ pub async fn fetch_startup_balances_by_owner(
         [owners, pubkeys, Value::BigInt(Some(startup_slot as i64))],
     ));
 
-    let rows = timeout(STARTUP_BALANCES_QUERY_TIMEOUT, query)
-        .await
-        .map_err(|elapsed| {
-            sea_orm::DbErr::Custom(format!(
-                "fetch_startup_balances_by_owner timeout: {}",
-                elapsed
-            ))
-        })??;
+    let rows = query_all_with_timeout("fetch_startup_balances_by_owner", query).await?;
 
     for row in rows {
         let pubkey = parse_pubkey(row.try_get("", "pubkey")?)?;
@@ -683,11 +694,6 @@ pub async fn fetch_startup_balances_from_versions(
         return Ok(Vec::new());
     }
 
-    let pubkey_values = pubkeys
-        .iter()
-        .map(|pubkey| pubkey.to_bytes().to_vec())
-        .collect();
-
     let query = db.query_all(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r#"
@@ -707,19 +713,12 @@ pub async fn fetch_startup_balances_from_versions(
         ) prev ON true
         "#,
         [
-            bytea_array(pubkey_values),
+            pubkey_bytea_array(pubkeys),
             Value::BigInt(Some(startup_slot as i64)),
         ],
     ));
 
-    let rows = timeout(STARTUP_BALANCES_QUERY_TIMEOUT, query)
-        .await
-        .map_err(|elapsed| {
-            sea_orm::DbErr::Custom(format!(
-                "fetch_startup_balances_from_versions timeout: {}",
-                elapsed
-            ))
-        })??;
+    let rows = query_all_with_timeout("fetch_startup_balances_from_versions", query).await?;
 
     rows.into_iter()
         .map(|row| {

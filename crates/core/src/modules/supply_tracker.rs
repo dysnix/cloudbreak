@@ -1,7 +1,7 @@
 use solana_pubkey::Pubkey;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 pub const SUPPLY_RING_SLOTS: u64 = 128;
@@ -60,6 +60,14 @@ struct NonCirculatingState {
     balances: HashMap<Pubkey, MemberBalance>,
 }
 
+impl NonCirculatingState {
+    fn is_member(&self, pubkey: &Pubkey) -> bool {
+        self.members
+            .as_ref()
+            .is_some_and(|members| members.contains(pubkey))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SupplyCommit {
     pub slot: u64,
@@ -82,8 +90,10 @@ impl SupplyTracker {
 
     pub fn is_tracking_deltas(&self) -> bool {
         let Some(inner) = &self.0 else { return false };
-        let state = inner.state.lock().expect("Failed to lock supply state");
-        matches!(state.status, SupplyStatus::Live | SupplyStatus::GapFilling)
+        matches!(
+            inner.state().status,
+            SupplyStatus::Live | SupplyStatus::GapFilling
+        )
     }
 
     pub async fn lock_block_writes(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
@@ -94,38 +104,22 @@ impl SupplyTracker {
     pub fn observe_account(&self, pubkey: &[u8], slot: u64, lamports: u64) {
         let Some(inner) = &self.0 else { return };
         let pubkey = Pubkey::try_from(pubkey).unwrap();
-        {
-            let non_circulating = inner
-                .non_circulating
-                .read()
-                .expect("Failed to read non-circulating state");
-            let is_member = non_circulating
-                .members
-                .as_ref()
-                .is_some_and(|members| members.contains(&pubkey));
-            if !is_member {
-                return;
-            }
-        }
-
-        let mut non_circulating = inner
-            .non_circulating
-            .write()
-            .expect("Failed to write non-circulating state");
-        let is_member = non_circulating
-            .members
-            .as_ref()
-            .is_some_and(|members| members.contains(&pubkey));
-        if !is_member {
+        if !inner.non_circulating_read().is_member(&pubkey) {
             return;
         }
-        match non_circulating.balances.get(&pubkey) {
-            Some(entry) if entry.slot > slot => {}
-            _ => {
-                non_circulating
-                    .balances
-                    .insert(pubkey, MemberBalance { slot, lamports });
-            }
+
+        let mut non_circulating = inner.non_circulating_write();
+        if !non_circulating.is_member(&pubkey) {
+            return;
+        }
+        if non_circulating
+            .balances
+            .get(&pubkey)
+            .is_none_or(|entry| entry.slot <= slot)
+        {
+            non_circulating
+                .balances
+                .insert(pubkey, MemberBalance { slot, lamports });
         }
     }
 
@@ -136,10 +130,7 @@ impl SupplyTracker {
     ) {
         let Some(inner) = &self.0 else { return };
         let members: HashSet<Pubkey> = accounts.into_iter().collect();
-        let mut non_circulating = inner
-            .non_circulating
-            .write()
-            .expect("Failed to write non-circulating state");
+        let mut non_circulating = inner.non_circulating_write();
         non_circulating
             .balances
             .retain(|pubkey, _| members.contains(pubkey));
@@ -147,17 +138,18 @@ impl SupplyTracker {
             if !members.contains(&balance.pubkey) {
                 continue;
             }
-            match non_circulating.balances.get(&balance.pubkey) {
-                Some(entry) if entry.slot >= balance.slot => {}
-                _ => {
-                    non_circulating.balances.insert(
-                        balance.pubkey,
-                        MemberBalance {
-                            slot: balance.slot,
-                            lamports: balance.lamports,
-                        },
-                    );
-                }
+            if non_circulating
+                .balances
+                .get(&balance.pubkey)
+                .is_none_or(|entry| entry.slot < balance.slot)
+            {
+                non_circulating.balances.insert(
+                    balance.pubkey,
+                    MemberBalance {
+                        slot: balance.slot,
+                        lamports: balance.lamports,
+                    },
+                );
             }
         }
         non_circulating.members = Some(members);
@@ -165,7 +157,7 @@ impl SupplyTracker {
 
     pub fn set_startup_total(&self, slot: u64, capitalization: u64) {
         let Some(inner) = &self.0 else { return };
-        let mut state = inner.state.lock().expect("Failed to lock supply state");
+        let mut state = inner.state();
         if state.status == SupplyStatus::Bootstrapping && slot > state.startup_slot {
             state.startup_slot = slot;
             state.total = capitalization;
@@ -174,7 +166,7 @@ impl SupplyTracker {
 
     pub fn startup_slot(&self) -> Option<u64> {
         let inner = self.0.as_deref()?;
-        let state = inner.state.lock().expect("Failed to lock supply state");
+        let state = inner.state();
         (state.status == SupplyStatus::Bootstrapping && state.startup_slot > 0)
             .then_some(state.startup_slot)
     }
@@ -185,7 +177,7 @@ impl SupplyTracker {
         touches: impl IntoIterator<Item = (Pubkey, u64, u64)>,
     ) {
         let Some(inner) = &self.0 else { return };
-        let mut state = inner.state.lock().expect("Failed to lock supply state");
+        let mut state = inner.state();
         if state.status != SupplyStatus::Bootstrapping {
             return;
         }
@@ -206,15 +198,14 @@ impl SupplyTracker {
         let Some(inner) = &self.0 else {
             return Vec::new();
         };
-        let state = inner.state.lock().expect("Failed to lock supply state");
-        state.startup_touched.keys().copied().collect()
+        inner.state().startup_touched.keys().copied().collect()
     }
 
     pub fn mark_bootstrap_failed(&self) -> bool {
         let Some(inner) = &self.0 else {
             return false;
         };
-        let mut state = inner.state.lock().expect("Failed to lock supply state");
+        let mut state = inner.state();
         if state.status != SupplyStatus::Bootstrapping || state.bootstrap_failed {
             return false;
         }
@@ -226,8 +217,7 @@ impl SupplyTracker {
         let Some(inner) = &self.0 else {
             return false;
         };
-        let state = inner.state.lock().expect("Failed to lock supply state");
-        state.bootstrap_failed
+        inner.state().bootstrap_failed
     }
 
     pub fn finish_bootstrap(
@@ -235,7 +225,7 @@ impl SupplyTracker {
         startup_balances: &HashMap<Pubkey, u64>,
     ) -> Option<SupplyCommit> {
         let inner = self.0.as_deref()?;
-        let mut state = inner.state.lock().expect("Failed to lock supply state");
+        let mut state = inner.state();
         if state.status != SupplyStatus::Bootstrapping
             || state.startup_slot == 0
             || state.bootstrap_failed
@@ -264,7 +254,7 @@ impl SupplyTracker {
         let Some(inner) = &self.0 else {
             return false;
         };
-        let mut state = inner.state.lock().expect("Failed to lock supply state");
+        let mut state = inner.state();
         if state.status != SupplyStatus::Live {
             return false;
         }
@@ -274,7 +264,7 @@ impl SupplyTracker {
 
     pub fn finish_gap(&self) {
         let Some(inner) = &self.0 else { return };
-        let mut state = inner.state.lock().expect("Failed to lock supply state");
+        let mut state = inner.state();
         if state.status == SupplyStatus::GapFilling {
             state.status = SupplyStatus::Live;
         }
@@ -284,7 +274,7 @@ impl SupplyTracker {
         let Some(inner) = &self.0 else {
             return false;
         };
-        let mut state = inner.state.lock().expect("Failed to lock supply state");
+        let mut state = inner.state();
         if !matches!(state.status, SupplyStatus::Live | SupplyStatus::GapFilling) {
             return false;
         }
@@ -294,26 +284,38 @@ impl SupplyTracker {
 
     pub fn commit_block(&self, slot: u64, block_delta: i128) -> Option<SupplyCommit> {
         let inner = self.0.as_deref()?;
-        let mut state = inner.state.lock().expect("Failed to lock supply state");
+        let mut state = inner.state();
         state.slot = state.slot.max(slot);
         if slot <= state.startup_slot {
             return None;
         }
         match state.status {
             SupplyStatus::Bootstrapping | SupplyStatus::Stale => None,
-            SupplyStatus::GapFilling => {
+            SupplyStatus::GapFilling | SupplyStatus::Live => {
                 state.total = (state.total as i128 + block_delta) as u64;
-                None
-            }
-            SupplyStatus::Live => {
-                state.total = (state.total as i128 + block_delta) as u64;
-                Some(inner.commit(&state))
+                (state.status == SupplyStatus::Live).then(|| inner.commit(&state))
             }
         }
     }
 }
 
 impl Inner {
+    fn state(&self) -> MutexGuard<'_, SupplyState> {
+        self.state.lock().expect("Failed to lock supply state")
+    }
+
+    fn non_circulating_read(&self) -> RwLockReadGuard<'_, NonCirculatingState> {
+        self.non_circulating
+            .read()
+            .expect("Failed to read non-circulating state")
+    }
+
+    fn non_circulating_write(&self) -> RwLockWriteGuard<'_, NonCirculatingState> {
+        self.non_circulating
+            .write()
+            .expect("Failed to write non-circulating state")
+    }
+
     fn commit(&self, state: &SupplyState) -> SupplyCommit {
         SupplyCommit {
             slot: state.slot,
@@ -323,10 +325,7 @@ impl Inner {
     }
 
     fn sum_non_circulating(&self) -> Option<u64> {
-        let non_circulating = self
-            .non_circulating
-            .read()
-            .expect("Failed to read non-circulating state");
+        let non_circulating = self.non_circulating_read();
         non_circulating.members.as_ref()?;
         let lamports: u128 = non_circulating
             .balances

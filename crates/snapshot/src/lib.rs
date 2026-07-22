@@ -33,7 +33,9 @@ pub mod metrics;
 pub mod sidecar;
 pub mod stake_data;
 
-pub use db_queries::{bytea_array, owner_pubkey_arrays, parse_pubkey, persist_epoch_stakes};
+pub use db_queries::{
+    bytea_array, owner_pubkey_arrays, parse_pubkey, persist_epoch_stakes, pubkey_bytea_array,
+};
 
 const DB_ACCOUNTS_BATCH_SIZE: usize = 200;
 
@@ -144,22 +146,12 @@ async fn finish_supply_bootstrap(
 
     let touched = supply_tracker.startup_touched_pubkeys();
     let touched_count = touched.len();
-    let mut balances = match resolve_startup_balances(
-        database,
-        accounts_owner_map,
-        touched,
-        startup_slot,
-    )
-    .await
-    {
-        Ok(balances) => balances,
-        Err(e) => {
-            tracing::error!(
-                "Failed to resolve startup balances for supply bootstrap, supply stays bootstrapping: {:?}",
-                e
-            );
-            return;
-        }
+    let Ok(mut balances) =
+        resolve_startup_balances(database, accounts_owner_map, touched, startup_slot)
+            .await
+            .map_err(log_startup_balances_error)
+    else {
+        return;
     };
 
     let _write_guard = supply_tracker.lock_block_writes().await;
@@ -169,16 +161,14 @@ async fn finish_supply_bootstrap(
         .into_iter()
         .filter(|pubkey| !balances.contains_key(pubkey))
         .collect();
-    match resolve_startup_balances(database, accounts_owner_map, late_touches, startup_slot).await {
-        Ok(resolved) => balances.extend(resolved),
-        Err(e) => {
-            tracing::error!(
-                "Failed to resolve startup balances for supply bootstrap, supply stays bootstrapping: {:?}",
-                e
-            );
-            return;
-        }
-    }
+    let Ok(late_balances) =
+        resolve_startup_balances(database, accounts_owner_map, late_touches, startup_slot)
+            .await
+            .map_err(log_startup_balances_error)
+    else {
+        return;
+    };
+    balances.extend(late_balances);
 
     let Some(commit) = supply_tracker.finish_bootstrap(&balances) else {
         if supply_tracker.bootstrap_failed() {
@@ -206,6 +196,13 @@ async fn finish_supply_bootstrap(
     if let Err(e) = db_queries::persist_supply_total(database, &commit).await {
         tracing::error!("Failed to persist bootstrapped supply total: {:?}", e);
     }
+}
+
+fn log_startup_balances_error(e: impl std::fmt::Debug) {
+    tracing::error!(
+        "Failed to resolve startup balances for supply bootstrap, supply stays bootstrapping: {:?}",
+        e
+    );
 }
 
 async fn resolve_startup_balances(

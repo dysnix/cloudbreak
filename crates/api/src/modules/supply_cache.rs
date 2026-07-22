@@ -26,6 +26,12 @@ pub type SharedSupplySnapshot = Arc<RwLock<Arc<SupplySnapshot>>>;
 
 const SUPPLY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+fn decimal_to_u64(value: Decimal, column: &str) -> Result<u64, anyhow::Error> {
+    value
+        .to_u64()
+        .ok_or_else(|| anyhow::anyhow!("supply.{} {} does not fit in u64", column, value))
+}
+
 pub async fn load_latest_supply(
     db: &DatabaseConnection,
 ) -> Result<Option<SupplySnapshot>, anyhow::Error> {
@@ -42,20 +48,10 @@ pub async fn load_latest_supply(
     let mut rows = Vec::with_capacity(supply_rows.len());
     for row in supply_rows {
         let slot: i64 = row.try_get("", "slot")?;
-        let total: Decimal = row.try_get("", "total")?;
-        let total = total
-            .to_u64()
-            .ok_or_else(|| anyhow::anyhow!("supply.total {} does not fit in u64", total))?;
+        let total = decimal_to_u64(row.try_get("", "total")?, "total")?;
         let non_circulating: Option<Decimal> = row.try_get("", "non_circulating_lamports")?;
         let non_circulating = non_circulating
-            .map(|lamports| {
-                lamports.to_u64().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "supply.non_circulating_lamports {} does not fit in u64",
-                        lamports
-                    )
-                })
-            })
+            .map(|lamports| decimal_to_u64(lamports, "non_circulating_lamports"))
             .transpose()?;
         rows.push(SupplyRow {
             slot: slot as u64,

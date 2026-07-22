@@ -8,7 +8,7 @@ use sea_orm::{
     DatabaseConnection,
 };
 use solana_pubkey::Pubkey;
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::HashMap;
 use tokio::{
     task::{JoinHandle, JoinSet},
     time::Instant,
@@ -96,20 +96,16 @@ pub async fn save_block(
 
         if supply_enabled {
             let pubkey = Pubkey::try_from(account.pubkey.as_slice()).unwrap();
-            match pending_supply_accounts.entry(pubkey) {
-                Entry::Vacant(entry) => {
-                    entry.insert(PendingSupplyAccount {
-                        owner: accounts_owner_map.get_owner(&pubkey),
-                        lamports: account.lamports,
-                        write_version: account.write_version,
-                    });
-                }
-                Entry::Occupied(mut entry) if account.write_version > entry.get().write_version => {
-                    let pending = entry.get_mut();
-                    pending.lamports = account.lamports;
-                    pending.write_version = account.write_version;
-                }
-                Entry::Occupied(_) => {}
+            let pending = pending_supply_accounts
+                .entry(pubkey)
+                .or_insert_with(|| PendingSupplyAccount {
+                    owner: accounts_owner_map.get_owner(&pubkey),
+                    lamports: account.lamports,
+                    write_version: account.write_version,
+                });
+            if account.write_version > pending.write_version {
+                pending.lamports = account.lamports;
+                pending.write_version = account.write_version;
             }
         }
 
@@ -193,11 +189,7 @@ pub async fn save_block(
         chunks.push((current_chunk, current_chunk_bytes));
     }
 
-    let supply_write_guard = if supply_enabled {
-        supply_tracker.lock_block_writes().await
-    } else {
-        None
-    };
+    let supply_write_guard = supply_tracker.lock_block_writes().await;
     let block_supply_delta = if supply_tracker.is_tracking_deltas() {
         compute_block_supply_delta(db, &config, &supply_tracker, pending_supply_accounts, slot)
             .await

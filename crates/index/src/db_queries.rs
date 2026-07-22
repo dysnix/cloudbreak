@@ -30,7 +30,7 @@ use cloudbreak_core::{
     },
 };
 use cloudbreak_entity::{accounts, service_health, slots};
-use cloudbreak_snapshot::{bytea_array, owner_pubkey_arrays, parse_pubkey};
+use cloudbreak_snapshot::{bytea_array, owner_pubkey_arrays, parse_pubkey, pubkey_bytea_array};
 
 use crate::metrics;
 
@@ -424,7 +424,11 @@ pub async fn insert_recent_blockhash(
     }
 }
 
-pub async fn upsert_supply_row(db: &DatabaseConnection, commit: &SupplyCommit, config: &IndexConfig) {
+pub async fn upsert_supply_row(
+    db: &DatabaseConnection,
+    commit: &SupplyCommit,
+    config: &IndexConfig,
+) {
     let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
     let supply = Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
@@ -470,10 +474,7 @@ pub async fn upsert_non_circulating_accounts(
                 slot = EXCLUDED.slot, \
                 accounts = EXCLUDED.accounts, \
                 updated_at = now()",
-            [
-                Value::from(slot as i64),
-                bytea_array(accounts.iter().map(|p| p.to_bytes().to_vec()).collect()),
-            ],
+            [Value::from(slot as i64), pubkey_bytea_array(accounts)],
         ))
         .await;
     if let Err(e) = result {
@@ -487,6 +488,18 @@ pub struct BlockSupplyDelta {
     pub block_delta: i128,
     pub routed_misses: u64,
 }
+
+const LATEST_ACCOUNT_ROW_SQL: &str = r#"
+            SELECT lamports, slot FROM (
+                SELECT lamports, slot FROM accounts
+                WHERE owner = v.owner AND pubkey = v.pubkey
+                UNION ALL
+                SELECT lamports, slot FROM snapshot_accounts
+                WHERE owner = v.owner AND pubkey = v.pubkey
+            ) u
+            ORDER BY slot DESC
+            LIMIT 1
+"#;
 
 fn numeric_array(items: Vec<u64>) -> Value {
     Value::Array(
@@ -512,24 +525,16 @@ pub async fn fetch_block_supply_delta(
 
     let query = db.query_one(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
-        r#"
+        format!(
+            r#"
         SELECT
             COALESCE(SUM(v.new_lamports - COALESCE(prev.lamports, 0))
                      FILTER (WHERE prev.slot IS NULL OR prev.slot < $4), 0) AS block_delta,
             COUNT(*) FILTER (WHERE prev.slot IS NULL)                       AS routed_misses
         FROM unnest($1::bytea[], $2::bytea[], $3::numeric[]) AS v(owner, pubkey, new_lamports)
-        LEFT JOIN LATERAL (
-            SELECT lamports, slot FROM (
-                SELECT lamports, slot FROM accounts
-                WHERE owner = v.owner AND pubkey = v.pubkey
-                UNION ALL
-                SELECT lamports, slot FROM snapshot_accounts
-                WHERE owner = v.owner AND pubkey = v.pubkey
-            ) u
-            ORDER BY slot DESC
-            LIMIT 1
-        ) prev ON true
-        "#,
+        LEFT JOIN LATERAL ({LATEST_ACCOUNT_ROW_SQL}) prev ON true
+        "#
+        ),
         [
             bytea_array(owners),
             bytea_array(pubkeys),
@@ -572,21 +577,13 @@ pub async fn fetch_non_circulating_balances(
     let rows = db
         .query_all(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            r#"
+            format!(
+                r#"
             SELECT v.pubkey, latest.lamports, latest.slot
             FROM unnest($1::bytea[], $2::bytea[]) AS v(owner, pubkey)
-            JOIN LATERAL (
-                SELECT lamports, slot FROM (
-                    SELECT lamports, slot FROM accounts
-                    WHERE owner = v.owner AND pubkey = v.pubkey
-                    UNION ALL
-                    SELECT lamports, slot FROM snapshot_accounts
-                    WHERE owner = v.owner AND pubkey = v.pubkey
-                ) u
-                ORDER BY slot DESC
-                LIMIT 1
-            ) latest ON true
-            "#,
+            JOIN LATERAL ({LATEST_ACCOUNT_ROW_SQL}) latest ON true
+            "#
+            ),
             [owners, pubkeys],
         ))
         .await?;

@@ -12,8 +12,8 @@ use solana_stake_interface::state::StakeStateV2;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::metrics;
 use crate::modules::epoch_stakes::{LATEST_BY_OWNER_SQL, is_healthy};
+use crate::{db_queries, metrics};
 use crate::modules::non_circulating_lists::{NON_CIRCULATING_ACCOUNTS, WITHDRAW_AUTHORITY};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -75,22 +75,21 @@ pub fn spawn_non_circulating_recomputer(
                         .map(|owner| (owner, *pubkey))
                 })
                 .collect();
-            let balances =
-                match crate::db_queries::fetch_non_circulating_balances(&db, &members).await {
-                    Ok(balances) => balances,
-                    Err(e) => {
-                        tracing::error!(
-                            target: "non_circulating_recomputer",
-                            "failed to fetch non-circulating balances: {:?}",
-                            e
-                        );
-                        continue;
-                    }
-                };
+            let balances = match db_queries::fetch_non_circulating_balances(&db, &members).await {
+                Ok(balances) => balances,
+                Err(e) => {
+                    tracing::error!(
+                        target: "non_circulating_recomputer",
+                        "failed to fetch non-circulating balances: {:?}",
+                        e
+                    );
+                    continue;
+                }
+            };
 
             last_recompute = Some(Instant::now());
             next_lockup_expiry = next_expiry;
-            crate::db_queries::upsert_non_circulating_accounts(&db, slot, &accounts).await;
+            db_queries::upsert_non_circulating_accounts(&db, slot, &accounts).await;
             supply_tracker.set_non_circulating_accounts(accounts, balances);
         }
     })
