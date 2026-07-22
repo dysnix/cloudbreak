@@ -191,7 +191,6 @@ fn refresh_db_pool_metrics(database: &DatabaseConnection) {
 
 pub fn metrics_handler(database: &DatabaseConnection) -> Result<HttpHandlerResponse, Infallible> {
     refresh_db_pool_metrics(database);
-    crate::modules::bandwidth::refresh_gauges();
 
     let metrics = TextEncoder::new()
         .encode_to_string(&METRICS_REGISTRY.gather())
