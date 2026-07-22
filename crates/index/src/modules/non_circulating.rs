@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use cloudbreak_core::STAKE_PROGRAM_ID;
+use cloudbreak_core::modules::account_owner_map::AccountOwnerMap;
 use cloudbreak_core::modules::supply_tracker::SupplyTracker;
 use futures::TryStreamExt;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, StreamTrait};
@@ -26,6 +27,7 @@ const CLOCK_SYSVAR_ID: Pubkey =
 pub fn spawn_non_circulating_recomputer(
     db: DatabaseConnection,
     supply_tracker: SupplyTracker,
+    accounts_owner_map: AccountOwnerMap,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let _guard = metrics::TokioTaskCounterGuard::new("non_circulating_recomputer");
@@ -65,10 +67,31 @@ pub fn spawn_non_circulating_recomputer(
                     continue;
                 }
             };
+            let members: Vec<(Pubkey, Pubkey)> = accounts
+                .iter()
+                .filter_map(|pubkey| {
+                    accounts_owner_map
+                        .get_owner(pubkey)
+                        .map(|owner| (owner, *pubkey))
+                })
+                .collect();
+            let balances =
+                match crate::db_queries::fetch_non_circulating_balances(&db, &members).await {
+                    Ok(balances) => balances,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "non_circulating_recomputer",
+                            "failed to fetch non-circulating balances: {:?}",
+                            e
+                        );
+                        continue;
+                    }
+                };
+
             last_recompute = Some(Instant::now());
             next_lockup_expiry = next_expiry;
             crate::db_queries::upsert_non_circulating_accounts(&db, slot, &accounts).await;
-            supply_tracker.set_non_circulating_accounts(accounts);
+            supply_tracker.set_non_circulating_accounts(accounts, balances);
         }
     })
 }

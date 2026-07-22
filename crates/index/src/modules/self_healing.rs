@@ -137,7 +137,7 @@ impl SelfHealingState {
                 // unsupported and `fill_gaps` fails fast in that case.
                 self.finalizer.pause().await;
 
-                if self.supply_tracker.mark_stale() {
+                if self.supply_tracker.mark_gap() {
                     metrics::SUPPLY_STALE.set(1);
                 }
             }
@@ -296,7 +296,6 @@ impl SelfHealingState {
                     snapshot_pair,
                     snapshot_config,
                     covered_gaps_list.clone(),
-                    self.supply_tracker.clone(),
                 ) {
                     Ok((handle, rx)) => (handle, rx),
                     Err(e) => {
@@ -387,7 +386,7 @@ impl SelfHealingState {
                     .expect("Failed to lock gaps_list")
                     .is_empty();
                 if !gaps_remaining {
-                    self.supply_tracker.request_reanchor();
+                    self.supply_tracker.finish_gap();
                     self.finalizer.resume().await;
                 }
             }
@@ -463,7 +462,6 @@ fn download_and_process_snapshot_for_gap_filling(
     snapshot_pair: SnapshotPair,
     config: SnapshotConfig,
     gaps_list: Vec<u64>,
-    supply_tracker: SupplyTracker,
 ) -> Result<
     (
         JoinHandle<Result<(), anyhow::Error>>,
@@ -499,7 +497,6 @@ fn download_and_process_snapshot_for_gap_filling(
             config,
             gaps_list,
             tx,
-            supply_tracker,
         )
         .await?;
 

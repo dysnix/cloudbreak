@@ -95,6 +95,9 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         if !config.programs.supports_simulation() {
             panic!("supply-tracker-enabled requires an empty [programs] filter");
         }
+        if !config.accounts_owner_map_enabled {
+            panic!("supply-tracker-enabled requires accounts-owner-map-enabled");
+        }
         SupplyTracker::new()
     } else {
         SupplyTracker::default()
@@ -169,6 +172,7 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     let _non_circulating_handle = modules::non_circulating::spawn_non_circulating_recomputer(
         db.clone(),
         indexer_state.supply_tracker.clone(),
+        indexer_state.accounts_owner_map.clone(),
     );
 
     operational_endpoints::self_healing::SELF_HEALING

@@ -5,7 +5,9 @@
 
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use solana_accounts_db::accounts_file::AccountsFile;
+use solana_pubkey::Pubkey;
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -31,7 +33,7 @@ pub mod metrics;
 pub mod sidecar;
 pub mod stake_data;
 
-pub use db_queries::persist_epoch_stakes;
+pub use db_queries::{bytea_array, owner_pubkey_arrays, parse_pubkey, persist_epoch_stakes};
 
 const DB_ACCOUNTS_BATCH_SIZE: usize = 200;
 
@@ -97,12 +99,6 @@ pub async fn run(
 
     tracing::info!(target: "full_snapshot_completed", "Full snapshot completed successfully in {} secs", start_time.elapsed().as_secs_f64());
 
-    if let Some(commit) = supply_tracker.finish_bootstrap()
-        && let Err(e) = db_queries::persist_supply_total(&database, &commit).await
-    {
-        tracing::error!("Failed to persist bootstrapped supply total: {:?}", e);
-    }
-
     if let Some(buffer_size) = buffer_size {
         db_queries::cluster_snapshot_accounts_table(
             &database,
@@ -116,12 +112,132 @@ pub async fn run(
     db_queries::clean_up_closed_accounts(&database).await?;
     db_queries::create_database_indexes(&database, &config.pg_indexes).await?;
 
+    finish_supply_bootstrap(&database, &accounts_owner_map, &supply_tracker).await;
+
     tracing::info!(
         "Total snapshot processing time after cleanup: {} secs",
         start_time.elapsed().as_secs_f64()
     );
 
     Ok(())
+}
+
+const STARTUP_BALANCES_CHUNK_SIZE: usize = 5_000;
+
+async fn finish_supply_bootstrap(
+    database: &DatabaseConnection,
+    accounts_owner_map: &AccountOwnerMap,
+    supply_tracker: &SupplyTracker,
+) {
+    let Some(startup_slot) = supply_tracker.startup_slot() else {
+        return;
+    };
+
+    if supply_tracker.bootstrap_failed() {
+        tracing::error!(
+            "Supply bootstrap poisoned by failed startup account writes, supply stays bootstrapping"
+        );
+        return;
+    }
+
+    let start_time = Instant::now();
+
+    let touched = supply_tracker.startup_touched_pubkeys();
+    let touched_count = touched.len();
+    let mut balances = match resolve_startup_balances(
+        database,
+        accounts_owner_map,
+        touched,
+        startup_slot,
+    )
+    .await
+    {
+        Ok(balances) => balances,
+        Err(e) => {
+            tracing::error!(
+                "Failed to resolve startup balances for supply bootstrap, supply stays bootstrapping: {:?}",
+                e
+            );
+            return;
+        }
+    };
+
+    let _write_guard = supply_tracker.lock_block_writes().await;
+
+    let late_touches: Vec<Pubkey> = supply_tracker
+        .startup_touched_pubkeys()
+        .into_iter()
+        .filter(|pubkey| !balances.contains_key(pubkey))
+        .collect();
+    match resolve_startup_balances(database, accounts_owner_map, late_touches, startup_slot).await {
+        Ok(resolved) => balances.extend(resolved),
+        Err(e) => {
+            tracing::error!(
+                "Failed to resolve startup balances for supply bootstrap, supply stays bootstrapping: {:?}",
+                e
+            );
+            return;
+        }
+    }
+
+    let Some(commit) = supply_tracker.finish_bootstrap(&balances) else {
+        if supply_tracker.bootstrap_failed() {
+            tracing::error!(
+                "Supply bootstrap poisoned by failed startup account writes, supply stays bootstrapping"
+            );
+        } else {
+            tracing::error!(
+                "Supply bootstrap reconciliation left unresolved accounts, supply stays bootstrapping"
+            );
+        }
+        return;
+    };
+
+    tracing::info!(
+        target: "supply_bootstrap",
+        "Supply bootstrap reconciled {} touched accounts against startup slot {} in {} secs - slot: {}, total: {}",
+        touched_count,
+        startup_slot,
+        start_time.elapsed().as_secs_f64(),
+        commit.slot,
+        commit.total
+    );
+
+    if let Err(e) = db_queries::persist_supply_total(database, &commit).await {
+        tracing::error!("Failed to persist bootstrapped supply total: {:?}", e);
+    }
+}
+
+async fn resolve_startup_balances(
+    database: &DatabaseConnection,
+    accounts_owner_map: &AccountOwnerMap,
+    pubkeys: Vec<Pubkey>,
+    startup_slot: u64,
+) -> Result<HashMap<Pubkey, u64>> {
+    let mut routed = Vec::new();
+    let mut unrouted = Vec::new();
+    for pubkey in pubkeys {
+        match accounts_owner_map.get_owner(&pubkey) {
+            Some(owner) => routed.push((owner, pubkey)),
+            None => unrouted.push(pubkey),
+        }
+    }
+
+    let mut balances = HashMap::new();
+    for chunk in routed.chunks(STARTUP_BALANCES_CHUNK_SIZE) {
+        let probe =
+            db_queries::fetch_startup_balances_by_owner(database, chunk, startup_slot).await?;
+        balances.extend(probe.resolved);
+        unrouted.extend(probe.misses);
+    }
+
+    for chunk in unrouted.chunks(STARTUP_BALANCES_CHUNK_SIZE) {
+        let resolved =
+            db_queries::fetch_startup_balances_from_versions(database, chunk, startup_slot).await?;
+        balances.extend(resolved);
+    }
+
+    Ok(balances)
 }
 
 fn download_and_process_snapshot(
@@ -185,7 +301,7 @@ async fn process_downloaded_snapshot(
     }
 
     if supply_tracker.is_enabled() {
-        supply_tracker.note_anchor(bank_info.slot);
+        supply_tracker.set_startup_total(bank_info.slot, bank_info.capitalization);
         if let Err(e) = db_queries::persist_supply_seed(database, &bank_info).await {
             tracing::error!("Failed to persist supply seed from snapshot: {:?}", e);
         }
@@ -256,7 +372,6 @@ async fn process_downloaded_snapshot(
             insert_into_temp_snapshot_account_versions_tx.clone();
 
         let accounts_owner_map = accounts_owner_map.clone();
-        let supply_tracker = supply_tracker.clone();
 
         account_file_workers.spawn(async move {
             let start_time = Instant::now();
@@ -306,11 +421,6 @@ async fn process_downloaded_snapshot(
                     // Add non closed accounts to the accounts owner map (if enabled)
                     if account.lamports > 0 {
                         accounts_owner_map.upsert_account(&pubkey, &owner, account_file_slot);
-                        supply_tracker.observe_snapshot_account(
-                            account.pubkey,
-                            account_file_slot,
-                            account.lamports,
-                        );
                     }
 
                     let account_update = SubscribeUpdateAccount {
@@ -461,7 +571,6 @@ pub async fn process_downloaded_snapshot_with_gap_filling(
     config: SnapshotConfig,
     gaps_list: Vec<u64>,
     block_sender: Sender<SubscribeUpdateBlock>,
-    supply_tracker: SupplyTracker,
 ) -> Result<()> {
     let start_time = Instant::now();
 
@@ -527,7 +636,6 @@ pub async fn process_downloaded_snapshot_with_gap_filling(
         }
 
         let block_sender = block_sender.clone();
-        let supply_tracker = supply_tracker.clone();
         account_file_workers.spawn(async move {
             let accounts = AccountsFile::new_for_startup(
                 path,
@@ -553,14 +661,6 @@ pub async fn process_downloaded_snapshot_with_gap_filling(
                         }
                     } else if programs_exclude.contains(account.owner) {
                         return;
-                    }
-
-                    if account.lamports > 0 {
-                        supply_tracker.observe_snapshot_account(
-                            account.pubkey,
-                            account_file_slot,
-                            account.lamports,
-                        );
                     }
 
                     let account_update = SubscribeUpdateAccountInfo {

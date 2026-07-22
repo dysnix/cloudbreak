@@ -12,9 +12,10 @@ use std::{
 use rust_decimal::Decimal;
 use sea_orm::{
     ActiveValue::Set, ConnectionTrait, DatabaseConnection, EntityTrait, Statement,
-    TransactionTrait, Value,
+    TransactionTrait, Value, sea_query::ArrayType,
 };
-use tokio::time::Instant;
+use solana_pubkey::Pubkey;
+use tokio::time::{Instant, timeout};
 use yellowstone_grpc_proto::geyser::SubscribeUpdateAccount;
 use cloudbreak_core::{
     SnapshotPgIndexesConfig,
@@ -584,6 +585,149 @@ pub async fn persist_supply_seed(
     );
 
     Ok(())
+}
+
+const STARTUP_BALANCES_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub fn bytea_array(items: Vec<Vec<u8>>) -> Value {
+    Value::Array(
+        ArrayType::Bytes,
+        Some(Box::new(
+            items
+                .into_iter()
+                .map(|bytes| Value::Bytes(Some(Box::new(bytes))))
+                .collect(),
+        )),
+    )
+}
+
+pub fn parse_pubkey(bytes: Vec<u8>) -> Result<Pubkey, sea_orm::DbErr> {
+    Pubkey::try_from(bytes.as_slice())
+        .map_err(|_| sea_orm::DbErr::Custom("invalid pubkey bytes in query result".to_string()))
+}
+
+pub fn owner_pubkey_arrays(pairs: &[(Pubkey, Pubkey)]) -> (Value, Value) {
+    let owners = pairs
+        .iter()
+        .map(|(owner, _)| owner.to_bytes().to_vec())
+        .collect();
+    let pubkeys = pairs
+        .iter()
+        .map(|(_, pubkey)| pubkey.to_bytes().to_vec())
+        .collect();
+    (bytea_array(owners), bytea_array(pubkeys))
+}
+
+pub struct StartupBalanceProbe {
+    pub resolved: Vec<(Pubkey, u64)>,
+    pub misses: Vec<Pubkey>,
+}
+
+pub async fn fetch_startup_balances_by_owner(
+    db: &DatabaseConnection,
+    entries: &[(Pubkey, Pubkey)],
+    startup_slot: u64,
+) -> Result<StartupBalanceProbe, sea_orm::DbErr> {
+    let mut probe = StartupBalanceProbe {
+        resolved: Vec::new(),
+        misses: Vec::new(),
+    };
+    if entries.is_empty() {
+        return Ok(probe);
+    }
+
+    let (owners, pubkeys) = owner_pubkey_arrays(entries);
+
+    let query = db.query_all(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r#"
+        SELECT v.pubkey, prev.lamports
+        FROM unnest($1::bytea[], $2::bytea[]) AS v(owner, pubkey)
+        LEFT JOIN LATERAL (
+            SELECT lamports FROM snapshot_accounts
+            WHERE owner = v.owner AND pubkey = v.pubkey AND slot <= $3
+            ORDER BY slot DESC
+            LIMIT 1
+        ) prev ON true
+        "#,
+        [owners, pubkeys, Value::BigInt(Some(startup_slot as i64))],
+    ));
+
+    let rows = timeout(STARTUP_BALANCES_QUERY_TIMEOUT, query)
+        .await
+        .map_err(|elapsed| {
+            sea_orm::DbErr::Custom(format!(
+                "fetch_startup_balances_by_owner timeout: {}",
+                elapsed
+            ))
+        })??;
+
+    for row in rows {
+        let pubkey = parse_pubkey(row.try_get("", "pubkey")?)?;
+        let lamports: Option<i64> = row.try_get("", "lamports")?;
+        match lamports {
+            Some(lamports) => probe.resolved.push((pubkey, lamports as u64)),
+            None => probe.misses.push(pubkey),
+        }
+    }
+
+    Ok(probe)
+}
+
+pub async fn fetch_startup_balances_from_versions(
+    db: &DatabaseConnection,
+    pubkeys: &[Pubkey],
+    startup_slot: u64,
+) -> Result<Vec<(Pubkey, u64)>, sea_orm::DbErr> {
+    if pubkeys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let pubkey_values = pubkeys
+        .iter()
+        .map(|pubkey| pubkey.to_bytes().to_vec())
+        .collect();
+
+    let query = db.query_all(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r#"
+        SELECT v.pubkey, COALESCE(prev.lamports, 0) AS lamports
+        FROM unnest($1::bytea[]) AS v(pubkey)
+        LEFT JOIN LATERAL (
+            SELECT owner FROM temp_snapshot_account_versions
+            WHERE pubkey = v.pubkey AND slot <= $2
+            ORDER BY slot DESC
+            LIMIT 1
+        ) version ON true
+        LEFT JOIN LATERAL (
+            SELECT lamports FROM snapshot_accounts
+            WHERE owner = version.owner AND pubkey = v.pubkey AND slot <= $2
+            ORDER BY slot DESC
+            LIMIT 1
+        ) prev ON true
+        "#,
+        [
+            bytea_array(pubkey_values),
+            Value::BigInt(Some(startup_slot as i64)),
+        ],
+    ));
+
+    let rows = timeout(STARTUP_BALANCES_QUERY_TIMEOUT, query)
+        .await
+        .map_err(|elapsed| {
+            sea_orm::DbErr::Custom(format!(
+                "fetch_startup_balances_from_versions timeout: {}",
+                elapsed
+            ))
+        })??;
+
+    rows.into_iter()
+        .map(|row| {
+            let pubkey = parse_pubkey(row.try_get("", "pubkey")?)?;
+            let lamports: i64 = row.try_get("", "lamports")?;
+            Ok((pubkey, lamports as u64))
+        })
+        .collect()
 }
 
 pub async fn persist_supply_total(
