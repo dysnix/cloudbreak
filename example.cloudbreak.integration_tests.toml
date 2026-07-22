@@ -11,6 +11,10 @@ target_rps = 5.0
 max_in_flight = 100
 duration_secs = 100
 timeout_secs = 60
+# Optional bandwidth cap in Gbit/s, enforced against actual received rpc1 bytes.
+# Works together with target_rps: if throughput hits this limit below target_rps,
+# effective RPS is throttled so the average stays under the cap. Omit to disable.
+# target_gbits = 1.0
 
 [source]
 type = "json_file"

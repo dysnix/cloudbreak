@@ -65,6 +65,13 @@ pub struct BenchmarkConfig {
 
     #[serde(default)]
     pub start_on_first_request: bool,
+
+    /// Optional bandwidth cap in Gbit/s, enforced against *actual received*
+    /// rpc1 response bytes. Acts as an upper bound together with `target_rps`:
+    /// if byte throughput hits this limit below `target_rps`, effective RPS is
+    /// reduced so the average stays under the cap. Omit/0 to disable.
+    #[serde(default)]
+    pub target_gbits: Option<f64>,
 }
 
 #[derive(Deserialize, Debug)]

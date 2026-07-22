@@ -191,6 +191,7 @@ fn refresh_db_pool_metrics(database: &DatabaseConnection) {
 
 pub fn metrics_handler(database: &DatabaseConnection) -> Result<HttpHandlerResponse, Infallible> {
     refresh_db_pool_metrics(database);
+    crate::modules::bandwidth::refresh_gauges();
 
     let metrics = TextEncoder::new()
         .encode_to_string(&METRICS_REGISTRY.gather())
@@ -229,6 +230,10 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         register!(CLOUDBREAK_GPA_CACHE_MAX_BYTES);
         register!(CLOUDBREAK_GPA_CACHE_EVICTIONS_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_EVICTED_BYTES_TOTAL);
+
+        // Per-client-IP egress bandwidth (peak gauge + throughput histogram).
+        // Registers its collectors and starts the 100ms sampler task.
+        crate::modules::bandwidth::register(&METRICS_REGISTRY);
     });
 
     // Set the max connections as a reference metric at startup

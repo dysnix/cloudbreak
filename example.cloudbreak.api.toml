@@ -13,6 +13,11 @@ api-queries-timeout = 20
 [metrics]
 host = "0.0.0.0"
 port = 8875
+# Header used to identify the subscription for per-subscription metrics.
+# subscription-id-key = "x-subscription-id"
+# Header used to identify the client IP for the per-client-IP
+# bandwidth metrics. Override to match your ingress (e.g. "x-forwarded-for").
+# client-ip-key = "client-ip"
 
 [query-tracker-client]
 endpoint = "http://localhost:4001"

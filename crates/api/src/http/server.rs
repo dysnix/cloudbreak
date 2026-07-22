@@ -37,13 +37,19 @@ use crate::metrics;
 pub struct HttpServer {
     state: Arc<CloudbreakRpcState>,
     subscription_id_key: String,
+    client_ip_key: String,
 }
 
 impl HttpServer {
-    pub fn new(state: CloudbreakRpcState, subscription_id_key: String) -> Self {
+    pub fn new(
+        state: CloudbreakRpcState,
+        subscription_id_key: String,
+        client_ip_key: String,
+    ) -> Self {
         Self {
             state: Arc::new(state),
             subscription_id_key,
+            client_ip_key,
         }
     }
 
@@ -53,6 +59,7 @@ impl HttpServer {
 
         let state = self.state;
         let subscription_id_key = self.subscription_id_key;
+        let client_ip_key = self.client_ip_key;
 
         loop {
             let (stream, remote_addr) = listener.accept().await?;
@@ -60,6 +67,7 @@ impl HttpServer {
             let io = TokioIo::new(stream);
             let state = state.clone();
             let subscription_id_key = subscription_id_key.clone();
+            let client_ip_key = client_ip_key.clone();
 
             tokio::spawn(async move {
                 let start_time = Instant::now();
@@ -70,11 +78,19 @@ impl HttpServer {
                 let service = service_fn(move |req: Request<Incoming>| {
                     let state = state.clone();
                     let subscription_id_key = subscription_id_key.clone();
+                    let client_ip_key = client_ip_key.clone();
 
                     *requests_in_connection.lock().unwrap() += 1;
 
                     async move {
-                        handle_request(req, state, subscription_id_key.clone(), remote_addr).await
+                        handle_request(
+                            req,
+                            state,
+                            subscription_id_key.clone(),
+                            client_ip_key.clone(),
+                            remote_addr,
+                        )
+                        .await
                     }
                 });
 
@@ -111,11 +127,21 @@ async fn handle_request(
     req: Request<Incoming>,
     state: Arc<CloudbreakRpcState>,
     subscription_id_key: String,
-    _remote_addr: SocketAddr,
+    client_ip_key: String,
+    remote_addr: SocketAddr,
 ) -> Result<Response<UnsyncBoxBody<Bytes, Infallible>>, Infallible> {
     let request_start = Instant::now();
     let inflight_guard = metrics::InFlightRequestGuard::new("http");
     let request_timeout = state.request_timeout;
+
+    tracing::debug!(
+        target: "api_request_headers",
+        method = %req.method(),
+        uri = %req.uri(),
+        remote_addr = %remote_addr,
+        headers = ?req.headers(),
+        "incoming API request"
+    );
 
     // Extract subscription ID from headers
     let subscription_id = req
@@ -124,6 +150,15 @@ async fn handle_request(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown-subscription-id")
         .to_string();
+
+    // Extract the client IP for per-client-IP bandwidth metrics. Prefer the configured
+    // header, fall back to the socket peer address when the header is absent.
+    let client_ip = req
+        .headers()
+        .get(&client_ip_key)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| remote_addr.ip().to_string());
 
     let handler_response = match (req.method(), req.uri().path()) {
         (&Method::POST, "/") => rpc::handle_rpc_request(req, state, &subscription_id).await,
@@ -158,6 +193,7 @@ async fn handle_request(
         _inflight_guard: inflight_guard,
         deadline: Box::pin(tokio::time::sleep(request_timeout)),
         timed_out: false,
+        client_ip,
     };
 
     let body = BodyExt::boxed_unsync(tracked);
@@ -214,6 +250,8 @@ struct TrackedBody<B> {
     /// does not continue polling the body.
     deadline: Pin<Box<Sleep>>,
     timed_out: bool,
+    /// Client IP for per-client-IP bandwidth metrics.
+    client_ip: String,
 }
 
 impl<B> Body for TrackedBody<B>
@@ -252,7 +290,10 @@ where
         match inner.poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
-                    this.bytes_count += data.len() as u64;
+                    let n = data.len() as u64;
+                    this.bytes_count += n;
+                    // Attribute bytes to the 100ms window they are transmitted in,
+                    crate::modules::bandwidth::record(&this.client_ip, n);
                 }
                 Poll::Ready(Some(Ok(frame)))
             }

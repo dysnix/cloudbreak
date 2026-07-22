@@ -501,11 +501,24 @@ pub struct MetricsConfig {
         default = "MetricsConfig::default_subscription_id_key"
     )]
     pub subscription_id_key: String,
+
+    /// Request header carrying the client IP used to group the per-client-IP
+    /// bandwidth metrics. Defaults to the load-balancer IP header `client-ip`;
+    /// override to match your ingress (e.g. `x-forwarded-for`, `x-real-ip`).
+    #[serde(
+        rename = "client-ip-key",
+        default = "MetricsConfig::default_client_ip_key"
+    )]
+    pub client_ip_key: String,
 }
 
 impl MetricsConfig {
     fn default_subscription_id_key() -> String {
         "x-subscription-id".to_string()
+    }
+
+    fn default_client_ip_key() -> String {
+        "client-ip".to_string()
     }
 }
 
