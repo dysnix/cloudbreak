@@ -52,6 +52,7 @@ struct SupplyState {
     slot: u64,
     startup_slot: u64,
     startup_touched: HashMap<Pubkey, TouchedAccount>,
+    startup_zero_prev: HashSet<Pubkey>,
 }
 
 #[derive(Default)]
@@ -235,7 +236,11 @@ impl SupplyTracker {
         let startup_slot = state.startup_slot;
         let mut window_delta: i128 = 0;
         let mut max_slot = startup_slot;
+        let mut zero_prev = HashSet::new();
         for (pubkey, account) in &state.startup_touched {
+            if account.lamports == 0 {
+                zero_prev.insert(*pubkey);
+            }
             if account.slot <= startup_slot {
                 continue;
             }
@@ -246,8 +251,16 @@ impl SupplyTracker {
         state.total = (state.total as i128 + window_delta) as u64;
         state.slot = state.slot.max(max_slot);
         state.startup_touched = HashMap::new();
+        state.startup_zero_prev = zero_prev;
         state.status = SupplyStatus::Live;
         Some(inner.commit(&state))
+    }
+
+    pub fn take_zero_prev(&self, pubkey: &Pubkey) -> bool {
+        let Some(inner) = &self.0 else {
+            return false;
+        };
+        inner.state().startup_zero_prev.remove(pubkey)
     }
 
     pub fn mark_gap(&self) -> bool {

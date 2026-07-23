@@ -337,13 +337,14 @@ async fn compute_block_supply_delta(
     let mut pubkeys = Vec::new();
     let mut new_lamports = Vec::new();
     for (pubkey, pending) in pending_accounts {
+        let zero_prev = supply_tracker.take_zero_prev(&pubkey);
         match pending.owner {
-            Some(owner) => {
+            Some(owner) if !zero_prev => {
                 owners.push(owner.to_bytes().to_vec());
                 pubkeys.push(pubkey.to_bytes().to_vec());
                 new_lamports.push(pending.lamports);
             }
-            None => block_delta += pending.lamports as i128,
+            _ => block_delta += pending.lamports as i128,
         }
     }
 
