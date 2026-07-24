@@ -502,23 +502,21 @@ pub struct MetricsConfig {
     )]
     pub subscription_id_key: String,
 
+    /// Enable the per-client-IP egress bandwidth metrics module (peak gauge +
+    /// throughput histogram). Off by default.
+    #[serde(rename = "client-ip-bandwidth-enabled", default)]
+    pub client_ip_bandwidth_enabled: bool,
+
     /// Request header carrying the client IP used to group the per-client-IP
-    /// bandwidth metrics. Defaults to the load-balancer IP header `client-ip`;
-    /// override to match your ingress (e.g. `x-forwarded-for`, `x-real-ip`).
-    #[serde(
-        rename = "client-ip-key",
-        default = "MetricsConfig::default_client_ip_key"
-    )]
-    pub client_ip_key: String,
+    /// bandwidth metrics. When unset — or when the header is absent on a
+    /// request — all bandwidth folds into a single placeholder label.
+    #[serde(rename = "client-ip-key", default)]
+    pub client_ip_key: Option<String>,
 }
 
 impl MetricsConfig {
     fn default_subscription_id_key() -> String {
         "x-subscription-id".to_string()
-    }
-
-    fn default_client_ip_key() -> String {
-        "client-ip".to_string()
     }
 }
 

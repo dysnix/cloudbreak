@@ -5,10 +5,15 @@
 
 //! Per-client-IP egress bandwidth tracking.
 //!
+//! Optional module, **off by default** — enabled via
+//! `[metrics].client-ip-bandwidth-enabled`. When disabled, nothing is
+//! registered, no sampler runs, and [`handle_for`] returns `None`, so the
+//! transport path does no work.
+//!
 //! Mechanism (one 1 s slotting engine feeding two views):
-//!  - Every response frame's byte length is attributed, as it is written to the
-//!    wire, to the current 1 s window for its client IP via [`record`]. This is
-//!    a single cheap atomic add on the hot path.
+//!  - Per request the transport layer resolves a [`BandwidthHandle`] once via
+//!    [`handle_for`], then attributes each response frame's byte length to the
+//!    current 1 s window with a single lock-free atomic add ([`BandwidthHandle::add`]).
 //!  - A background sampler ([`spawn_sampler`]) closes the window every second:
 //!    it snapshots+resets each client's accumulator (yielding a directly
 //!    measured bytes/sec), feeds it into both views, and there is no ×10
@@ -28,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use lazy_static::lazy_static;
@@ -48,6 +53,15 @@ const WINDOW_SECS: usize = 60;
 /// [`OTHER_LABEL`], keeping series count bounded.
 const MAX_CLIENT_IPS: usize = 100;
 const OTHER_LABEL: &str = "overflowed-ips";
+
+/// Placeholder client-IP label used when no `client-ip-key` is configured (or a
+/// request lacks the header). All such bytes fold into this single series.
+pub const UNCONFIGURED_CLIENT_IP: &str = "unconfigured";
+
+/// Set true by [`register`] when the module is enabled. Guards [`handle_for`]
+/// and is exposed via [`is_enabled`] so the transport path skips all work when
+/// the module is off.
+static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Per-client accumulator. `current` is the still-open 1 s window's byte total
 /// (touched on the hot path). `window` is a ring of the last [`WINDOW_SECS`]
@@ -136,10 +150,15 @@ lazy_static! {
     .unwrap();
 }
 
-/// Register the bandwidth collectors and start the background sampler. Called
-/// once from `setup_metrics` (inside the tokio runtime). Registration and
-/// sampler startup are idempotent-safe to call once.
-pub fn register(registry: &Registry) {
+/// Register the bandwidth collectors and start the background sampler — but
+/// only when `enabled`. When disabled this is a no-op: nothing is registered
+/// and no sampler runs. Must be called once from `setup_metrics` (the `Once`
+/// there is the guard; a second call would panic on re-registration).
+pub fn register(registry: &Registry, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    ENABLED.store(true, Ordering::Relaxed);
     registry
         .register(Box::new(CLIENT_IP_PEAK_BYTES_PER_SEC.clone()))
         .expect("client-ip peak gauge can't be registered");
@@ -149,21 +168,41 @@ pub fn register(registry: &Registry) {
     spawn_sampler();
 }
 
-/// The single hot-path call: attribute `bytes` of egress to `client_ip`'s
-/// currently-open 1 s window. Cheap: a read-lock + atomic add on the fast path;
-/// a write-lock only when first seeing an IP (or routing overflow to
-/// [`OTHER_LABEL`]).
-pub fn record(client_ip: &str, bytes: u64) {
-    if bytes == 0 {
-        return;
+/// Whether the module is enabled (set once at [`register`] time). Lets callers
+/// skip label extraction entirely when the module is off.
+pub fn is_enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
+/// A per-request handle to one client's byte accumulator, resolved once by
+/// [`handle_for`]. The transport path then attributes each frame with a single
+/// lock-free atomic add, avoiding a per-frame map lookup + string hash.
+pub struct BandwidthHandle(Arc<ClientBw>);
+
+impl BandwidthHandle {
+    /// Attribute `bytes` of egress to this request's currently-open 1 s window.
+    pub fn add(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.0.current.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// Resolve (creating if needed) the accumulator for `client_ip` and return a
+/// handle for the lock-free per-frame path. Returns `None` when the module is
+/// disabled. Takes the write lock only when first seeing an IP (or routing
+/// overflow to [`OTHER_LABEL`] once at capacity); called once per request.
+pub fn handle_for(client_ip: &str) -> Option<BandwidthHandle> {
+    if !is_enabled() {
+        return None;
     }
 
     // Fast path: entry already exists.
     {
         let map = STATE.read().unwrap();
         if let Some(client) = map.get(client_ip) {
-            client.current.fetch_add(bytes, Ordering::Relaxed);
-            return;
+            return Some(BandwidthHandle(client.clone()));
         }
     }
 
@@ -171,16 +210,18 @@ pub fn record(client_ip: &str, bytes: u64) {
     let mut map = STATE.write().unwrap();
     // Re-check under the write lock in case another thread inserted it.
     if let Some(client) = map.get(client_ip) {
-        client.current.fetch_add(bytes, Ordering::Relaxed);
-        return;
+        return Some(BandwidthHandle(client.clone()));
     }
     let key = if map.len() < MAX_CLIENT_IPS {
         client_ip.to_string()
     } else {
         OTHER_LABEL.to_string()
     };
-    let client = map.entry(key).or_insert_with(|| Arc::new(ClientBw::new()));
-    client.current.fetch_add(bytes, Ordering::Relaxed);
+    let client = map
+        .entry(key)
+        .or_insert_with(|| Arc::new(ClientBw::new()))
+        .clone();
+    Some(BandwidthHandle(client))
 }
 
 /// Close the current 1 s window for every tracked client: snapshot+reset the

@@ -15,9 +15,13 @@ host = "0.0.0.0"
 port = 8875
 # Header used to identify the subscription for per-subscription metrics.
 # subscription-id-key = "x-subscription-id"
-# Header used to identify the client IP for the per-client-IP
-# bandwidth metrics. Override to match your ingress (e.g. "x-forwarded-for").
-# client-ip-key = "client-ip"
+# Optional per-client-IP egress bandwidth metrics (peak gauge + throughput
+# histogram). Off by default.
+# client-ip-bandwidth-enabled = false
+# Header used to group the per-client-IP bandwidth metrics. When unset (or when
+# a request lacks the header) all bandwidth folds into a single "unconfigured"
+# label. Set it to a trusted ingress header (e.g. "x-forwarded-for") to group by client IP.
+# client-ip-key = "x-forwarded-for"
 
 [query-tracker-client]
 endpoint = "http://localhost:4001"
