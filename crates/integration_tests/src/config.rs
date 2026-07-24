@@ -91,6 +91,10 @@ pub enum SourceConfig {
         min_request_size: Option<u64>,
         max_request_size: Option<u64>,
         encoding: Option<String>,
+        /// Value for the `pool_dedicated` VictoriaLogs filter (e.g. `"liquid"`).
+        /// When omitted, no `pool_dedicated` constraint is added to the query.
+        #[serde(default)]
+        pool_dedicated: Option<String>,
         /// If true, when a no-context mismatch is detected, re-sends the request
         /// with `withContext: true` injected and runs slot compensation before
         /// deciding whether it's a real mismatch.

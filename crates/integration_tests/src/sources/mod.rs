@@ -67,6 +67,7 @@ pub async fn load_requests_from_source(
             min_request_size,
             max_request_size,
             encoding,
+            pool_dedicated,
             inject_context: _,
             poll_interval_secs,
             replay_once,
@@ -93,6 +94,7 @@ pub async fn load_requests_from_source(
                 *minutes,
                 *window_seconds,
                 *limit,
+                pool_dedicated.as_deref(),
             )
             .await?;
             let initial_requests = retain_unseen(initial_requests, &mut seen, replay_once);
@@ -109,6 +111,7 @@ pub async fn load_requests_from_source(
             let min_request_size = *min_request_size;
             let max_request_size = *max_request_size;
             let encoding = encoding.clone();
+            let pool_dedicated = pool_dedicated.clone();
             let minutes = *minutes;
             let window_seconds = *window_seconds;
             let limit = *limit;
@@ -127,6 +130,7 @@ pub async fn load_requests_from_source(
                         minutes,
                         window_seconds,
                         limit,
+                        pool_dedicated.as_deref(),
                     )
                     .await
                     {
