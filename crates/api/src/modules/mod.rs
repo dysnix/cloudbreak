@@ -3,5 +3,6 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+pub mod bandwidth;
 pub mod cache;
 pub mod vote_accounts_cache;

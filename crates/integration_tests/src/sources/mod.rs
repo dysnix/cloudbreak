@@ -15,13 +15,28 @@ use anyhow::Result;
 use serde_json::Value as JsonValue;
 use tokio::sync::watch;
 
+/// A request to benchmark plus an optional estimated response size in bytes.
+///
+/// `est_bytes` is populated only by the VictoriaLogs source (from its `bytes`
+/// field) and drives the bandwidth cap. Other sources leave it `None`, so those
+/// requests run uncapped.
+#[derive(Clone, Debug)]
+pub struct BenchRequest {
+    pub body: JsonValue,
+    pub est_bytes: Option<u64>,
+}
+
 fn retain_unseen(
     requests: Vec<victoria_logs::LoggedRequest>,
     seen: &mut HashSet<String>,
     replay_once: bool,
-) -> Vec<JsonValue> {
+) -> Vec<BenchRequest> {
+    let to_bench = |r: victoria_logs::LoggedRequest| BenchRequest {
+        body: r.body,
+        est_bytes: r.bytes,
+    };
     if !replay_once {
-        return requests.into_iter().map(|r| r.body).collect();
+        return requests.into_iter().map(to_bench).collect();
     }
     requests
         .into_iter()
@@ -29,7 +44,7 @@ fn retain_unseen(
             Some(id) => seen.insert(id.clone()),
             None => true,
         })
-        .map(|r| r.body)
+        .map(to_bench)
         .collect()
 }
 
@@ -37,7 +52,7 @@ fn retain_unseen(
 pub async fn load_requests_from_source(
     source: &SourceConfig,
     request_type: RequestType,
-) -> Result<watch::Receiver<Vec<JsonValue>>, anyhow::Error> {
+) -> Result<watch::Receiver<Vec<BenchRequest>>, anyhow::Error> {
     match source {
         SourceConfig::JsonFile { path } => {
             let rx = json_file::load_requests(path)?;
@@ -52,6 +67,7 @@ pub async fn load_requests_from_source(
             min_request_size,
             max_request_size,
             encoding,
+            pool_dedicated,
             inject_context: _,
             poll_interval_secs,
             replay_once,
@@ -78,6 +94,7 @@ pub async fn load_requests_from_source(
                 *minutes,
                 *window_seconds,
                 *limit,
+                pool_dedicated.as_deref(),
             )
             .await?;
             let initial_requests = retain_unseen(initial_requests, &mut seen, replay_once);
@@ -94,6 +111,7 @@ pub async fn load_requests_from_source(
             let min_request_size = *min_request_size;
             let max_request_size = *max_request_size;
             let encoding = encoding.clone();
+            let pool_dedicated = pool_dedicated.clone();
             let minutes = *minutes;
             let window_seconds = *window_seconds;
             let limit = *limit;
@@ -112,6 +130,7 @@ pub async fn load_requests_from_source(
                         minutes,
                         window_seconds,
                         limit,
+                        pool_dedicated.as_deref(),
                     )
                     .await
                     {

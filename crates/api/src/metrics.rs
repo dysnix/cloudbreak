@@ -229,6 +229,14 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         register!(CLOUDBREAK_GPA_CACHE_MAX_BYTES);
         register!(CLOUDBREAK_GPA_CACHE_EVICTIONS_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_EVICTED_BYTES_TOTAL);
+
+        // Per-client-IP egress bandwidth (peak gauge + throughput histogram).
+        // Optional, off by default: registers its collectors and starts the 1s
+        // sampler task only when enabled in config.
+        crate::modules::bandwidth::register(
+            &METRICS_REGISTRY,
+            config.metrics.client_ip_bandwidth_enabled,
+        );
     });
 
     // Set the max connections as a reference metric at startup
