@@ -53,6 +53,7 @@ struct SupplyState {
     startup_slot: u64,
     startup_touched: HashMap<Pubkey, TouchedAccount>,
     startup_zero_prev: HashSet<Pubkey>,
+    gap_closes: HashMap<Pubkey, u64>,
 }
 
 #[derive(Default)]
@@ -261,6 +262,30 @@ impl SupplyTracker {
             return false;
         };
         inner.state().startup_zero_prev.remove(pubkey)
+    }
+
+    pub fn is_gap_filling(&self) -> bool {
+        let Some(inner) = &self.0 else { return false };
+        inner.state().status == SupplyStatus::GapFilling
+    }
+
+    pub fn record_gap_closes(&self, slot: u64, closed_accounts: &[Vec<u8>]) {
+        let Some(inner) = &self.0 else { return };
+        let mut state = inner.state();
+        if state.status != SupplyStatus::GapFilling {
+            return;
+        }
+        for pubkey in closed_accounts {
+            let pubkey = Pubkey::try_from(pubkey.as_slice()).unwrap();
+            let entry = state.gap_closes.entry(pubkey).or_insert(slot);
+            *entry = (*entry).max(slot);
+        }
+    }
+
+    pub fn gap_close_floor(&self, pubkey: &Pubkey) -> Option<u64> {
+        let inner = self.0.as_deref()?;
+        let state = inner.state();
+        state.gap_closes.get(pubkey).copied()
     }
 
     pub fn mark_gap(&self) -> bool {

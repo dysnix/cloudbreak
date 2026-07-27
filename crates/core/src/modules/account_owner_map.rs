@@ -134,6 +134,7 @@ impl AccountOwnerMap {
         &self,
         closed_accounts: Vec<Vec<u8>>,
         slot: u64,
+        defer_removals: bool,
     ) -> Result<ExecResult, sea_orm::DbErr> {
         let accounts = self.accounts.as_ref().expect("AccountOwnerMap not enabled");
 
@@ -146,7 +147,12 @@ impl AccountOwnerMap {
                 let pubkey = Pubkey::try_from(pubkey_bytes.as_slice()).unwrap();
 
                 // Only insert closed accounts that are present in the map
-                if let Some(item) = map.remove(&pubkey) {
+                let item = if defer_removals {
+                    map.get(&pubkey).cloned()
+                } else {
+                    map.remove(&pubkey)
+                };
+                if let Some(item) = item {
                     pubkeys.push(pubkey_bytes.clone());
                     owners.push(item.owner.to_bytes().to_vec());
                 }

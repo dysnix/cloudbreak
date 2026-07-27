@@ -90,6 +90,7 @@ pub fn insert_closed_accounts(
     slot: u64,
     config: &IndexConfig,
     accounts_owner_map: AccountOwnerMap,
+    defer_map_removals: bool,
 ) -> Option<JoinHandle<bool>> {
     let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
 
@@ -100,7 +101,9 @@ pub fn insert_closed_accounts(
         let mut inserted = true;
 
         if accounts_owner_map.is_enabled() {
-            let result = accounts_owner_map.save_closed_accounts(pubkeys, slot).await;
+            let result = accounts_owner_map
+                .save_closed_accounts(pubkeys, slot, defer_map_removals)
+                .await;
             match result {
                 Ok(res) => {
                     tracing::debug!("saved {} closed accounts", res.rows_affected());

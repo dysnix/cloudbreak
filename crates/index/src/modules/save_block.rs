@@ -52,6 +52,7 @@ pub async fn save_block(
     let max_chunk_bytes_data = config.grpc.max_chunk_bytes_data;
 
     let slot = block.slot;
+    let is_repaired = block.blockhash.is_empty();
 
     modules::snapshot::process_snapshot_if_needed(
         config.clone(),
@@ -152,7 +153,13 @@ pub async fn save_block(
             continue;
         }
 
-        accounts_owner_map.upsert_account(&account.pubkey, &account.owner, slot);
+        let resurrects_gap_closed_account = is_repaired
+            && supply_tracker
+                .gap_close_floor(&Pubkey::try_from(account.pubkey.as_slice()).unwrap())
+                .is_some_and(|closed_slot| closed_slot >= slot);
+        if !resurrects_gap_closed_account {
+            accounts_owner_map.upsert_account(&account.pubkey, &account.owner, slot);
+        }
 
         block_bytes_data += account.data.len();
         current_chunk_bytes += account.data.len();
@@ -190,9 +197,20 @@ pub async fn save_block(
     }
 
     let supply_write_guard = supply_tracker.lock_block_writes().await;
+    if !is_repaired {
+        supply_tracker.record_gap_closes(slot, &closed_accounts_for_slot);
+    }
+    let defer_map_removals = supply_tracker.is_gap_filling();
     let block_supply_delta = if supply_tracker.is_tracking_deltas() {
-        compute_block_supply_delta(db, &config, &supply_tracker, pending_supply_accounts, slot)
-            .await
+        compute_block_supply_delta(
+            db,
+            &config,
+            &supply_tracker,
+            pending_supply_accounts,
+            slot,
+            is_repaired,
+        )
+        .await
     } else {
         supply_tracker.record_startup_touches(
             slot,
@@ -223,6 +241,7 @@ pub async fn save_block(
             slot,
             &config,
             accounts_owner_map,
+            defer_map_removals,
         )
     } else {
         None
@@ -331,6 +350,7 @@ async fn compute_block_supply_delta(
     supply_tracker: &SupplyTracker,
     pending_accounts: HashMap<Pubkey, PendingSupplyAccount>,
     slot: u64,
+    is_repaired: bool,
 ) -> Option<i128> {
     let mut block_delta: i128 = 0;
     let mut owners = Vec::new();
@@ -338,6 +358,14 @@ async fn compute_block_supply_delta(
     let mut new_lamports = Vec::new();
     for (pubkey, pending) in pending_accounts {
         let zero_prev = supply_tracker.take_zero_prev(&pubkey);
+        if is_repaired
+            && !zero_prev
+            && supply_tracker
+                .gap_close_floor(&pubkey)
+                .is_some_and(|closed_slot| closed_slot >= slot)
+        {
+            continue;
+        }
         match pending.owner {
             Some(owner) if !zero_prev => {
                 owners.push(owner.to_bytes().to_vec());
