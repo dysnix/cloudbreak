@@ -65,6 +65,13 @@ pub struct BenchmarkConfig {
 
     #[serde(default)]
     pub start_on_first_request: bool,
+
+    /// Optional bandwidth cap in Gbit/s, enforced against *actual received*
+    /// rpc1 response bytes. Acts as an upper bound together with `target_rps`:
+    /// if byte throughput hits this limit below `target_rps`, effective RPS is
+    /// reduced so the average stays under the cap. Omit/0 to disable.
+    #[serde(default)]
+    pub target_gbits: Option<f64>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -84,6 +91,10 @@ pub enum SourceConfig {
         min_request_size: Option<u64>,
         max_request_size: Option<u64>,
         encoding: Option<String>,
+        /// Value for the `pool_dedicated` VictoriaLogs filter (e.g. `"liquid"`).
+        /// When omitted, no `pool_dedicated` constraint is added to the query.
+        #[serde(default)]
+        pool_dedicated: Option<String>,
         /// If true, when a no-context mismatch is detected, re-sends the request
         /// with `withContext: true` injected and runs slot compensation before
         /// deciding whether it's a real mismatch.

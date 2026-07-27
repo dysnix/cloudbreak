@@ -5,6 +5,7 @@
 
 use clap::{Parser, Subcommand};
 
+mod bandwidth;
 mod benchmark;
 mod compare_accounts_by_mint;
 mod compare_accounts_by_mint_vs_cluster;

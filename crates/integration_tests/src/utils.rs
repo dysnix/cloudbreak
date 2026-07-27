@@ -19,6 +19,7 @@ pub async fn send_rpc_request(
     client: &reqwest::Client,
     endpoint: &RpcEndpoint,
     request: &JsonValue,
+    meter: Option<&std::sync::Arc<crate::bandwidth::BwMeter>>,
 ) -> Result<(JsonValue, u128)> {
     let start = Instant::now();
 
@@ -30,11 +31,23 @@ pub async fn send_rpc_request(
         .await
         .with_context(|| format!("Failed to connect to {}", endpoint.name))?;
 
-    let json = response
-        .json()
+    // Read the raw body first so we can account the true received wire size
+    // cheaply: `reqwest::Response::json()` already buffers the full body into
+    // `bytes()` internally, so doing it ourselves adds no extra copy — we just
+    // get `.len()` for free and parse from the slice. The re-serialized JSON
+    // length used for the size buckets is computed by the caller as before.
+    let body = response
+        .bytes()
         .await
         .with_context(|| format!("Failed to read response from {}", endpoint.name))?;
     let duration = start.elapsed().as_millis();
+
+    if let Some(meter) = meter {
+        meter.record(body.len() as u64);
+    }
+
+    let json = serde_json::from_slice(&body)
+        .with_context(|| format!("Failed to parse response from {}", endpoint.name))?;
 
     Ok((json, duration))
 }

@@ -64,7 +64,13 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
         duration_secs,
         timeout_secs,
         start_on_first_request,
+        target_gbits,
     } = benchmark;
+
+    // Shared bandwidth meter: always totals both estimated and actual rpc1 bytes
+    // (for the summary) and, when `target_gbits` is set, paces dispatch with a
+    // zero-burst token bucket charged off each request's estimated size.
+    let bw_meter = Arc::new(crate::bandwidth::BwMeter::new(target_gbits));
 
     let retry_with_context = source.retry_with_context();
     let replay_once = source.replay_once();
@@ -106,13 +112,14 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
     let dropped_count_spawner = dropped_count.clone();
     let rpc1_name = rpc1.name.clone();
     let retry_in_place_enabled = retry_in_place.enabled;
+    let bw_meter_spawner = bw_meter.clone();
 
     // Spawner loop (runs for `duration` seconds)
     tokio::spawn(async move {
         let mut deadline = (!start_on_first_request)
             .then(|| Instant::now() + Duration::from_secs(duration_secs));
         let mut idx: usize = 0;
-        let mut pending: VecDeque<serde_json::Value> = VecDeque::new();
+        let mut pending: VecDeque<sources::BenchRequest> = VecDeque::new();
         let mut drained_initial = false;
 
         // Will make the requests loop infinitely until the deadline is reached
@@ -123,6 +130,7 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
                 break;
             }
             ticker.tick().await;
+
             let permit = semaphore.clone().try_acquire_owned();
 
             let request = if replay_once {
@@ -146,6 +154,11 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
                 req
             };
 
+            // Split off the bandwidth estimate; the rest of the pipeline only
+            // needs the request body (`JsonValue`), so shadow `request`.
+            let est_bytes = request.est_bytes;
+            let request = request.body;
+
             if deadline.is_none() {
                 tracing::info!(
                     target: "bench_source",
@@ -156,6 +169,12 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
 
             match permit {
                 Ok(permit) => {
+                    // Bandwidth gate: charge this dispatch's estimate and, when a
+                    // Gbit/s cap is configured, block until the zero-burst bucket
+                    // has refilled. Only dispatched (non-dropped) requests are
+                    // charged. No-op for requests without an estimate.
+                    bw_meter_spawner.acquire_for(est_bytes).await;
+
                     let tx = tx.clone();
                     let client = client.clone();
                     let rpc1 = rpc1.clone();
@@ -165,6 +184,7 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
                     let print_config = print_config.clone();
                     let retry_in_place = retry_in_place.clone();
                     let db_probe_pool = db_probe_pool.clone();
+                    let bw_meter = bw_meter_spawner.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = process_request(
@@ -180,6 +200,7 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
                             retry_with_context,
                             &retry_in_place,
                             db_probe_pool.as_ref(),
+                            &bw_meter,
                         )
                         .await
                         {
@@ -202,7 +223,13 @@ pub async fn run(args: &BenchmarkArgs) -> Result<()> {
     }
 
     let dropped = dropped_count.load(std::sync::atomic::Ordering::Relaxed);
-    stats.print_summary(dropped, retry_in_place_enabled);
+    stats.print_summary(
+        dropped,
+        retry_in_place_enabled,
+        bw_meter.est_bytes(),
+        bw_meter.actual_bytes(),
+        target_gbits,
+    );
 
     if stats.total_mismatches > 0 {
         anyhow::bail!(
@@ -261,14 +288,22 @@ async fn run_comparison(
     encoding: &str,
     retry_with_context: bool,
     db_probe_ctx: Option<&DbProbeCtx>,
+    bw_meter: &Arc<crate::bandwidth::BwMeter>,
 ) -> Result<ComparisonOutcome> {
     let mut iterations: Option<Vec<response_comparison::IterationCapture>> = comparison_config
         .save_compensation_iterations
         .then(Vec::new);
 
     let initial_fired_at = SystemTime::now();
-    let (r1, r2, initial_probe) =
-        response_comparison::join_pair_with_probe(client, rpc1, rpc2, request, db_probe_ctx).await;
+    let (r1, r2, initial_probe) = response_comparison::join_pair_with_probe(
+        client,
+        rpc1,
+        rpc2,
+        request,
+        db_probe_ctx,
+        bw_meter,
+    )
+    .await;
     let (json1, duration1) = r1?;
     let (json2, duration2) = r2?;
 
@@ -301,6 +336,7 @@ async fn run_comparison(
         iterations.as_mut(),
         "initial",
         db_probe_ctx,
+        bw_meter,
     )
     .await?;
 
@@ -319,6 +355,7 @@ async fn run_comparison(
             rpc2,
             &ctx_request,
             db_probe_ctx,
+            bw_meter,
         )
         .await;
         let (ctx_json1, ctx_dur1) = ctx_r1?;
@@ -353,6 +390,7 @@ async fn run_comparison(
             iterations.as_mut(),
             "with_context_retry",
             db_probe_ctx,
+            bw_meter,
         )
         .await?;
 
@@ -382,6 +420,7 @@ async fn process_request(
     retry_with_context: bool,
     retry_in_place: &RetryInPlaceConfig,
     db_probe_pool: Option<&Arc<sea_orm::DatabaseConnection>>,
+    bw_meter: &Arc<crate::bandwidth::BwMeter>,
 ) -> Result<()> {
     let encoding = utils::extract_encoding_from_request(request, request_type);
     let commitment = utils::extract_commitment_from_request(request, request_type);
@@ -403,7 +442,7 @@ async fn process_request(
 
     // Comparison-disabled path keeps the legacy one-sided behavior (just rpc1).
     let Some(comparison_config) = comparison_config else {
-        let (json, duration) = utils::send_rpc_request(client, rpc1, request).await?;
+        let (json, duration) = utils::send_rpc_request(client, rpc1, request, Some(bw_meter)).await?;
         utils::print_request_result(request, duration, &json, rpc1, &encoding, print_config);
         if let Err(e) = results_tx.send(BenchResult {
             duration,
@@ -444,6 +483,7 @@ async fn process_request(
         let comparison_config = comparison_config.clone();
         let encoding = encoding.clone();
         let db_probe_ctx = db_probe_ctx.clone();
+        let bw_meter = bw_meter.clone();
         Some(tokio::spawn(async move {
             tokio::time::sleep_until(fire_at).await;
             run_comparison(
@@ -456,6 +496,7 @@ async fn process_request(
                 &encoding,
                 retry_with_context,
                 db_probe_ctx.as_ref(),
+                &bw_meter,
             )
             .await
         }))
@@ -474,6 +515,7 @@ async fn process_request(
         &encoding,
         retry_with_context,
         db_probe_ctx_ref,
+        bw_meter,
     )
     .await?;
     let original_elapsed_ms = original_start.elapsed().as_millis();
@@ -533,6 +575,7 @@ async fn process_request(
             &encoding,
             retry_with_context,
             db_probe_ctx_ref,
+            bw_meter,
         )
         .await
         {
@@ -771,17 +814,38 @@ impl BenchStats {
         self.buckets.entry(key).or_default().push(result.duration);
     }
 
-    fn print_summary(&mut self, dropped: u64, retry_in_place_enabled: bool) {
+    fn print_summary(
+        &mut self,
+        dropped: u64,
+        retry_in_place_enabled: bool,
+        est_rpc1_bytes: u64,
+        actual_rpc1_bytes: u64,
+        target_gbits: Option<f64>,
+    ) {
         let elapsed = self.start_time.elapsed();
+
+        // Average rpc1 throughput over the run. `est` is what pacing used (the
+        // VLogs `bytes` estimate); `real` is the actual received wire bytes —
+        // shown side by side so estimate drift is visible.
+        let secs = elapsed.as_secs_f64();
+        let est_gbits = est_rpc1_bytes as f64 * 8.0 / secs / 1e9;
+        let real_gbits = actual_rpc1_bytes as f64 * 8.0 / secs / 1e9;
 
         println!("\n{}", "=".repeat(90));
         println!("BENCHMARK SUMMARY");
         println!("{}", "=".repeat(90));
+        let gbits_cap = target_gbits
+            .filter(|g| *g > 0.0)
+            .map(|g| format!(" (cap {g:.3} Gbit/s)"))
+            .unwrap_or_default();
         println!(
-            "Duration: {:.1}s | Total requests: {} | Effective RPS: {:.1}",
-            elapsed.as_secs_f64(),
+            "Duration: {:.1}s | Total requests: {} | Effective RPS: {:.1} | Est: {:.3} Gbit/s{} | Real: {:.3} Gbit/s",
+            secs,
             self.total_requests,
-            self.total_requests as f64 / elapsed.as_secs_f64(),
+            self.total_requests as f64 / secs,
+            est_gbits,
+            gbits_cap,
+            real_gbits,
         );
 
         if dropped > 0 {

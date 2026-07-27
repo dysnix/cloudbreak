@@ -5,6 +5,7 @@ Benchmarking and correctness testing tool for Solana RPC endpoints.
 ## Features
 
 - **Constant-rate load generation**: Spawns requests at a configurable RPS rate decoupled from response latency. A ticker fires at the target interval and dispatches requests regardless of how long previous ones take, with a semaphore limiting maximum in-flight concurrency.
+- **Bandwidth limit (Gbit/s)**: An optional `[benchmark].target_gbits` cap throttles load based on the **actual received rpc1 response bytes**, acting as a second ceiling alongside `target_rps`. If byte throughput reaches the cap below the target RPS, the spawner slows down so the average stays under the limit — useful for reproducing a link/NIC saturation ceiling instead of a pure request-rate one. Implemented as a debt-based token bucket over real wire bytes (no estimation). The run's **average Gbit/s** is always reported in the summary next to Effective RPS, whether or not a cap is set.
 - **Response comparison**: Optionally sends the same request to a second endpoint and compares the responses. Comparison is order-agnostic — accounts are matched by pubkey, so different ordering between endpoints is not flagged as a mismatch.
 - **Slot compensation**: When two endpoints return different data, the tool checks if the difference is due to a slot lag. If enabled, it fires concurrent requests to **both** endpoints at regular intervals, collecting all responses. It then searches for the first pair (one from each endpoint) that share the same slot, and uses that pair for comparison. This avoids the ping-pong problem where sequential retries on the behind endpoint can never converge because the chain keeps advancing (especially with `processed` commitment). The initial slot difference is still recorded in statistics. **Important**: slot compensation only activates when both responses include `result.context.slot` (i.e. the request was made with `withContext: true`). If the responses have no context, mismatches are reported as-is with no retries. For `getProgramAccounts`, context is only present if the request explicitly includes `withContext: true`; `getTokenAccountsByOwner` and `getTokenAccountsByDelegate` always return context.
 - **Live request sources**: Requests can come from a static JSON file or be fetched live from VictoriaLogs. The VictoriaLogs source refreshes every 60 seconds in the background, so the request pool evolves during long runs.
@@ -152,6 +153,7 @@ Controls load generation.
 | `target_rps`    | _(required)_ | Target requests per second. Requests are spawned at this rate independently of response latency |
 | `max_in_flight` | `100`        | Maximum concurrent in-flight requests. Requests beyond this limit are dropped                   |
 | `duration_secs` | `0`          | How long to run in seconds. `0` exits immediately (should be set)                               |
+| `target_gbits`  | _(none)_     | Optional bandwidth cap in **Gbit/s**, enforced against the actual received rpc1 response bytes. Works together with `target_rps`: if throughput hits this limit below the target RPS, effective RPS is throttled so the average stays under the cap. Omit (or `0`) to disable — the average Gbit/s is still reported either way |
 
 ### `[source]`
 
@@ -672,7 +674,7 @@ At the end of a run, a summary is printed to stdout. It has three sections:
 ==========================================================================================
 BENCHMARK SUMMARY
 ==========================================================================================
-Duration: 100.0s | Total requests: 1847 | Effective RPS: 18.5
+Duration: 100.0s | Total requests: 1847 | Effective RPS: 18.5 | Avg: 3.421 Gbit/s (cap 5.000 Gbit/s)
 Dropped requests (backpressure): 53 (2.8% of attempted)
 Comparisons: 1423 matches, 5 mismatches, 7 no-context mismatches (possible slot lag)
 Recovered by retry: 18 (would have been mismatches without retry_in_place) (1.26% of compared)
@@ -685,6 +687,7 @@ The **Recovered by retry** line is only printed when `[retry_in_place]` is enabl
 | Duration         | Actual wall-clock time of the run                                                                                                                                                                                                           |
 | Total requests   | Total number of requests sent (to both endpoints combined)                                                                                                                                                                                  |
 | Effective RPS    | `total_requests / duration` — the actual throughput achieved                                                                                                                                                                                |
+| Avg Gbit/s       | Average rpc1 throughput over the run, computed from the actual received response wire bytes (`total_rpc1_bytes * 8 / duration / 1e9`). When `target_gbits` is set, the configured cap is shown in parentheses                                 |
 | Dropped requests | Requests that were not sent because `max_in_flight` was full (only shown if > 0). This can indicate that `max_in_flight` is too low for the target RPS, or that the server is responding too slowly and in-flight requests are accumulating |
 | Comparisons      | Match/mismatch/no-context mismatch counts. No-context mismatches are responses that differ but lack `result.context`, meaning the difference may be due to slot lag that cannot be verified or compensated for                              |
 
@@ -754,6 +757,8 @@ name = "reference"
 target_rps = 5.0
 max_in_flight = 100
 duration_secs = 100
+# target_gbits = 1.0  # Optional bandwidth cap (Gbit/s) enforced on actual
+                      # received rpc1 bytes; throttles RPS to stay under it.
 
 [source]
 type = "json_file"

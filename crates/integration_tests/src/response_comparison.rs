@@ -449,24 +449,27 @@ pub async fn join_pair_with_probe(
     rpc2: &RpcEndpoint,
     request: &JsonValue,
     db_probe_ctx: Option<&DbProbeCtx>,
+    bw_meter: &std::sync::Arc<crate::bandwidth::BwMeter>,
 ) -> (
     Result<(JsonValue, u128)>,
     Result<(JsonValue, u128)>,
     Option<DbProbeResult>,
 ) {
+    // Only rpc1 (the endpoint under test) is metered for the Gbit/s limit and
+    // the average throughput display; rpc2 is the comparison arm.
     match db_probe_ctx {
         Some(ctx) => {
             let (r1, r2, probe) = tokio::join!(
-                utils::send_rpc_request(client, rpc1, request),
-                utils::send_rpc_request(client, rpc2, request),
+                utils::send_rpc_request(client, rpc1, request, Some(bw_meter)),
+                utils::send_rpc_request(client, rpc2, request, None),
                 probe_get_balance_state(ctx),
             );
             (r1, r2, probe)
         }
         None => {
             let (r1, r2) = tokio::join!(
-                utils::send_rpc_request(client, rpc1, request),
-                utils::send_rpc_request(client, rpc2, request),
+                utils::send_rpc_request(client, rpc1, request, Some(bw_meter)),
+                utils::send_rpc_request(client, rpc2, request, None),
             );
             (r1, r2, None)
         }
@@ -496,6 +499,7 @@ pub async fn compare_with_slot_compensation(
     mut iterations: Option<&mut Vec<IterationCapture>>,
     iteration_phase: &'static str,
     db_probe_ctx: Option<&DbProbeCtx>,
+    bw_meter: &std::sync::Arc<crate::bandwidth::BwMeter>,
 ) -> Result<(CompareResponsesResult, u32)> {
     let enable_slot_compensation = comparison_config.enable_slot_compensation;
     let max_retries = comparison_config.slot_compensation_max_retries;
@@ -539,6 +543,7 @@ pub async fn compare_with_slot_compensation(
                         rpc2,
                         request,
                         db_probe_ctx,
+                        bw_meter,
                     )
                     .await;
 

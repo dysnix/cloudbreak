@@ -33,17 +33,27 @@ use crate::http::CloudbreakRpcState;
 use crate::http::operational_endpoints;
 use crate::http::rpc;
 use crate::metrics;
+use crate::modules::bandwidth;
 
 pub struct HttpServer {
     state: Arc<CloudbreakRpcState>,
     subscription_id_key: String,
+    /// Header carrying the client IP for the (optional) per-client-IP bandwidth
+    /// metrics. `None` means "not configured" — all bandwidth is attributed to
+    /// a single placeholder label rather than reading any request header.
+    client_ip_key: Option<String>,
 }
 
 impl HttpServer {
-    pub fn new(state: CloudbreakRpcState, subscription_id_key: String) -> Self {
+    pub fn new(
+        state: CloudbreakRpcState,
+        subscription_id_key: String,
+        client_ip_key: Option<String>,
+    ) -> Self {
         Self {
             state: Arc::new(state),
             subscription_id_key,
+            client_ip_key,
         }
     }
 
@@ -53,13 +63,15 @@ impl HttpServer {
 
         let state = self.state;
         let subscription_id_key = self.subscription_id_key;
+        let client_ip_key = self.client_ip_key;
 
         loop {
-            let (stream, remote_addr) = listener.accept().await?;
+            let (stream, _remote_addr) = listener.accept().await?;
 
             let io = TokioIo::new(stream);
             let state = state.clone();
             let subscription_id_key = subscription_id_key.clone();
+            let client_ip_key = client_ip_key.clone();
 
             tokio::spawn(async move {
                 let start_time = Instant::now();
@@ -70,11 +82,13 @@ impl HttpServer {
                 let service = service_fn(move |req: Request<Incoming>| {
                     let state = state.clone();
                     let subscription_id_key = subscription_id_key.clone();
+                    let client_ip_key = client_ip_key.clone();
 
                     *requests_in_connection.lock().unwrap() += 1;
 
                     async move {
-                        handle_request(req, state, subscription_id_key.clone(), remote_addr).await
+                        handle_request(req, state, subscription_id_key.clone(), client_ip_key)
+                            .await
                     }
                 });
 
@@ -111,7 +125,7 @@ async fn handle_request(
     req: Request<Incoming>,
     state: Arc<CloudbreakRpcState>,
     subscription_id_key: String,
-    _remote_addr: SocketAddr,
+    client_ip_key: Option<String>,
 ) -> Result<Response<UnsyncBoxBody<Bytes, Infallible>>, Infallible> {
     let request_start = Instant::now();
     let inflight_guard = metrics::InFlightRequestGuard::new("http");
@@ -124,6 +138,21 @@ async fn handle_request(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown-subscription-id")
         .to_string();
+
+    // Resolve the per-client-IP bandwidth handle once per request; the transport
+    // path is then a lock-free atomic add per frame. `None` when the module is
+    // disabled. When `client-ip-key` is unset — or the header is absent — bytes
+    // fold into a single placeholder label rather than reading any
+    // client-settable/PII header value.
+    let bw = if bandwidth::is_enabled() {
+        let label = client_ip_key
+            .as_deref()
+            .and_then(|key| req.headers().get(key).and_then(|v| v.to_str().ok()))
+            .unwrap_or(bandwidth::UNCONFIGURED_CLIENT_IP);
+        bandwidth::handle_for(label)
+    } else {
+        None
+    };
 
     let handler_response = match (req.method(), req.uri().path()) {
         (&Method::POST, "/") => rpc::handle_rpc_request(req, state, &subscription_id).await,
@@ -158,6 +187,7 @@ async fn handle_request(
         _inflight_guard: inflight_guard,
         deadline: Box::pin(tokio::time::sleep(request_timeout)),
         timed_out: false,
+        bw,
     };
 
     let body = BodyExt::boxed_unsync(tracked);
@@ -214,6 +244,9 @@ struct TrackedBody<B> {
     /// does not continue polling the body.
     deadline: Pin<Box<Sleep>>,
     timed_out: bool,
+    /// Per-client-IP bandwidth accumulator handle, resolved once per request.
+    /// `None` when the bandwidth module is disabled.
+    bw: Option<bandwidth::BandwidthHandle>,
 }
 
 impl<B> Body for TrackedBody<B>
@@ -252,7 +285,12 @@ where
         match inner.poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
-                    this.bytes_count += data.len() as u64;
+                    let n = data.len() as u64;
+                    this.bytes_count += n;
+                    // Attribute bytes to the current 1s window (lock-free add).
+                    if let Some(bw) = &this.bw {
+                        bw.add(n);
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }

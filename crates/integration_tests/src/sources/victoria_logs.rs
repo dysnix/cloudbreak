@@ -11,6 +11,9 @@ use crate::utils;
 pub struct LoggedRequest {
     pub req_id: Option<String>,
     pub body: JsonValue,
+    /// Logged response size in bytes (the VictoriaLogs `bytes` field), used as
+    /// the bandwidth-cap estimate. `None` when the field is absent/unparseable.
+    pub bytes: Option<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22,9 +25,21 @@ pub fn get_body_query(
     minutes: Option<u32>,
     window_seconds: Option<u32>,
     limit: u32,
+    pool_dedicated: Option<&str>,
 ) -> String {
     let encoding_filter = encoding
         .map(|e| format!(r#" AND body:~`"encoding":\s*"{}"`"#, e))
+        .unwrap_or_default();
+
+    // `pool_dedicated` filter, configurable per source. When unset, no
+    // `pool_dedicated` constraint is applied. `simulateTransaction` keeps its
+    // historical `foundation` default when the config leaves it unset.
+    let pool_filter = pool_dedicated
+        .map(|p| format!(" AND pool_dedicated:~\"{}\"", p))
+        .unwrap_or_default();
+    let simulate_pool_filter = pool_dedicated
+        .or(Some("foundation"))
+        .map(|p| format!(" AND pool_dedicated:~\"{}\"", p))
         .unwrap_or_default();
 
     let time_filter = match window_seconds {
@@ -36,13 +51,13 @@ pub fn get_body_query(
 
     match request_type {
         RequestType::Gtabo => format!(
-            "query={time_filter}rpc_call:=\"getTokenAccountsByOwner\" {encoding_filter} AND pool_dedicated:~\"liquid\" {min_filter} {max_filter} | limit {limit}"
+            "query={time_filter}rpc_call:=\"getTokenAccountsByOwner\" {encoding_filter}{pool_filter} {min_filter} {max_filter} | limit {limit}"
         ),
         RequestType::Gtabd => format!(
-            "query={time_filter}rpc_call:=\"getTokenAccountsByDelegate\" {encoding_filter} AND pool_dedicated:~\"liquid\" {min_filter} {max_filter} | limit {limit}"
+            "query={time_filter}rpc_call:=\"getTokenAccountsByDelegate\" {encoding_filter}{pool_filter} {min_filter} {max_filter} | limit {limit}"
         ),
         RequestType::Gpa => format!(
-            "query={time_filter}rpc_call:=\"getProgramAccounts\"  AND pool_dedicated:~\"liquid\" AND NOT body:~\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA|TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\" {encoding_filter} {min_filter} {max_filter} | limit {limit}"
+            "query={time_filter}rpc_call:=\"getProgramAccounts\" {pool_filter} AND NOT body:~\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA|TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\" {encoding_filter} {min_filter} {max_filter} | limit {limit}"
         ),
         RequestType::GpaTokenOwner => format!(
             "query={time_filter}rpc_call:=\"getProgramAccounts\" {encoding_filter} AND b_end:~\"tokenowner\" AND body:~\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA|TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\" AND body:~`memcmp.*offset.:\\s*32` | limit {limit}"
@@ -51,22 +66,22 @@ pub fn get_body_query(
             "query={time_filter}rpc_call:=\"getProgramAccounts\" {encoding_filter} AND b_end:~\"liquid-tokenmint\" AND body:~\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA|TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\" AND body:~`memcmp.*offset.:\\s*0` | limit {limit}"
         ),
         RequestType::GetAccountInfo => format!(
-            "query={time_filter}rpc_call:=\"getAccountInfo\" AND pool_dedicated:~\"liquid\" | limit {limit}"
+            "query={time_filter}rpc_call:=\"getAccountInfo\"{pool_filter} | limit {limit}"
         ),
         RequestType::GetMultipleAccounts => format!(
-            "query={time_filter}rpc_call:=\"getMultipleAccounts\" AND pool_dedicated:~\"liquid\" | limit {limit}"
+            "query={time_filter}rpc_call:=\"getMultipleAccounts\"{pool_filter} | limit {limit}"
         ),
         RequestType::GetBalance => format!(
-            "query={time_filter}rpc_call:=\"getBalance\" AND pool_dedicated:~\"liquid\" | limit {limit}"
+            "query={time_filter}rpc_call:=\"getBalance\"{pool_filter} | limit {limit}"
         ),
         RequestType::GetTokenAccountBalance => format!(
-            "query={time_filter}rpc_call:=\"getTokenAccountBalance\" AND pool_dedicated:~\"liquid\" | limit {limit}"
+            "query={time_filter}rpc_call:=\"getTokenAccountBalance\"{pool_filter} | limit {limit}"
         ),
         RequestType::GetTokenSupply => format!(
             "query={time_filter}rpc_call:=\"getTokenSupply\" AND pool_dedicated:~\"liquid\" | limit {limit}"
         ),
         RequestType::SimulateTransaction => format!(
-            "query={time_filter}rpc_call:=\"simulateTransaction\" AND pool_dedicated:~\"foundation\" AND body:* | limit {limit}"
+            "query={time_filter}rpc_call:=\"simulateTransaction\"{simulate_pool_filter} AND body:* | limit {limit}"
         ),
         RequestType::GetSupply => format!(
             "query={time_filter}rpc_call:=\"getSupply\" AND body:* | limit {limit}"
@@ -85,6 +100,7 @@ pub async fn get_requests(
     minutes: Option<u32>,
     window_seconds: Option<u32>,
     limit: u32,
+    pool_dedicated: Option<&str>,
 ) -> Result<Vec<LoggedRequest>, anyhow::Error> {
     let min_filter = if let Some(min_request_size) = min_request_size {
         format!(" AND bytes:>{}", min_request_size)
@@ -106,6 +122,7 @@ pub async fn get_requests(
         minutes,
         window_seconds,
         limit,
+        pool_dedicated,
     );
 
     let response = client
@@ -136,6 +153,10 @@ pub async fn get_requests(
             }
 
             let req_id = log["req_id"].as_str().map(String::from);
+            // VictoriaLogs may emit `bytes` as a JSON number or a string.
+            let bytes = log["bytes"]
+                .as_u64()
+                .or_else(|| log["bytes"].as_str().and_then(|s| s.parse::<u64>().ok()));
             let mut body: JsonValue = serde_json::from_str(log["body"].as_str().unwrap()).ok()?;
 
             if request_type == RequestType::GpaTokenMint
@@ -184,7 +205,11 @@ pub async fn get_requests(
                 }
             }
 
-            Some(LoggedRequest { req_id, body })
+            Some(LoggedRequest {
+                req_id,
+                body,
+                bytes,
+            })
         })
         .collect();
 
