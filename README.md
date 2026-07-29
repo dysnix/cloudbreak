@@ -322,9 +322,10 @@ If you want to run a tracker outside Compose, point `endpoint` at it.
 
 When this section is present, the indexer downloads and processes snapshots on startup for fast bootstrapping.
 
-| Key                        | Type    | Default | Description                                                     |
-| -------------------------- | ------- | ------- | --------------------------------------------------------------- |
-| `accounts-file-concurency` | `usize` | (none)  | Max number of `AccountsFile` entries to process simultaneously. |
+| Key                             | Type    | Default | Description                                                                                                                                                                                                             |
+| ------------------------------- | ------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `accounts-file-concurency`      | `usize` | (none)  | Max number of `AccountsFile` entries to process simultaneously.                                                                                                                                                       |
+| `gap-fill-max-snapshot-retries` | `u32`   | `10`    | Max consecutive gap-filling iterations (~30 s each) allowed to fail fetching a covering snapshot pair from the tracker before the self-healing task gives up and fails the indexer. Resets on the first successful fetch. |
 
 #### `[snapshot.tracker_endpoint]` (optional)
 
@@ -589,7 +590,7 @@ The indexer includes a self-healing mechanism that automatically detects and rep
 
 2. **Pause + mark unhealthy:** The instant a gap is confirmed, finalization is **paused** and the service is flagged **unhealthy** via the `service_health` table. Live finalized notifications keep buffering (bounded by `finalize-slot-buffer-size`, then back-pressuring the stream) but are not applied until the gap is repaired, preserving in-order finalization.
 
-3. **Gap filling via incremental snapshots:** Every 30 s a background task processes confirmed gaps by asking the cluster tracker for an incremental snapshot pair covering the newest missing slot, downloading it (into a timestamped directory), and processing **only the gap slots**. Repaired accounts are written to the database and enqueued for finalization directly (snapshot data is already finalized). Gap slots that have **no accounts in the snapshot** are empty/skipped slots: they are logged (target `self_healing_empty_slots`) and dropped from the list. If the tracker has no covering pair yet, the task retries on the next tick.
+3. **Gap filling via incremental snapshots:** Every 30 s a background task processes confirmed gaps by asking the cluster tracker for an incremental snapshot pair covering the newest missing slot, downloading it (into a timestamped directory), and processing **only the gap slots**. Repaired accounts are written to the database and enqueued for finalization directly (snapshot data is already finalized). Gap slots that have **no accounts in the snapshot** are empty/skipped slots: they are logged (target `self_healing_empty_slots`) and dropped from the list. If the tracker has no covering pair yet, the task retries on the next tick, up to `gap-fill-max-snapshot-retries` (default 10) consecutive attempts — past that the indexer gives up and exits with an error rather than staying unhealthy forever. The counter resets as soon as a snapshot pair is fetched successfully.
 
 4. **Missed finalized notifications:** A reconnect can also drop finalized notifications for slots just *below* a large gap. When finalizing a live slot the finalizer walks its ancestor chain (hash-checked) to finalize any ancestors whose notification was missed; additionally the slot just before each repaired gap (`gap_start - 1`) is seeded so its ancestors are caught even though repaired slots carry no chain data to bridge the walk.
 
