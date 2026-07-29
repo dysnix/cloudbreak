@@ -7,7 +7,6 @@ use agave_feature_set::{FEATURE_NAMES, FeatureSet};
 use agave_syscalls::create_program_runtime_environment_v1;
 use base64::Engine as _;
 use rust_decimal::prelude::ToPrimitive;
-use sea_orm::EntityTrait;
 use sea_orm::sqlx::{self, Row};
 use solana_account::{AccountSharedData, ReadableAccount};
 use solana_account_decoder::{UiAccountEncoding, encode_ui_account};
@@ -54,8 +53,6 @@ use solana_transaction_status_client_types::{
 };
 use tokio::time::timeout;
 use tracing::Instrument;
-
-use cloudbreak_entity::slots;
 
 use crate::db_query;
 use crate::error::RpcError;
@@ -348,19 +345,7 @@ async fn resolve_slot(
         .transpose()?
         .unwrap_or(CommitmentLevel::Finalized);
 
-    let slot = match &state.slot_syncronizer_data {
-        Some(data) => data
-            .read()
-            .expect("Failed to read slot syncronizer data")
-            .get_slot_for_commitment(commitment),
-        None => {
-            let slot_model = slots::Entity::find_by_id(commitment as i32)
-                .one(&state.database)
-                .instrument(tracing::info_span!("simtx_slot_db"))
-                .await?;
-            slot_model.ok_or(RpcError::InternalError)?.slot as u64
-        }
-    };
+    let (slot, _) = state.latest_slot_and_block_time(commitment).await?;
 
     if let Some(min_context_slot) = config.min_context_slot
         && slot < min_context_slot

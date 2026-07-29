@@ -65,6 +65,36 @@ pub async fn update_service_health(db: &DatabaseConnection, healthy: bool) {
             metrics::increment_db_errors();
         }
     }
+
+    // Denormalise the same health state onto every `slots` row so the API can read
+    // the latest slot and the health flag in a single lookup.
+    let slots_query = slots::Entity::update_many()
+        .col_expr(slots::Column::Health, Expr::value(healthy))
+        .exec(db);
+
+    let slots_result = timeout(Duration::from_secs(30), slots_query)
+        .await
+        .unwrap_or_else(|elapsed| {
+            tracing::error!("update_service_health (slots) timeout ERROR: {}", elapsed);
+            metrics::increment_db_errors();
+            Err(sea_orm::DbErr::RecordNotUpdated)
+        });
+
+    match slots_result {
+        Ok(result) => {
+            tracing::debug!(
+                "update_service_health: updated health on {} slot rows",
+                result.rows_affected
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                "update_service_health: failed to update slots health: {}",
+                e
+            );
+            metrics::increment_db_errors();
+        }
+    }
 }
 
 const INSERT_CLOSED_ACCOUNTS_BATCH_SIZE: usize = 500;
@@ -323,6 +353,9 @@ pub async fn insert_slot(
         slot: Set(slot as i64),
         commitment: Set(commitment as i32),
         block_time: Set(block_time),
+        // Health is owned by `update_service_health`; leave it to the column default
+        // on insert and never clobber it on conflict.
+        health: NotSet,
     })
     .on_conflict(
         OnConflict::columns([slots::Column::Commitment])
