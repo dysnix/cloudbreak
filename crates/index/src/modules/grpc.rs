@@ -70,6 +70,7 @@ pub fn subscribe_grpc_with_reconnection(
         let _guard = metrics::TokioTaskCounterGuard::new("grpc");
         let mut log_first_message = true;
         let mut connect_failed_since: Option<Instant> = None;
+        let mut is_reconnect = false;
 
         loop {
             if cancel.load(Ordering::SeqCst) {
@@ -131,6 +132,15 @@ pub fn subscribe_grpc_with_reconnection(
 
             // tracing::debug!("Account include: {:?}", account_include);
 
+            let from_slot = if is_reconnect {
+                let last = *last_slot_received
+                    .lock()
+                    .expect("Failed to lock last_slot_received");
+                (last != 0).then_some(last)
+            } else {
+                None
+            };
+
             let blocks_subscribe_request: SubscribeRequest = SubscribeRequest {
                 accounts: HashMap::new(),
                 slots: HashMap::from([(
@@ -156,13 +166,36 @@ pub fn subscribe_grpc_with_reconnection(
                 commitment: Some(CommitmentLevel::Confirmed as i32),
                 accounts_data_slice: Vec::new(),
                 ping: None,
-                from_slot: None,
+                from_slot,
             };
 
-            let (_sub_tx, stream) = client
-                .subscribe_with_request(Some(blocks_subscribe_request))
+            let (_sub_tx, stream) = match client
+                .subscribe_with_request(Some(blocks_subscribe_request.clone()))
                 .await
-                .expect("Failed to subscribe to Yellowstone GRPC");
+            {
+                Ok(subscription) => {
+                    if let Some(slot) = from_slot {
+                        tracing::info!("Reconnected to Yellowstone GRPC replaying from slot {}", slot);
+                    }
+                    subscription
+                }
+                Err(e) if from_slot.is_some() => {
+                    tracing::error!(
+                        "Failed to subscribe to Yellowstone GRPC with from_slot {:?}, retrying without it: {:?}",
+                        from_slot,
+                        e
+                    );
+                    metrics::increment_grpc_errors();
+                    client
+                        .subscribe_with_request(Some(SubscribeRequest {
+                            from_slot: None,
+                            ..blocks_subscribe_request
+                        }))
+                        .await
+                        .expect("Failed to subscribe to Yellowstone GRPC")
+                }
+                Err(e) => panic!("Failed to subscribe to Yellowstone GRPC: {:?}", e),
+            };
 
             let buffer_channel_rx_len_clone = buffer_channel_rx_len.clone();
             let mut grpc_current_errors = 0;
@@ -281,6 +314,8 @@ pub fn subscribe_grpc_with_reconnection(
                     tracing::error!("GRPC subscription handle panicked: {:?}", e);
                 }
             }
+
+            is_reconnect = true;
         }
     })
 }
