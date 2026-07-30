@@ -105,9 +105,18 @@ pub async fn run(config_path: &str) -> cloudbreak_core::Result<()> {
         info!(target: "query_tracker", "index creation disabled; recording demand only");
     }
 
-    if qt.index_eviction_enabled {
+    // The eviction task also hosts the latency regression guard, so it runs when
+    // either idle eviction or the guard is enabled.
+    if qt.index_eviction_enabled
+        || qt.index_regression_guard != cloudbreak_core::IndexRegressionGuard::Off
+    {
         let (store, cfg) = (store.clone(), qt.clone());
         tokio::spawn(async move { modules::eviction::run(store, cfg).await });
+    }
+
+    if qt.priority_mode.uses_windowed_rate() {
+        let (store, cfg) = (store.clone(), qt.clone());
+        tokio::spawn(async move { modules::score_roll::run(store, cfg).await });
     }
 
     if qt.explain_enabled {

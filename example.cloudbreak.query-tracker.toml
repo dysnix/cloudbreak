@@ -15,15 +15,28 @@ index-generation-threshold = 10
 index-creation-delay = "10s"
 
 # --- prioritization ---
-# How creation candidates are ranked: "frequency" (default), "cost",
-# "cost-per-hit" (heaviest single queries first), or "weighted".
+# Creation and eviction rank by the SAME criterion (creation builds the highest,
+# eviction drops the lowest). Three modes are bare strings and rank on lifetime
+# totals:
+#   "frequency"    (default) most-demanded first
+#   "cost"         heaviest accumulated DB cost first
+#   "cost-per-hit" heaviest average cost per request first
+# The "weighted" mode is a table with its own weights and measurement window
+# (they only apply here) and ranks on RECENT windowed activity, not lifetime
+# totals:
+#   priority-mode = { weighted = { demand-weight = 1.0, supply-weight = 0.0, failure-weight = 0.0, latency-weight = 0.0, rate-window = "1h" } }
+# Score = (avg_cost * gain) * (1 + demand-weight*demand + supply-weight*(supply/2)
+#                                + failure-weight*failed), each count being the
+# value seen in the last rate-window. supply is halved because a served GPA scans
+# both tables of the pair (~2 idx_scan per request). "gain" scales avg_cost by the
+# measured latency win from the index: gain = 1 + latency-weight*ln(without/with),
+# neutral (=1) until the pattern has served requests both with and without the
+# index. All weights default 0.0, which degenerates to plain average cost-per-hit
+# (and needs no rate roll).
 priority-mode = "frequency"
 # Only index patterns whose average cost-per-hit reaches this many microseconds
 # (omit to disable the gate).
 # cost-eligibility-threshold-us = 50000
-# Weights used only by priority-mode = "weighted".
-cost-weight = 0.0
-failure-weight = 0.0
 
 # --- program scoping ---
 included-programs = []
@@ -47,6 +60,27 @@ index-min-idle = "24h"
 eviction-fill-threshold = 0.9
 drop-lock-timeout = "5s"
 drop-retries = 1
+
+# --- latency regression guard (index slower than no index) ---
+# Compares per-pattern query latency WITH the index against WITHOUT it. Runs in
+# the eviction pass but ignores the fill threshold — a harmful index is removed
+# even when there is room — so enabling it also starts the eviction task.
+#   "off"   (default) ignore regressions
+#   "warn"  log + report count via query_tracker_regressed_indexes, keep the index
+#   "evict" drop the pair and mark the pattern "rejected" (not rebuilt until it
+#           is proven slower without the index than it was with it)
+index-regression-guard = "off"
+# How many times slower WITH the index than without before it counts as a
+# regression (1.2 = at least 20% slower). Also the hysteresis a rejected pattern
+# must clear before it is retried.
+index-regression-ratio = 1.2
+# How long a pattern rejected for a regression must stay rejected — gathering
+# fresh without-index samples — before it may be retried (and only then if its
+# without-index average has climbed past the with-index average recorded at
+# rejection). Guards against rebuild churn on an index we already know hurt. The
+# detection side needs no window of its own: an index is judged once it is older
+# than index-min-age-grace, the same grace idle eviction uses.
+index-regression-retry-delay = "6h"
 
 # --- discrepancy detection (demand vs. supply) ---
 discrepancy-enabled = true

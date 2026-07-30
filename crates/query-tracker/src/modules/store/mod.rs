@@ -20,8 +20,8 @@ pub mod patterns;
 pub mod prioritization;
 
 use crate::stats::variety::VarietySketch;
-use cloudbreak_core::modules::index_identity::IndexIdentity;
 use cloudbreak_core::PriorityMode;
+use cloudbreak_core::modules::index_identity::IndexIdentity;
 use patterns::{PatternRow, offsets_from_json, offsets_to_json, status};
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, DbErr, QueryResult, Statement, TransactionTrait, Value,
@@ -31,14 +31,20 @@ use std::collections::HashSet;
 /// Columns selected into a [`PatternRow`]; kept in one place so every read
 /// stays in sync with [`row_to_pattern`].
 const PATTERN_COLUMNS: &str = "pattern_id, program, human_name, offsets_lengths, datasize, \
-     demand_count, demand_at_create, total_cost_us, failed_count, variety_estimate, status, \
-     last_idx_scan, index_bytes, discrepancy_state, discrepancy_ratio";
+     example_request, \
+     demand_count, demand_at_create, total_cost_us, failed_count, \
+     cost_with_index_us, cost_with_index_count, cost_without_index_us, cost_without_index_count, \
+     variety_estimate, status, last_idx_scan, index_bytes, discrepancy_state, discrepancy_ratio";
 
-/// Aggregate counts for metrics.
+/// Aggregate counts for metrics. `created`/`candidate`/`evicted`/`rejected`
+/// partition the table by lifecycle status (their sum is the total);
+/// `discrepant` is a sub-count of `created` and orthogonal to status.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StoreCounts {
-    pub total: i64,
     pub created: i64,
+    pub candidate: i64,
+    pub evicted: i64,
+    pub rejected: i64,
     pub discrepant: i64,
 }
 
@@ -73,22 +79,39 @@ impl Store {
         cost_us: u64,
         failed: u32,
         fingerprints: &HashSet<u64>,
+        example_request: Option<serde_json::Value>,
     ) -> Result<(), DbErr> {
         let backend = self.db.get_database_backend();
         let pattern_id = identity.pattern_id();
 
         let txn = self.db.begin().await?;
 
+        // New rows are always `candidate` (no index yet), so their first cost
+        // goes to the without-index bucket. On update we route by the row's
+        // current status: `created` → with-index bucket, anything else →
+        // without-index bucket. ($6 = count, $7 = cost are reused for the
+        // without-index columns on insert.) `example_request` ($9) is set once on
+        // first insert and then kept (COALESCE), giving a stable EXPLAIN probe.
         let insert = Statement::from_sql_and_values(
             backend,
             "INSERT INTO index_patterns \
-               (pattern_id, program, human_name, offsets_lengths, datasize, \
-                demand_count, total_cost_us, failed_count, last_demand_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now()) \
+               (pattern_id, program, human_name, offsets_lengths, datasize, example_request, \
+                demand_count, total_cost_us, failed_count, \
+                cost_without_index_us, cost_without_index_count, last_demand_at) \
+             VALUES ($1, $2, $3, $4, $5, $9, $6, $7, $8, $7, $6, now()) \
              ON CONFLICT (pattern_id) DO UPDATE SET \
                demand_count = index_patterns.demand_count + EXCLUDED.demand_count, \
                total_cost_us = index_patterns.total_cost_us + EXCLUDED.total_cost_us, \
                failed_count = index_patterns.failed_count + EXCLUDED.failed_count, \
+               cost_with_index_us = index_patterns.cost_with_index_us \
+                 + CASE WHEN index_patterns.status = 'created' THEN EXCLUDED.total_cost_us ELSE 0 END, \
+               cost_with_index_count = index_patterns.cost_with_index_count \
+                 + CASE WHEN index_patterns.status = 'created' THEN EXCLUDED.demand_count ELSE 0 END, \
+               cost_without_index_us = index_patterns.cost_without_index_us \
+                 + CASE WHEN index_patterns.status = 'created' THEN 0 ELSE EXCLUDED.total_cost_us END, \
+               cost_without_index_count = index_patterns.cost_without_index_count \
+                 + CASE WHEN index_patterns.status = 'created' THEN 0 ELSE EXCLUDED.demand_count END, \
+               example_request = COALESCE(index_patterns.example_request, EXCLUDED.example_request), \
                last_demand_at = now(), \
                status = CASE WHEN index_patterns.status = 'evicted' \
                              THEN 'candidate' ELSE index_patterns.status END \
@@ -104,6 +127,7 @@ impl Store {
                 (count as i64).into(),
                 (cost_us as i64).into(),
                 (failed as i64).into(),
+                Value::Json(example_request.map(Box::new)),
             ],
         );
 
@@ -138,30 +162,46 @@ impl Store {
     pub async fn top_candidates(
         &self,
         mode: PriorityMode,
-        cost_weight: f64,
-        failure_weight: f64,
         threshold: u32,
         cost_eligibility_us: Option<u64>,
         limit: u64,
     ) -> Result<Vec<PatternRow>, DbErr> {
-        let order_by = prioritization::order_by_clause(mode, cost_weight, failure_weight);
+        Ok(self
+            .top_candidates_scored(mode, threshold, cost_eligibility_us, limit)
+            .await?
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect())
+    }
+
+    /// Like [`Store::top_candidates`] but also returns each pattern's numeric
+    /// score — the exact SQL ranking value — so the debug endpoint can show
+    /// operators the number driving the order without re-deriving it in Rust.
+    pub async fn top_candidates_scored(
+        &self,
+        mode: PriorityMode,
+        threshold: u32,
+        cost_eligibility_us: Option<u64>,
+        limit: u64,
+    ) -> Result<Vec<(PatternRow, f64)>, DbErr> {
+        let score = prioritization::score_expr(mode);
         let cost_gate = match cost_eligibility_us {
-            Some(us) => format!(
-                " AND (total_cost_us::float8 / GREATEST(demand_count, 1)) >= {us}"
-            ),
+            Some(us) => format!(" AND (total_cost_us::float8 / GREATEST(demand_count, 1)) >= {us}"),
             None => String::new(),
         };
         let sql = format!(
-            "SELECT {PATTERN_COLUMNS} FROM index_patterns \
+            "SELECT {PATTERN_COLUMNS}, ({score})::float8 AS score FROM index_patterns \
              WHERE status = '{candidate}' AND demand_count >= {threshold}{cost_gate} \
-             ORDER BY {order_by} LIMIT {limit}",
+             ORDER BY score DESC LIMIT {limit}",
             candidate = status::CANDIDATE,
         );
         let rows = self
             .db
             .query_all(Statement::from_string(self.db.get_database_backend(), sql))
             .await?;
-        rows.iter().map(row_to_pattern).collect()
+        rows.iter()
+            .map(|r| Ok((row_to_pattern(r)?, r.try_get::<f64>("", "score")?)))
+            .collect()
     }
 
     /// Mark a pattern as created and (re)anchor its supply clock to now.
@@ -232,21 +272,57 @@ impl Store {
             .map(|_| ())
     }
 
+    /// Roll the windowed score counters: store the count observed since the last
+    /// roll (`current - prev`, clamped ≥ 0 to absorb Postgres stat resets) in the
+    /// `*_rate` columns, then snapshot the current totals into `*_prev`. Run once
+    /// per `score-rate-window`; only [`PriorityMode::Weighted`] reads the result.
+    /// Returns the number of rows rolled.
+    pub async fn roll_scores(&self) -> Result<u64, DbErr> {
+        let res = self
+            .db
+            .execute(Statement::from_string(
+                self.db.get_database_backend(),
+                "UPDATE index_patterns SET \
+                   demand_rate = GREATEST(demand_count - demand_prev, 0), \
+                   failed_rate = GREATEST(failed_count - failed_prev, 0), \
+                   supply_rate = GREATEST(last_idx_scan - idx_scan_prev, 0), \
+                   demand_prev = demand_count, \
+                   failed_prev = failed_count, \
+                   idx_scan_prev = last_idx_scan"
+                    .to_string(),
+            ))
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Created patterns idle by **both** supply and demand for longer than
     /// `min_idle_secs`, and older than `min_age_secs`. Requiring *both* signals
     /// to be quiet is what avoids the drop→slow→rebuild churn loop: a pattern
     /// Postgres is ignoring but the API is still demanding is not idle.
+    ///
+    /// Rows come back in **drop-priority order — least useful first** — each
+    /// paired with its numeric score: the same [`prioritization::score_expr`]
+    /// the creation loop ranks by, but ascending, so eviction drops exactly what
+    /// creation would build last. The caller drops from the top until the table
+    /// is back under its fill target. Ordering lives here, next to the
+    /// eligibility filter, so the whole "what may be dropped, and in what order"
+    /// decision is one SQL statement. `pattern_id` breaks ties deterministically
+    /// (idle rows share the same low score). The score is returned so the caller
+    /// can weigh each drop against the pending creation it would make room for.
     pub async fn eviction_candidates(
         &self,
+        mode: PriorityMode,
         min_idle_secs: i64,
         min_age_secs: i64,
-    ) -> Result<Vec<PatternRow>, DbErr> {
+    ) -> Result<Vec<(PatternRow, f64)>, DbErr> {
+        let score = prioritization::score_expr(mode);
         let sql = format!(
-            "SELECT {PATTERN_COLUMNS} FROM index_patterns \
+            "SELECT {PATTERN_COLUMNS}, ({score})::float8 AS score FROM index_patterns \
              WHERE status = '{created}' \
                AND EXTRACT(EPOCH FROM (now() - COALESCE(created_at, first_seen_at))) > $1 \
                AND EXTRACT(EPOCH FROM (now() - COALESCE(last_seen_used, created_at, first_seen_at))) > $2 \
-               AND EXTRACT(EPOCH FROM (now() - COALESCE(last_demand_at, first_seen_at))) > $2",
+               AND EXTRACT(EPOCH FROM (now() - COALESCE(last_demand_at, first_seen_at))) > $2 \
+             ORDER BY score ASC, pattern_id ASC",
             created = status::CREATED,
         );
         let rows = self
@@ -257,7 +333,9 @@ impl Store {
                 [min_age_secs.into(), min_idle_secs.into()],
             ))
             .await?;
-        rows.iter().map(row_to_pattern).collect()
+        rows.iter()
+            .map(|r| Ok((row_to_pattern(r)?, r.try_get::<f64>("", "score")?)))
+            .collect()
     }
 
     /// Mark a pattern as evicted after its index pair has been dropped.
@@ -271,6 +349,92 @@ impl Store {
             ))
             .await
             .map(|_| ())
+    }
+
+    // ---- latency regression guard -----------------------------------------
+
+    /// Created patterns that are **slower with the index than without** by more
+    /// than `ratio`. An index is only judged once it is older than
+    /// `min_age_secs` (the same lifetime grace idle eviction uses), by which
+    /// point it has had time to gather with-index latency to compare against its
+    /// frozen without-index baseline. Patterns with no with-index traffic have a
+    /// zero with-index average and so never trip the ratio. These are the
+    /// drop/warn candidates for the regression guard.
+    pub async fn regression_candidates(
+        &self,
+        min_age_secs: i64,
+        ratio: f64,
+    ) -> Result<Vec<PatternRow>, DbErr> {
+        let sql = format!(
+            "SELECT {PATTERN_COLUMNS} FROM index_patterns \
+             WHERE status = '{created}' \
+               AND cost_with_index_count > 0 \
+               AND EXTRACT(EPOCH FROM (now() - COALESCE(created_at, first_seen_at))) > {min_age_secs} \
+               AND (cost_with_index_us::float8 / GREATEST(cost_with_index_count, 1)) \
+                 > (cost_without_index_us::float8 / GREATEST(cost_without_index_count, 1)) * {ratio} \
+             ORDER BY pattern_id ASC",
+            created = status::CREATED,
+        );
+        let rows = self
+            .db
+            .query_all(Statement::from_string(self.db.get_database_backend(), sql))
+            .await?;
+        rows.iter().map(row_to_pattern).collect()
+    }
+
+    /// Mark a pattern `rejected` after its index pair was dropped for being a
+    /// latency regression. Captures the with-index average that condemned it and
+    /// snapshots the without-index bucket, so recovery
+    /// ([`Store::promote_recovered_rejections`]) is judged only on without-index
+    /// samples gathered after this point.
+    pub async fn mark_rejected(&self, pattern_id: &str) -> Result<(), DbErr> {
+        self.db
+            .execute(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                "UPDATE index_patterns SET status = 'rejected', evicted_at = now(), \
+                   rejected_with_index_avg_us = \
+                     cost_with_index_us::float8 / GREATEST(cost_with_index_count, 1), \
+                   without_index_at_reject_us = cost_without_index_us, \
+                   without_index_at_reject_count = cost_without_index_count \
+                 WHERE pattern_id = $1",
+                [pattern_id.into()],
+            ))
+            .await
+            .map(|_| ())
+    }
+
+    /// Flip `rejected` patterns back to `candidate` once fresh evidence justifies
+    /// retrying the index. A pattern must have been rejected for at least
+    /// `retry_delay_secs` — time spent accumulating without-index samples again —
+    /// and its without-index average measured **since rejection** must exceed the
+    /// with-index average recorded then (times `ratio` for hysteresis).
+    /// Returns the number promoted.
+    pub async fn promote_recovered_rejections(
+        &self,
+        retry_delay_secs: i64,
+        ratio: f64,
+    ) -> Result<u64, DbErr> {
+        let res = self
+            .db
+            .execute(Statement::from_string(
+                self.db.get_database_backend(),
+                format!(
+                    "UPDATE index_patterns SET status = 'candidate', \
+                       rejected_with_index_avg_us = NULL, \
+                       without_index_at_reject_us = NULL, \
+                       without_index_at_reject_count = NULL \
+                     WHERE status = 'rejected' \
+                       AND rejected_with_index_avg_us IS NOT NULL \
+                       AND EXTRACT(EPOCH FROM (now() - evicted_at)) > {retry_delay_secs} \
+                       AND (cost_without_index_count - COALESCE(without_index_at_reject_count, 0)) > 0 \
+                       AND ((cost_without_index_us - COALESCE(without_index_at_reject_us, 0))::float8 \
+                            / GREATEST(cost_without_index_count \
+                                       - COALESCE(without_index_at_reject_count, 0), 1)) \
+                           > rejected_with_index_avg_us * {ratio}"
+                ),
+            ))
+            .await?;
+        Ok(res.rows_affected())
     }
 
     /// Record (or clear) the discrepancy verdict for a pattern.
@@ -367,8 +531,10 @@ impl Store {
             .db
             .query_one(Statement::from_string(
                 self.db.get_database_backend(),
-                "SELECT COUNT(*)::bigint AS total, \
-                   COUNT(*) FILTER (WHERE status = 'created')::bigint AS created, \
+                "SELECT COUNT(*) FILTER (WHERE status = 'created')::bigint AS created, \
+                   COUNT(*) FILTER (WHERE status = 'candidate')::bigint AS candidate, \
+                   COUNT(*) FILTER (WHERE status = 'evicted')::bigint AS evicted, \
+                   COUNT(*) FILTER (WHERE status = 'rejected')::bigint AS rejected, \
                    COUNT(*) FILTER (WHERE status = 'created' AND discrepancy_state IS NOT NULL)::bigint AS discrepant \
                  FROM index_patterns"
                     .to_string(),
@@ -376,8 +542,10 @@ impl Store {
             .await?;
         match row {
             Some(row) => Ok(StoreCounts {
-                total: row.try_get("", "total")?,
                 created: row.try_get("", "created")?,
+                candidate: row.try_get("", "candidate")?,
+                evicted: row.try_get("", "evicted")?,
+                rejected: row.try_get("", "rejected")?,
                 discrepant: row.try_get("", "discrepant")?,
             }),
             None => Ok(StoreCounts::default()),
@@ -392,12 +560,19 @@ fn row_to_pattern(row: &QueryResult) -> Result<PatternRow, DbErr> {
         pattern_id: row.try_get("", "pattern_id")?,
         program: row.try_get("", "program")?,
         human_name: row.try_get("", "human_name")?,
-        offsets_lengths: offsets_from_json(&row.try_get::<serde_json::Value>("", "offsets_lengths")?),
+        offsets_lengths: offsets_from_json(
+            &row.try_get::<serde_json::Value>("", "offsets_lengths")?,
+        ),
         datasize: row.try_get("", "datasize")?,
+        example_request: row.try_get::<Option<serde_json::Value>>("", "example_request")?,
         demand_count: row.try_get("", "demand_count")?,
         demand_at_create: row.try_get("", "demand_at_create")?,
         total_cost_us: row.try_get("", "total_cost_us")?,
         failed_count: row.try_get("", "failed_count")?,
+        cost_with_index_us: row.try_get("", "cost_with_index_us")?,
+        cost_with_index_count: row.try_get("", "cost_with_index_count")?,
+        cost_without_index_us: row.try_get("", "cost_without_index_us")?,
+        cost_without_index_count: row.try_get("", "cost_without_index_count")?,
         variety_estimate: row.try_get("", "variety_estimate")?,
         status: row.try_get("", "status")?,
         last_idx_scan: row.try_get("", "last_idx_scan")?,

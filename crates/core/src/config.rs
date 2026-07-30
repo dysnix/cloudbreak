@@ -618,7 +618,7 @@ impl SlotSyncronizerConfig {
 /// build next. The score is computed on read from the stored demand columns, so
 /// changing this takes effect immediately without any data migration. See the
 /// query tracker's `prioritization` module for the exact `ORDER BY` mapping.
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum PriorityMode {
     /// Rank by how many requests demanded the pattern (most frequent first).
@@ -629,10 +629,109 @@ pub enum PriorityMode {
     /// Rank by average cost per request, so individually expensive but rarer
     /// patterns still rise to the top ("huge queries first").
     CostPerHit,
-    /// Rank by a weighted blend of demand, cost and failures, tuned with
-    /// [`QueryTrackerConfig::cost_weight`] and
-    /// [`QueryTrackerConfig::failure_weight`].
-    Weighted,
+    /// Rank by average cost-per-hit scaled by a weighted blend of **windowed**
+    /// activity. Unlike the other modes — which rank on lifetime totals — this
+    /// one uses the per-window counts maintained by the score roll task, so it
+    /// reflects *current* throughput and both creation and eviction rank by the
+    /// same number.
+    ///
+    /// Score: `(avg_cost * gain) * (1 + demand_weight*demand +
+    /// supply_weight*(supply/2) + failure_weight*failed)`, where `avg_cost =
+    /// total_cost_us / demand_count`, each count is the value observed in the
+    /// last window, and `gain = 1 + latency_weight * ln(latency_ratio)` scales
+    /// `avg_cost` by how much faster the pattern is *with* the index than without
+    /// (see `latency_weight`). The `ln` is what keeps that scaling well-behaved:
+    /// it grows slowly, so a wildly faster index (`latency_ratio` in the tens or
+    /// hundreds) is compressed instead of dominating the ranking, while staying
+    /// symmetric — `ln(1) = 0` is neutral and a harmful index (`ratio < 1`) gives
+    /// a negative log that drags the score down. The `+ 1` baseline keeps the
+    /// volume factor non-zero, so a zero-activity pattern just ranks by
+    /// `avg_cost * gain` (no special-casing, and no ties at zero when evicting).
+    ///
+    /// The weights (and the measurement window) only make sense here, so they
+    /// live inside the variant. In TOML this is a table while the other modes
+    /// stay bare strings:
+    /// `priority-mode = { weighted = { demand-weight = 1.0, rate-window = "1h" } }`.
+    /// All weights default `0.0`, which collapses the score to plain average
+    /// cost-per-hit (and needs no rate roll).
+    Weighted {
+        /// Weight on demand (request count in the window). Default `0.0`.
+        #[serde(rename = "demand-weight", default)]
+        demand_weight: f64,
+        /// Weight on supply (`idx_scan` in the window, halved via
+        /// `SCANS_PER_REQUEST` so it is comparable to demand). Only contributes
+        /// for created indexes — candidates have no supply yet. Default `0.0`.
+        #[serde(rename = "supply-weight", default)]
+        supply_weight: f64,
+        /// Weight on failed/timed-out requests in the window, to prioritize
+        /// patterns that currently *cannot* be served without an index.
+        /// Default `0.0`.
+        #[serde(rename = "failure-weight", default)]
+        failure_weight: f64,
+        /// Weight on the measured latency **gain** from the index — the ratio of
+        /// the without-index average cost to the with-index average. Applied to
+        /// `avg_cost` as `gain = 1 + latency_weight * ln(latency_ratio)`, so a
+        /// clearly helpful index (ratio > 1) boosts the score while a harmful one
+        /// (ratio < 1) drags it down; `ln` smooths extreme ratios. Stays neutral
+        /// (`gain = 1`) until the pattern has served requests both with and
+        /// without the index (so a ratio can be formed), or when the weight is
+        /// `0`. Default `0.0`.
+        #[serde(rename = "latency-weight", default)]
+        latency_weight: f64,
+        /// Window over which the demand/supply/failure counts are measured. A
+        /// background task snapshots the counters at this cadence and stores the
+        /// per-window deltas the score reads. Default `1h`.
+        #[serde(
+            rename = "rate-window",
+            default = "PriorityMode::default_rate_window",
+            deserialize_with = "deserialize_duration_required"
+        )]
+        rate_window: Duration,
+    },
+}
+
+impl PriorityMode {
+    fn default_rate_window() -> Duration {
+        Duration::from_secs(3600)
+    }
+
+    /// The measurement window when this mode needs one (only `Weighted`).
+    pub fn rate_window(&self) -> Option<Duration> {
+        match self {
+            PriorityMode::Weighted { rate_window, .. } => Some(*rate_window),
+            _ => None,
+        }
+    }
+
+    /// Whether this mode needs the windowed score columns maintained. Only
+    /// `Weighted` with at least one non-zero weight does; an all-zero `Weighted`
+    /// collapses to plain average cost-per-hit and needs no rate roll.
+    pub fn uses_windowed_rate(&self) -> bool {
+        matches!(
+            self,
+            PriorityMode::Weighted { demand_weight, supply_weight, failure_weight, .. }
+                if *demand_weight != 0.0 || *supply_weight != 0.0 || *failure_weight != 0.0
+        )
+    }
+}
+
+/// What the tracker does when a created index measures **slower** than the same
+/// pattern was *without* it (a latency regression). An index becomes eligible
+/// for the guard once it is older than `index-min-age-grace` — the same
+/// lifetime gate idle eviction uses — by which point it has had time to gather
+/// with-index latency to compare against its frozen without-index baseline.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum IndexRegressionGuard {
+    /// Ignore latency regressions entirely (no logging, no action).
+    #[default]
+    Off,
+    /// Log a warning and increment a metric, but keep the index in place.
+    Warn,
+    /// Drop the index pair and mark the pattern `rejected`, so it is not rebuilt
+    /// until fresh without-index samples show the pattern is now *slower*
+    /// without the index than it was with it.
+    Evict,
 }
 
 /// Configuration for the query tracker service.
@@ -679,20 +778,6 @@ pub struct QueryTrackerConfig {
         default = "QueryTrackerConfig::default_cost_eligibility_threshold_us"
     )]
     pub cost_eligibility_threshold_us: Option<u64>,
-    /// Weight applied to accumulated cost in [`PriorityMode::Weighted`].
-    #[serde(
-        rename = "cost-weight",
-        default = "QueryTrackerConfig::default_cost_weight"
-    )]
-    pub cost_weight: f64,
-    /// Weight applied to failed/timed-out request count in
-    /// [`PriorityMode::Weighted`], letting operators prioritize patterns that
-    /// currently *cannot* be served without an index.
-    #[serde(
-        rename = "failure-weight",
-        default = "QueryTrackerConfig::default_failure_weight"
-    )]
-    pub failure_weight: f64,
 
     // ---- program scoping --------------------------------------------------
     /// Programs to include in index creation; empty means "all". Use either
@@ -777,6 +862,45 @@ pub struct QueryTrackerConfig {
     )]
     pub drop_retries: u32,
 
+    // ---- latency regression guard ----------------------------------------
+    /// What to do when a created index is measured *slower* than the same
+    /// pattern was without it. `off` (default) ignores it; `warn` logs and bumps
+    /// a metric; `evict` drops the pair and marks the pattern `rejected` so it is
+    /// not rebuilt until fresh evidence shows the index would help again. See
+    /// [`IndexRegressionGuard`]. The guard runs inside the eviction pass but is
+    /// independent of the fill threshold — a harmful index is dropped even when
+    /// there is room — so enabling it also starts the eviction task.
+    #[serde(rename = "index-regression-guard", default)]
+    pub index_regression_guard: IndexRegressionGuard,
+    /// How many times slower *with* the index than without before it counts as a
+    /// regression (e.g. `1.2` = the with-index average must exceed the
+    /// without-index average by 20%). Also the hysteresis a `rejected` pattern
+    /// must clear — its recent without-index average must exceed the with-index
+    /// average recorded at rejection by this factor — before it is retried.
+    /// Default: 1.2.
+    #[serde(
+        rename = "index-regression-ratio",
+        default = "QueryTrackerConfig::default_index_regression_ratio"
+    )]
+    pub index_regression_ratio: f64,
+    /// How long a pattern that was `rejected` for a latency regression must stay
+    /// rejected — accumulating fresh without-index samples — before it may be
+    /// retried. When this has elapsed *and* its without-index average since
+    /// rejection has climbed past `index-regression-ratio ×` the with-index
+    /// average recorded at rejection, it returns to `candidate`. Guards against
+    /// rebuild churn on an index we already know hurt. Default: 6h.
+    ///
+    /// (The regression *detection* side has no separate window: an index becomes
+    /// eligible for the guard once it is older than `index-min-age-grace`, the
+    /// same lifetime gate idle eviction uses — long enough to have gathered
+    /// with-index latency to compare against its frozen without-index baseline.)
+    #[serde(
+        rename = "index-regression-retry-delay",
+        default = "QueryTrackerConfig::default_index_regression_retry_delay",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub index_regression_retry_delay: Duration,
+
     // ---- discrepancy detection -------------------------------------------
     /// Emit a metric/log when demand (API) and supply (`idx_scan`) diverge,
     /// surfacing indexes Postgres is ignoring despite live demand.
@@ -841,6 +965,14 @@ impl QueryTrackerConfig {
         1
     }
 
+    const fn default_index_regression_ratio() -> f64 {
+        1.2
+    }
+
+    fn default_index_regression_retry_delay() -> Duration {
+        Duration::from_secs(6 * 3600)
+    }
+
     const fn default_discrepancy_enabled() -> bool {
         true
     }
@@ -859,14 +991,6 @@ impl QueryTrackerConfig {
 
     const fn default_cost_eligibility_threshold_us() -> Option<u64> {
         None
-    }
-
-    const fn default_cost_weight() -> f64 {
-        0.0
-    }
-
-    const fn default_failure_weight() -> f64 {
-        0.0
     }
 
     const fn default_create_database_indexes() -> bool {
@@ -907,8 +1031,6 @@ impl Default for QueryTrackerConfig {
             index_creation_delay: Self::default_index_creation_delay(),
             priority_mode: PriorityMode::default(),
             cost_eligibility_threshold_us: Self::default_cost_eligibility_threshold_us(),
-            cost_weight: Self::default_cost_weight(),
-            failure_weight: Self::default_failure_weight(),
             included_programs: Vec::new(),
             excluded_programs: Vec::new(),
             indexer_metrics: String::default(),
@@ -921,6 +1043,9 @@ impl Default for QueryTrackerConfig {
             eviction_fill_threshold: Self::default_eviction_fill_threshold(),
             drop_lock_timeout: Self::default_drop_lock_timeout(),
             drop_retries: Self::default_drop_retries(),
+            index_regression_guard: IndexRegressionGuard::default(),
+            index_regression_ratio: Self::default_index_regression_ratio(),
+            index_regression_retry_delay: Self::default_index_regression_retry_delay(),
             discrepancy_enabled: Self::default_discrepancy_enabled(),
             discrepancy_delta: Self::default_discrepancy_delta(),
             explain_enabled: Self::default_explain_enabled(),

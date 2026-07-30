@@ -7,11 +7,12 @@
 //!
 //! ```text
 //! store                 the only SQL: index_patterns CRUD, candidates, supply,
-//!                       discrepancy; plus prioritization (`PriorityMode` -> `ORDER BY`)
+//!                       discrepancy; plus prioritization (`PriorityMode` -> score)
 //! ingest                demand in: a batch of observations -> store (handles the requests from `/track` endpoint)
 //! indexer_backpressure  gate DDL(`CREATE`/`DROP INDEX`) on the [`crate indexer`]'s load
 //! creation              demand -> `CREATE INDEX` pair -> mark created
 //! eviction              refresh supply, flag discrepancies, `DROP INDEX` idle pairs past fill %
+//! score_roll            (Weighted mode only) roll per-window activity counters
 //! ```
 //!
 //! The observability/statistics side (variety, discrepancy verdict, EXPLAIN
@@ -26,6 +27,7 @@ pub mod creation;
 pub mod eviction;
 pub mod indexer_backpressure;
 pub mod ingest;
+pub mod score_roll;
 pub mod store;
 
 /// The two tables an auto-index is always created on (and dropped from)

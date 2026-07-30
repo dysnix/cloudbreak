@@ -33,6 +33,7 @@ use tracing::error;
 /// JSON view of a created pattern's demand vs. supply, shared by the
 /// `debug_created` and `debug_discrepancies` endpoints.
 fn created_view(r: &PatternRow) -> serde_json::Value {
+    let avg = |sum: i64, count: i64| (count > 0).then(|| sum as f64 / count as f64);
     jval!({
         "pattern_id": r.pattern_id,
         "index": r.human_name,
@@ -41,8 +42,11 @@ fn created_view(r: &PatternRow) -> serde_json::Value {
         "idx_scan": r.last_idx_scan,
         "index_bytes": r.index_bytes,
         "variety_estimate": r.variety_estimate,
+        "avg_cost_with_index_us": avg(r.cost_with_index_us, r.cost_with_index_count),
+        "avg_cost_without_index_us": avg(r.cost_without_index_us, r.cost_without_index_count),
         "discrepancy_state": r.discrepancy_state,
         "discrepancy_ratio": r.discrepancy_ratio,
+        "example_request": r.example_request,
     })
 }
 

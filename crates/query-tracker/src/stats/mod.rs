@@ -15,8 +15,8 @@
 //!   values one index serves. **Effect:** the estimate is stored
 //!   (`index_patterns.variety_estimate`), exported as the `query_tracker_index_variety`
 //!   gauge, shown in the debug endpoints, and logged when an index is created.
-//!   It does **not** feed prioritization or eviction — `order_by_clause`/`score`
-//!   ignore it — so today it is purely informational.
+//!   It does **not** feed prioritization or eviction — `score_expr` ignores it —
+//!   so today it is purely informational.
 //!
 //! - `discrepancy` — the demand-vs-supply verdict (`Ok`/`Starved`/`OverScanned`),
 //!   evaluated once per eviction pass. **Effect:** persisted onto the row

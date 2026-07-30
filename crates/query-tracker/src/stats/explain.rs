@@ -13,16 +13,24 @@
 //! executes) on a synthetic probe query shaped like the index's partial
 //! predicate, and checking whether the plan references the index.
 //!
+//! The probe uses the row's stored `example_request` (a real request that maps to
+//! the identity) so the memcmp constants are realistic values Postgres has
+//! statistics for, it falls back to zeros per column when no
+//! example is available. Each index pair is probed on **both** physical tables
+//! (`accounts` and `snapshot_accounts`), one log line per table.
+//!
 //! It is purely diagnostic: it only emits a log warning (corroborating
 //! `discrepancy`) when the planner would not use an index — it writes nothing to
 //! the DB, updates no metrics, and never creates or drops anything. Off unless
 //! `explain-enabled = true`.
 
+use crate::modules::INDEX_TABLES;
 use crate::modules::store::Store;
-use crate::modules::CAP_TABLE;
-use cloudbreak_core::modules::index_identity::IndexIdentity;
 use cloudbreak_core::QueryTrackerConfig;
+use cloudbreak_core::modules::index_identity::IndexIdentity;
+use cloudbreak_core::modules::rpc_filter_type::{RpcFilterType, RpcProgramAccountsConfig};
 use sea_orm::{ConnectionTrait, DbErr, Statement};
+use std::collections::HashMap;
 use tracing::{error, info, warn};
 
 #[tracing::instrument(name = "query_tracker_explain", skip_all)]
@@ -48,34 +56,44 @@ async fn run_pass(store: &Store) -> Result<(), DbErr> {
                 continue;
             }
         };
-        let index_name = identity.pg_index_name(CAP_TABLE);
-        match planner_would_use(store, &identity, &index_name).await {
-            Ok(true) => {}
-            Ok(false) => warn!(
-                target: "query_tracker_explain",
-                "planner would NOT use '{}' for its own probe query — likely stale stats or \
-                 predicate mismatch (starved)", row.human_name
-            ),
-            Err(e) => error!(
-                target: "query_tracker_explain",
-                "EXPLAIN probe failed for '{}': {e:?}", row.human_name
-            ),
+        // Real memcmp values from the stored example (empty ⇒ fall back to zeros).
+        let example = example_memcmps(row.example_request.as_ref());
+        // The index pair spans both tables; probe each and report per table.
+        for table in INDEX_TABLES {
+            let index_name = identity.pg_index_name(table);
+            match planner_would_use(store, &identity, &index_name, table, &example).await {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    target: "query_tracker_explain",
+                    "planner would NOT use '{}' on {table} for its own probe query — likely stale \
+                     stats or predicate mismatch (starved)", row.human_name
+                ),
+                Err(e) => error!(
+                    target: "query_tracker_explain",
+                    "EXPLAIN probe failed for '{}' on {table}: {e:?}", row.human_name
+                ),
+            }
         }
     }
     Ok(())
 }
 
-/// Run `EXPLAIN` on a synthetic query matching the index's partial predicate and
-/// return whether the resulting plan references `index_name`.
+/// Run `EXPLAIN` on a synthetic query matching the index's partial predicate on
+/// `table` and return whether the resulting plan references `index_name`.
 async fn planner_would_use(
     store: &Store,
     identity: &IndexIdentity,
     index_name: &str,
+    table: &str,
+    example: &HashMap<u64, Vec<u8>>,
 ) -> Result<bool, DbErr> {
-    let sql = format!("EXPLAIN {}", probe_query(identity));
+    let sql = format!("EXPLAIN {}", probe_query(identity, table, example));
     let rows = store
         .db()
-        .query_all(Statement::from_string(store.db().get_database_backend(), sql))
+        .query_all(Statement::from_string(
+            store.db().get_database_backend(),
+            sql,
+        ))
         .await?;
 
     let mut plan = String::new();
@@ -88,10 +106,12 @@ async fn planner_would_use(
     Ok(plan.contains(index_name))
 }
 
-/// A representative query for `identity`: filters on `owner` (+ optional
-/// datasize) and equality on each memcmp column, using zero-filled synthetic
-/// constants of the right length. Shaped to match the partial index predicate.
-fn probe_query(identity: &IndexIdentity) -> String {
+/// A representative query for `identity` on `table`: filters on `owner` (+
+/// optional datasize) and equality on each memcmp column. Uses the real value
+/// from `example` when one is present for that offset (and its length matches),
+/// otherwise a zero-filled constant of the right length. Shaped to match the
+/// partial index predicate.
+fn probe_query(identity: &IndexIdentity, table: &str, example: &HashMap<u64, Vec<u8>>) -> String {
     let mut clauses = vec![format!(
         "owner = '\\x{}'::bytea",
         hex::encode(identity.program.to_bytes())
@@ -100,14 +120,38 @@ fn probe_query(identity: &IndexIdentity) -> String {
         clauses.push(format!("length(data) = {size}"));
     }
     for (offset, length) in &identity.filter.offsets_lengths {
-        let zeros = "00".repeat(*length as usize);
+        let value_hex = match example.get(offset) {
+            Some(bytes) if bytes.len() == *length as usize => hex::encode(bytes),
+            _ => "00".repeat(*length as usize),
+        };
         clauses.push(format!(
-            "substring(data, {}, {length}) = '\\x{zeros}'::bytea",
+            "substring(data, {}, {length}) = '\\x{value_hex}'::bytea",
             offset + 1
         ));
     }
-    format!(
-        "SELECT 1 FROM {CAP_TABLE} WHERE {}",
-        clauses.join(" AND ")
-    )
+    format!("SELECT 1 FROM {table} WHERE {}", clauses.join(" AND "))
+}
+
+/// Extract `offset → value` for each memcmp filter in the stored example
+/// request, so [`probe_query`] can use real constants. Best-effort: an absent or
+/// unparseable example yields an empty map (probe falls back to zeros).
+fn example_memcmps(example: Option<&serde_json::Value>) -> HashMap<u64, Vec<u8>> {
+    let mut map = HashMap::new();
+    let Some(value) = example else {
+        return map;
+    };
+    let Ok(config) = serde_json::from_value::<RpcProgramAccountsConfig>(value.clone()) else {
+        return map;
+    };
+    let Some(filters) = config.filters else {
+        return map;
+    };
+    for filter in filters {
+        if let RpcFilterType::Memcmp(memcmp) = filter
+            && let Some(bytes) = memcmp.bytes()
+        {
+            map.insert(memcmp.offset() as u64, bytes.to_vec());
+        }
+    }
+    map
 }

@@ -11,7 +11,6 @@
 //! an index will (or will not) be built without querying Postgres by hand.
 
 use super::db_error;
-use crate::modules::store::prioritization;
 use crate::server::{AppState, json};
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -26,10 +25,8 @@ pub async fn handle(state: &Arc<AppState>) -> Response<Full<Bytes>> {
     let cfg = &state.config;
     let rows = match state
         .store
-        .top_candidates(
+        .top_candidates_scored(
             cfg.priority_mode,
-            cfg.cost_weight,
-            cfg.failure_weight,
             cfg.index_generation_threshold,
             cfg.cost_eligibility_threshold_us,
             DEBUG_CANDIDATE_LIMIT,
@@ -42,18 +39,16 @@ pub async fn handle(state: &Arc<AppState>) -> Response<Full<Bytes>> {
 
     let items: Vec<_> = rows
         .iter()
-        .map(|r| {
+        .map(|(r, score)| {
             jval!({
                 "pattern_id": r.pattern_id,
                 "index": r.human_name,
-                "score": prioritization::score(
-                    cfg.priority_mode, cfg.cost_weight, cfg.failure_weight,
-                    r.demand_count, r.total_cost_us, r.failed_count,
-                ),
+                "score": score,
                 "demand_count": r.demand_count,
                 "total_cost_us": r.total_cost_us,
                 "failed_count": r.failed_count,
                 "variety_estimate": r.variety_estimate,
+                "example_request": r.example_request,
             })
         })
         .collect();

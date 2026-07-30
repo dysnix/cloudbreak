@@ -22,7 +22,7 @@ use crate::modules::indexer_backpressure;
 use crate::modules::store::{Store, patterns::PatternRow};
 use crate::modules::{CAP_TABLE, INDEX_TABLES};
 use crate::stats::metrics;
-use cloudbreak_core::QueryTrackerConfig;
+use cloudbreak_core::{IndexRegressionGuard, QueryTrackerConfig};
 use cloudbreak_core::modules::index_identity::IndexIdentity;
 use sea_orm::{ConnectionTrait, Statement};
 use solana_pubkey::Pubkey;
@@ -52,6 +52,28 @@ pub async fn run(store: Store, config: QueryTrackerConfig) {
 
     loop {
         tokio::time::sleep(config.index_creation_delay).await;
+
+        // Recover `rejected` patterns (dropped by the latency guard) that have
+        // since proven slower without the index — they become candidates again.
+        if config.index_regression_guard != IndexRegressionGuard::Off {
+            match store
+                .promote_recovered_rejections(
+                    config.index_regression_retry_delay.as_secs() as i64,
+                    config.index_regression_ratio,
+                )
+                .await
+            {
+                Ok(n) if n > 0 => info!(
+                    target: "query_tracker_creation",
+                    "recovered {n} rejected pattern(s) to candidate (now slower without the index)"
+                ),
+                Ok(_) => {}
+                Err(e) => error!(
+                    target: "query_tracker_creation",
+                    "failed to recover rejected patterns: {e:?}"
+                ),
+            }
+        }
 
         if indexer_backpressure::is_under_pressure(
             &config.indexer_metrics,
@@ -85,8 +107,6 @@ pub async fn run(store: Store, config: QueryTrackerConfig) {
         let candidates = match store
             .top_candidates(
                 config.priority_mode,
-                config.cost_weight,
-                config.failure_weight,
                 config.index_generation_threshold,
                 config.cost_eligibility_threshold_us,
                 CANDIDATE_FETCH_LIMIT,

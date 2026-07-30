@@ -3,11 +3,11 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-pub use sea_orm_migration::prelude::*;
-use std::sync::OnceLock;
 pub use cloudbreak_core::{
     MigrationConfig, MigrationPgIndexesConfig, PgOwnerPartitionsConfig, TryLoadConfig,
 };
+pub use sea_orm_migration::prelude::*;
+use std::sync::OnceLock;
 
 mod m20220101_000001_create_slots_table;
 pub(crate) mod m20250414_201255_create_accounts_table;
@@ -18,7 +18,6 @@ mod m20260325_000000_drop_temp_tables;
 mod m20260414_000000_create_indexer_filters_table;
 mod m20260522_000000_create_environment_info_table;
 mod m20260528_000000_create_epoch_stakes_table;
-mod m20260618_000000_create_auto_index_usage_table;
 mod m20260711_000000_create_index_patterns_table;
 
 pub struct Migrator;
@@ -38,7 +37,6 @@ impl MigratorTrait for Migrator {
             Box::new(m20260414_000000_create_indexer_filters_table::Migration),
             Box::new(m20260522_000000_create_environment_info_table::Migration),
             Box::new(m20260528_000000_create_epoch_stakes_table::Migration),
-            Box::new(m20260618_000000_create_auto_index_usage_table::Migration),
             Box::new(m20260711_000000_create_index_patterns_table::Migration),
         ]
     }
@@ -154,10 +152,7 @@ fn columns_sql() -> &'static str {
             token_owner BYTEA GENERATED ALWAYS AS (SUBSTRING(data FROM 33 FOR 32)) STORED"#
 }
 
-fn list_partition_block(
-    table_name: &str,
-    programs: &[cloudbreak_core::PubkeyDef],
-) -> String {
+fn list_partition_block(table_name: &str, programs: &[cloudbreak_core::PubkeyDef]) -> String {
     programs
         .iter()
         .map(|program| {

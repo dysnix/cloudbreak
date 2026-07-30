@@ -20,25 +20,73 @@ pub mod status {
     pub const CREATED: &str = "created";
     /// Previously created, dropped by eviction (demand may resurrect it).
     pub const EVICTED: &str = "evicted";
+    /// Dropped by the latency regression guard because the index made the
+    /// pattern slower. Sticky: demand alone does not resurrect it — only fresh
+    /// without-index evidence that the index would now help (see
+    /// `Store::promote_recovered_rejections`).
+    pub const REJECTED: &str = "rejected";
 }
 
 /// In-memory view of an `index_patterns` row (only the columns consumers need).
+///
+/// Each field maps 1:1 to a column defined in the `index_patterns` migration
+/// (`crates/migration/src/m20260711_000000_create_index_patterns_table.rs`);
+/// see that file for the full schema, including columns the tracker persists but
+/// does not read back into this struct.
 #[derive(Debug, Clone)]
 pub struct PatternRow {
+    /// Primary key: deterministic hash of the [`IndexIdentity`] this row
+    /// represents (`program` + `offsets_lengths` + `datasize`).
     pub pattern_id: String,
+    /// Raw 32-byte program (owner) pubkey the index filters on.
     pub program: Vec<u8>,
+    /// Human-readable index label used in logs, metrics and debug endpoints.
     pub human_name: String,
+    /// `memcmp` filters as `(offset, length)` pairs; the index columns.
     pub offsets_lengths: Vec<(u64, u64)>,
+    /// Optional `dataSize` filter (account data length), if part of the identity.
     pub datasize: Option<i64>,
+    /// One representative request (`RpcProgramAccountsConfig` JSON) that maps to
+    /// this identity, captured on first sight and kept. Its real memcmp values
+    /// let the `EXPLAIN` probe use a realistic constant instead of zeros, and it
+    /// doubles as a human-readable example on the debug endpoints. `None` for
+    /// legacy rows or requests that carried no config.
+    pub example_request: Option<serde_json::Value>,
+    /// Demand signal: cumulative API request count observed for this pattern.
     pub demand_count: i64,
+    /// Snapshot of `demand_count` taken when the index was created; the baseline
+    /// for measuring demand accrued *since* creation (comparable to `idx_scan`).
     pub demand_at_create: i64,
+    /// Demand signal: cumulative query cost in microseconds (drives cost-aware
+    /// prioritization).
     pub total_cost_us: i64,
+    /// Demand signal: cumulative count of failed/timed-out queries for this
+    /// pattern.
     pub failed_count: i64,
+    /// Latency signal: cost (µs) accrued while the index existed, and the number
+    /// of requests it covers. `cost_with_index_us / cost_with_index_count` is the
+    /// average served-with-index latency.
+    pub cost_with_index_us: i64,
+    /// Requests counted into [`Self::cost_with_index_us`].
+    pub cost_with_index_count: i64,
+    /// Latency signal: cost (µs) accrued while no index existed, and the number
+    /// of requests it covers. `cost_without_index_us / cost_without_index_count`
+    /// is the average served-without-index latency (the baseline to beat).
+    pub cost_without_index_us: i64,
+    /// Requests counted into [`Self::cost_without_index_us`].
+    pub cost_without_index_count: i64,
+    /// HyperLogLog estimate of distinct filter *values* served (query variety).
     pub variety_estimate: i64,
+    /// Lifecycle status: one of [`status::CANDIDATE`], [`status::CREATED`],
+    /// [`status::EVICTED`], [`status::REJECTED`].
     pub status: String,
+    /// Supply signal: last observed Postgres `idx_scan` for the physical index.
     pub last_idx_scan: i64,
+    /// On-disk size of the physical index in bytes (supply-side sizing signal).
     pub index_bytes: i64,
+    /// Last computed discrepancy verdict between demand and supply, if any.
     pub discrepancy_state: Option<String>,
+    /// Last computed demand/supply divergence ratio backing `discrepancy_state`.
     pub discrepancy_ratio: Option<f64>,
 }
 

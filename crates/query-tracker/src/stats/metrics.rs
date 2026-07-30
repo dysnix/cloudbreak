@@ -22,16 +22,15 @@ lazy_static::lazy_static! {
         "Current number of indexes on the snapshot_accounts table",
     );
 
-    /// Total distinct patterns known (any status).
-    pub static ref PATTERNS_TOTAL: IntGauge = register_gauge(
-        "query_tracker_patterns_total",
-        "Number of distinct index patterns tracked",
-    );
-
-    /// Patterns currently in the `created` state.
-    pub static ref CREATED_INDEXES: IntGauge = register_gauge(
-        "query_tracker_created_indexes",
-        "Number of auto-index patterns currently in the created state",
+    /// Distinct index patterns by lifecycle `status` (`created` / `candidate` /
+    /// `evicted` / `rejected`). These partition the `index_patterns` table, so
+    /// the total is `sum(query_tracker_patterns)` in PromQL and is intentionally
+    /// not a separate series (a `total` label value would double-count on
+    /// aggregation).
+    pub static ref PATTERNS: IntGaugeVec = register_gauge_vec(
+        "query_tracker_patterns",
+        "Number of distinct index patterns tracked, by lifecycle status",
+        "status",
     );
 
     /// Patterns currently flagged as demand/supply discrepant.
@@ -58,6 +57,17 @@ lazy_static::lazy_static! {
         "Cumulative number of failed auto-index creation attempts",
     );
 
+    /// Created indexes **currently** measuring slower with the index than
+    /// without it (a latency regression). Refreshed by the eviction pass's
+    /// regression guard; stays 0 when the guard is off. In `warn` mode it
+    /// reflects the regressions being tolerated; in `evict` mode it stays near
+    /// zero, since drops move those patterns into the `rejected` status
+    /// (`query_tracker_patterns{status="rejected"}`).
+    pub static ref REGRESSED_INDEXES: IntGauge = register_gauge(
+        "query_tracker_regressed_indexes",
+        "Number of created indexes currently slower with the index than without it",
+    );
+
     /// Cumulative accepted track observations.
     pub static ref OBSERVATIONS_TOTAL: IntCounter = register_counter(
         "query_tracker_observations_total",
@@ -68,18 +78,21 @@ lazy_static::lazy_static! {
     pub static ref INDEX_DEMAND: IntGaugeVec = register_gauge_vec(
         "query_tracker_index_demand",
         "Cumulative API demand (request count) per created index",
+        "index",
     );
 
     /// Per-index supply (`idx_scan`), labelled by index name.
     pub static ref INDEX_IDX_SCAN: IntGaugeVec = register_gauge_vec(
         "query_tracker_index_idx_scan",
         "Postgres idx_scan (supply) per created index",
+        "index",
     );
 
     /// Per-index distinct-value variety estimate, labelled by index name.
     pub static ref INDEX_VARIETY: IntGaugeVec = register_gauge_vec(
         "query_tracker_index_variety",
         "Estimated distinct filter values served per created index",
+        "index",
     );
 }
 
@@ -99,8 +112,8 @@ fn register_counter(name: &str, help: &str) -> IntCounter {
     c
 }
 
-fn register_gauge_vec(name: &str, help: &str) -> IntGaugeVec {
-    let g = IntGaugeVec::new(Opts::new(name, help), &["index"]).expect("failed to create gaugevec");
+fn register_gauge_vec(name: &str, help: &str, label: &str) -> IntGaugeVec {
+    let g = IntGaugeVec::new(Opts::new(name, help), &[label]).expect("failed to create gaugevec");
     REGISTRY
         .register(Box::new(g.clone()))
         .expect("failed to register gaugevec");
@@ -120,12 +133,12 @@ pub fn encode() -> String {
 /// Force-initialise the lazy statics so metrics appear before the first update.
 pub fn init() {
     lazy_static::initialize(&SNAPSHOT_ACCOUNTS_INDEXES);
-    lazy_static::initialize(&PATTERNS_TOTAL);
-    lazy_static::initialize(&CREATED_INDEXES);
+    lazy_static::initialize(&PATTERNS);
     lazy_static::initialize(&DISCREPANT_INDEXES);
     lazy_static::initialize(&INDEX_CREATED_TOTAL);
     lazy_static::initialize(&INDEX_EVICTED_TOTAL);
     lazy_static::initialize(&INDEX_CREATE_FAILURES_TOTAL);
+    lazy_static::initialize(&REGRESSED_INDEXES);
     lazy_static::initialize(&OBSERVATIONS_TOTAL);
     lazy_static::initialize(&INDEX_DEMAND);
     lazy_static::initialize(&INDEX_IDX_SCAN);

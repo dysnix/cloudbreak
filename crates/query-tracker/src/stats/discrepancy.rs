@@ -6,11 +6,12 @@
 //! Discrepancy — where demand (API) and supply (Postgres) disagree.
 //!
 //! Demand is what the API asked for; supply is what the planner actually did
-//! (`idx_scan`). With hash-partitioning by `owner` and a partial index, a served
-//! request prunes to a single partition and yields ~1 index scan, so once an
-//! index exists its `idx_scan` growth should track the request growth. When it
-//! does not, the two signals disagree and that disagreement is itself the most
-//! useful output:
+//! (`idx_scan`). A served `getProgramAccounts` is a `UNION ALL` over `accounts`
+//! and `snapshot_accounts`, so it scans **both** indexes of the pair — raw
+//! `idx_scan` grows ~2x the request count. The caller normalizes supply by
+//! `SCANS_PER_REQUEST` before calling [`evaluate`], so once an index exists the
+//! normalized supply should track request growth ~1:1. When it does not, the two
+//! signals disagree and that disagreement is itself the most useful output:
 //!
 //! - **Starved** (supply ≪ demand): Postgres is *ignoring* an index the workload
 //!   still wants (stale stats, predicate mismatch, cost misconfig). Do **not**
@@ -41,7 +42,8 @@ impl DiscrepancyState {
     }
 }
 
-/// Evaluate demand-vs-supply for a created pattern.
+/// Evaluate demand-vs-supply for a created pattern. `supply` must already be
+/// normalized by `SCANS_PER_REQUEST` so it is comparable to `demand_since_create`.
 ///
 /// Returns the verdict and the `supply / demand_since_create` ratio (`None`
 /// ratio when there is not enough demand to judge, in which case the state is
