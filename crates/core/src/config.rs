@@ -117,6 +117,11 @@ impl AccountSelectorConfig {
     pub fn supports_vote_accounts(&self) -> bool {
         self.is_program_selected(&VOTE_PROGRAM_ID) && self.is_program_selected(&STAKE_PROGRAM_ID)
     }
+
+    /// `simulateTransaction` requires a full unfiltered index
+    pub fn supports_simulation(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
 }
 
 pub const VOTE_PROGRAM_ID: Pubkey =
@@ -496,6 +501,17 @@ pub struct MetricsConfig {
         default = "MetricsConfig::default_subscription_id_key"
     )]
     pub subscription_id_key: String,
+
+    /// Enable the per-client-IP egress bandwidth metrics module (peak gauge +
+    /// throughput histogram). Off by default.
+    #[serde(rename = "client-ip-bandwidth-enabled", default)]
+    pub client_ip_bandwidth_enabled: bool,
+
+    /// Request header carrying the client IP used to group the per-client-IP
+    /// bandwidth metrics. When unset — or when the header is absent on a
+    /// request — all bandwidth folds into a single placeholder label.
+    #[serde(rename = "client-ip-key", default)]
+    pub client_ip_key: Option<String>,
 }
 
 impl MetricsConfig {

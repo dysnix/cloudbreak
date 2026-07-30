@@ -10,8 +10,8 @@ use std::{
 
 use sea_orm::{
     ActiveValue::{NotSet, Set},
-    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Statement, Value,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
+    QueryFilter, Statement, Value,
     prelude::Expr,
     sea_query::{Alias, OnConflict},
 };
@@ -351,6 +351,58 @@ pub async fn insert_slot(
             tracing::error!("insert_slot: failed to insert slot {}: {}", slot, e);
             metrics::increment_db_errors();
         }
+    }
+}
+
+/// Retained window of `recent_blockhashes` rows (~5 minutes of slots at mainnet cadence).
+const RECENT_BLOCKHASH_RETENTION_SLOTS: u64 = 900;
+
+/// Records a block's blockhash for simulation's blockhash-age check, pruning older rows.
+pub async fn insert_recent_blockhash(
+    slot: u64,
+    blockhash: String,
+    block_height: Option<u64>,
+    db: &DatabaseConnection,
+    config: &IndexConfig,
+) {
+    if blockhash.is_empty() {
+        return;
+    }
+
+    let query_timeout = Duration::from_secs(config.database.finalize_slot_queries_timeout);
+    let prune_before = slot.saturating_sub(RECENT_BLOCKHASH_RETENTION_SLOTS) as i64;
+
+    let insert = Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO recent_blockhashes (slot, blockhash, block_height) VALUES ($1, $2, $3) \
+         ON CONFLICT (slot) DO UPDATE SET blockhash = EXCLUDED.blockhash, \
+         block_height = EXCLUDED.block_height",
+        [
+            Value::from(slot as i64),
+            Value::from(blockhash),
+            Value::from(block_height.map(|h| h as i64)),
+        ],
+    );
+    let prune = Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "DELETE FROM recent_blockhashes WHERE slot < $1",
+        [Value::from(prune_before)],
+    );
+
+    let result = timeout(query_timeout, async {
+        db.execute(insert).await?;
+        db.execute(prune).await?;
+        Ok::<(), sea_orm::DbErr>(())
+    })
+    .await
+    .unwrap_or_else(|elapsed| {
+        tracing::error!("insert_recent_blockhash timeout ERROR: {}", elapsed);
+        Err(sea_orm::DbErr::RecordNotInserted)
+    });
+
+    if let Err(e) = result {
+        tracing::error!("insert_recent_blockhash: failed for slot {}: {}", slot, e);
+        metrics::increment_db_errors();
     }
 }
 

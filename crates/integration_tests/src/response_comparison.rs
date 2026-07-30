@@ -181,6 +181,7 @@ pub fn compare_responses(
         RequestType::GetBalance | RequestType::GetTokenAccountBalance => {
             compare_value_direct(response1, response2)
         }
+        RequestType::SimulateTransaction => compare_simulate_responses(response1, response2),
     };
 
     CompareResponsesResult::new_with_matching_context(matches, compare_context_result)
@@ -192,6 +193,82 @@ fn compare_value_direct(response1: &JsonValue, response2: &JsonValue) -> bool {
     let v1 = response1.get("result").and_then(|r| r.get("value"));
     let v2 = response2.get("result").and_then(|r| r.get("value"));
     v1 == v2
+}
+
+static NULL_VALUE: JsonValue = JsonValue::Null;
+
+fn field<'a>(value: &'a JsonValue, key: &str) -> &'a JsonValue {
+    value.get(key).unwrap_or(&NULL_VALUE)
+}
+
+const SIMULATE_EXACT_FIELDS: [&str; 9] = [
+    "err",
+    "logs",
+    "unitsConsumed",
+    "loadedAccountsDataSize",
+    "returnData",
+    "fee",
+    "loadedAddresses",
+    "innerInstructions",
+    "accounts",
+];
+
+fn token_balance_map(balances: &JsonValue) -> Option<HashMap<String, &JsonValue>> {
+    let array = balances.as_array()?;
+    Some(
+        array
+            .iter()
+            .map(|b| {
+                let key = format!(
+                    "{}:{}",
+                    field(b, "accountIndex"),
+                    field(b, "mint"),
+                );
+                (key, b)
+            })
+            .collect(),
+    )
+}
+
+fn compare_token_balances(value1: &JsonValue, value2: &JsonValue, key: &str) -> bool {
+    let b1 = field(value1, key);
+    let b2 = field(value2, key);
+
+    match (token_balance_map(b1), token_balance_map(b2)) {
+        (Some(m1), Some(m2)) => m1 == m2,
+        (None, None) => b1 == b2,
+        _ => false,
+    }
+}
+
+fn compare_simulate_responses(response1: &JsonValue, response2: &JsonValue) -> bool {
+    let v1 = response1.get("result").and_then(|r| r.get("value"));
+    let v2 = response2.get("result").and_then(|r| r.get("value"));
+
+    let (v1, v2) = match (v1, v2) {
+        (Some(v1), Some(v2)) => (v1, v2),
+        _ => return v1 == v2,
+    };
+
+    if SIMULATE_EXACT_FIELDS
+        .iter()
+        .any(|key| field(v1, key) != field(v2, key))
+    {
+        return false;
+    }
+
+    if field(v1, "replacementBlockhash").is_null() != field(v2, "replacementBlockhash").is_null() {
+        return false;
+    }
+
+    if field(v1, "preBalances") != field(v2, "preBalances")
+        || field(v1, "postBalances") != field(v2, "postBalances")
+    {
+        return false;
+    }
+
+    compare_token_balances(v1, v2, "preTokenBalances")
+        && compare_token_balances(v1, v2, "postTokenBalances")
 }
 
 /// Compares two `result.value: UiAccount | null` responses (`getAccountInfo`).
@@ -339,24 +416,27 @@ pub async fn join_pair_with_probe(
     rpc2: &RpcEndpoint,
     request: &JsonValue,
     db_probe_ctx: Option<&DbProbeCtx>,
+    bw_meter: &std::sync::Arc<crate::bandwidth::BwMeter>,
 ) -> (
     Result<(JsonValue, u128)>,
     Result<(JsonValue, u128)>,
     Option<DbProbeResult>,
 ) {
+    // Only rpc1 (the endpoint under test) is metered for the Gbit/s limit and
+    // the average throughput display; rpc2 is the comparison arm.
     match db_probe_ctx {
         Some(ctx) => {
             let (r1, r2, probe) = tokio::join!(
-                utils::send_rpc_request(client, rpc1, request),
-                utils::send_rpc_request(client, rpc2, request),
+                utils::send_rpc_request(client, rpc1, request, Some(bw_meter)),
+                utils::send_rpc_request(client, rpc2, request, None),
                 probe_get_balance_state(ctx),
             );
             (r1, r2, probe)
         }
         None => {
             let (r1, r2) = tokio::join!(
-                utils::send_rpc_request(client, rpc1, request),
-                utils::send_rpc_request(client, rpc2, request),
+                utils::send_rpc_request(client, rpc1, request, Some(bw_meter)),
+                utils::send_rpc_request(client, rpc2, request, None),
             );
             (r1, r2, None)
         }
@@ -386,6 +466,7 @@ pub async fn compare_with_slot_compensation(
     mut iterations: Option<&mut Vec<IterationCapture>>,
     iteration_phase: &'static str,
     db_probe_ctx: Option<&DbProbeCtx>,
+    bw_meter: &std::sync::Arc<crate::bandwidth::BwMeter>,
 ) -> Result<(CompareResponsesResult, u32)> {
     let enable_slot_compensation = comparison_config.enable_slot_compensation;
     let max_retries = comparison_config.slot_compensation_max_retries;
@@ -429,6 +510,7 @@ pub async fn compare_with_slot_compensation(
                         rpc2,
                         request,
                         db_probe_ctx,
+                        bw_meter,
                     )
                     .await;
 

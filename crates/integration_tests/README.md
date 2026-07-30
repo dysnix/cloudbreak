@@ -5,6 +5,7 @@ Benchmarking and correctness testing tool for Solana RPC endpoints.
 ## Features
 
 - **Constant-rate load generation**: Spawns requests at a configurable RPS rate decoupled from response latency. A ticker fires at the target interval and dispatches requests regardless of how long previous ones take, with a semaphore limiting maximum in-flight concurrency.
+- **Bandwidth limit (Gbit/s)**: An optional `[benchmark].target_gbits` cap throttles load based on the **actual received rpc1 response bytes**, acting as a second ceiling alongside `target_rps`. If byte throughput reaches the cap below the target RPS, the spawner slows down so the average stays under the limit — useful for reproducing a link/NIC saturation ceiling instead of a pure request-rate one. Implemented as a debt-based token bucket over real wire bytes (no estimation). The run's **average Gbit/s** is always reported in the summary next to Effective RPS, whether or not a cap is set.
 - **Response comparison**: Optionally sends the same request to a second endpoint and compares the responses. Comparison is order-agnostic — accounts are matched by pubkey, so different ordering between endpoints is not flagged as a mismatch.
 - **Slot compensation**: When two endpoints return different data, the tool checks if the difference is due to a slot lag. If enabled, it fires concurrent requests to **both** endpoints at regular intervals, collecting all responses. It then searches for the first pair (one from each endpoint) that share the same slot, and uses that pair for comparison. This avoids the ping-pong problem where sequential retries on the behind endpoint can never converge because the chain keeps advancing (especially with `processed` commitment). The initial slot difference is still recorded in statistics. **Important**: slot compensation only activates when both responses include `result.context.slot` (i.e. the request was made with `withContext: true`). If the responses have no context, mismatches are reported as-is with no retries. For `getProgramAccounts`, context is only present if the request explicitly includes `withContext: true`; `getTokenAccountsByOwner` and `getTokenAccountsByDelegate` always return context.
 - **Live request sources**: Requests can come from a static JSON file or be fetched live from VictoriaLogs. The VictoriaLogs source refreshes every 60 seconds in the background, so the request pool evolves during long runs.
@@ -79,6 +80,7 @@ cargo run --bin integration_tests -- benchmark -c custom.toml gpa
 | `get-multiple-accounts`      | `getMultipleAccounts` (up to `[server].max-multiple-accounts` pubkeys, default `100`; positional comparison) |
 | `get-balance`                | `getBalance` (returns `u64`, no encoding)                                                |
 | `get-token-account-balance`  | `getTokenAccountBalance` (returns `UiTokenAmount`, no encoding, no `minContextSlot`)    |
+| `simulate-transaction`       | `simulateTransaction` (replays real captured requests; see [Replaying simulateTransaction](#replaying-simulatetransaction)) |
 
 **Per-method response comparison** (when `[comparison]` is configured):
 
@@ -89,6 +91,7 @@ cargo run --bin integration_tests -- benchmark -c custom.toml gpa
 | `get-account-info`            | Single `UiAccount \| null` — direct compare with zstd-aware account-equality                                    |
 | `get-balance`                 | `u64` — direct JSON equality                                                                                    |
 | `get-token-account-balance`   | `UiTokenAmount` object — direct JSON equality                                                                    |
+| `simulate-transaction`        | `result.value` field-by-field: `err`, `logs`, `unitsConsumed`, `loadedAccountsDataSize`, `returnData`, `fee`, `loadedAddresses`, `innerInstructions`, `accounts`, `pre`/`postBalances`; `pre`/`postTokenBalances` are `(accountIndex, mint)`-keyed so ordering is ignored. `replacementBlockhash` is compared only for presence, since each endpoint substitutes its own blockhash. |
 
 **Default encodings used by `extract_encoding_from_request` when the request omits `encoding`** (mirrors Agave's per-method defaults):
 
@@ -149,6 +152,7 @@ Controls load generation.
 | `target_rps`    | _(required)_ | Target requests per second. Requests are spawned at this rate independently of response latency |
 | `max_in_flight` | `100`        | Maximum concurrent in-flight requests. Requests beyond this limit are dropped                   |
 | `duration_secs` | `0`          | How long to run in seconds. `0` exits immediately (should be set)                               |
+| `target_gbits`  | _(none)_     | Optional bandwidth cap in **Gbit/s**, enforced against the actual received rpc1 response bytes. Works together with `target_rps`: if throughput hits this limit below the target RPS, effective RPS is throttled so the average stays under the cap. Omit (or `0`) to disable — the average Gbit/s is still reported either way |
 
 ### `[source]`
 
@@ -164,17 +168,42 @@ Loads a static array of JSON-RPC request bodies from a file. Requests cycle inde
 
 #### `type = "victoria_logs"`
 
-Fetches real request bodies from a VictoriaLogs instance. Refreshes automatically every 60 seconds during the benchmark run with fresh logs.
+Fetches real request bodies from a VictoriaLogs instance. Refreshes automatically every `poll_interval_secs` (default 60) during the benchmark run with fresh logs.
 
-| Field              | Default      | Description                                                                                                                                                                                                                                                        |
-| ------------------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `url`              | _(required)_ | VictoriaLogs query endpoint URL                                                                                                                                                                                                                                    |
-| `minutes`          | _(none)_     | Time window in minutes for the log query. If omitted, no time constraint is applied                                                                                                                                                                                |
-| `limit`            | `1000`       | Maximum number of log entries to fetch per query                                                                                                                                                                                                                   |
-| `min_request_size` | _(none)_     | Only include requests where the response was at least this many bytes                                                                                                                                                                                              |
-| `max_request_size` | _(none)_     | Only include requests where the response was at most this many bytes                                                                                                                                                                                               |
-| `encoding`         | _(none)_     | Filter requests by encoding. See [VictoriaLogs encoding filter](#victorialogs-encoding-filter) below. Supports `\|` for multiple (e.g. `"base58\|jsonParsed"`) |
-| `inject_context`   | `false`      | If `true`, when a no-context mismatch is detected, re-sends the request with `withContext: true` injected and runs slot compensation before deciding if it's a real mismatch. Eliminates false positives from slot lag on requests originally sent without context |
+| Field                | Default      | Description                                                                                                                                                                                                                                                        |
+| -------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `url`                | _(required)_ | VictoriaLogs query endpoint URL                                                                                                                                                                                                                                    |
+| `minutes`            | _(none)_     | Time window in minutes for the log query. If omitted, no time constraint is applied                                                                                                                                                                                |
+| `window_seconds`     | _(none)_     | Trailing time window in seconds (`_time:>now-Ns`). Takes precedence over `minutes`. Use for request types that expire quickly                                                                                                                                       |
+| `limit`              | `1000`       | Maximum number of log entries to fetch per query                                                                                                                                                                                                                   |
+| `min_request_size`   | _(none)_     | Only include requests where the response was at least this many bytes                                                                                                                                                                                              |
+| `max_request_size`   | _(none)_     | Only include requests where the response was at most this many bytes                                                                                                                                                                                               |
+| `encoding`           | _(none)_     | Filter requests by encoding. See [VictoriaLogs encoding filter](#victorialogs-encoding-filter) below. Supports `\|` for multiple (e.g. `"base58\|jsonParsed"`) |
+| `inject_context`     | `false`      | If `true`, when a no-context mismatch is detected, re-sends the request with `withContext: true` injected and runs slot compensation before deciding if it's a real mismatch. Eliminates false positives from slot lag on requests originally sent without context |
+| `poll_interval_secs` | `60`         | How often the background fetcher re-queries VictoriaLogs                                                                                                                                                                                                            |
+| `replay_once`        | `false`      | Deduplicate by the log's `req_id` and send each request exactly once instead of cycling the pool. Required for requests that expire                                                                                                                                 |
+
+##### Replaying simulateTransaction
+
+A `simulateTransaction` request carries a `recentBlockhash` that the cluster only accepts for
+~150 blocks (~60s). VictoriaLogs ingestion lag is 1–9s, so a request must be replayed within
+seconds of being logged. Three settings make that work, and all three are required:
+
+- `window_seconds = 30` — a short trailing window instead of whole minutes.
+- `poll_interval_secs = 5` — fetch new arrivals promptly.
+- `replay_once = true` — send each `req_id` once. Without it the spawner cycles the pool at
+  `target_rps`, replaying the same transactions until their blockhashes expire.
+
+Pair with `[benchmark].start_on_first_request = true` so the `duration_secs` countdown begins
+when the first request is picked up rather than while waiting for the first poll.
+
+Two known, non-bug divergence classes when comparing against an Agave validator:
+
+- **`AlreadyProcessed` on the Agave side.** Clients typically submit the transaction a second
+  after simulating it, so by replay time it has landed and Agave's signature status cache
+  rejects it. Cloudbreak has no status cache and re-executes. Only affects requests that do
+  *not* set `replaceRecentBlockhash: true` (replacing the blockhash changes the status-cache key).
+- **`BlockhashNotFound` on one side only** when a request's original blockhash expires mid-run.
 
 ##### VictoriaLogs tips
 
@@ -644,7 +673,7 @@ At the end of a run, a summary is printed to stdout. It has three sections:
 ==========================================================================================
 BENCHMARK SUMMARY
 ==========================================================================================
-Duration: 100.0s | Total requests: 1847 | Effective RPS: 18.5
+Duration: 100.0s | Total requests: 1847 | Effective RPS: 18.5 | Avg: 3.421 Gbit/s (cap 5.000 Gbit/s)
 Dropped requests (backpressure): 53 (2.8% of attempted)
 Comparisons: 1423 matches, 5 mismatches, 7 no-context mismatches (possible slot lag)
 Recovered by retry: 18 (would have been mismatches without retry_in_place) (1.26% of compared)
@@ -657,6 +686,7 @@ The **Recovered by retry** line is only printed when `[retry_in_place]` is enabl
 | Duration         | Actual wall-clock time of the run                                                                                                                                                                                                           |
 | Total requests   | Total number of requests sent (to both endpoints combined)                                                                                                                                                                                  |
 | Effective RPS    | `total_requests / duration` — the actual throughput achieved                                                                                                                                                                                |
+| Avg Gbit/s       | Average rpc1 throughput over the run, computed from the actual received response wire bytes (`total_rpc1_bytes * 8 / duration / 1e9`). When `target_gbits` is set, the configured cap is shown in parentheses                                 |
 | Dropped requests | Requests that were not sent because `max_in_flight` was full (only shown if > 0). This can indicate that `max_in_flight` is too low for the target RPS, or that the server is responding too slowly and in-flight requests are accumulating |
 | Comparisons      | Match/mismatch/no-context mismatch counts. No-context mismatches are responses that differ but lack `result.context`, meaning the difference may be due to slot lag that cannot be verified or compensated for                              |
 
@@ -726,6 +756,8 @@ name = "reference"
 target_rps = 5.0
 max_in_flight = 100
 duration_secs = 100
+# target_gbits = 1.0  # Optional bandwidth cap (Gbit/s) enforced on actual
+                      # received rpc1 bytes; throttles RPS to stay under it.
 
 [source]
 type = "json_file"

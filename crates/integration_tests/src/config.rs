@@ -62,6 +62,16 @@ pub struct BenchmarkConfig {
 
     #[serde(default = "defaults::timeout_secs")]
     pub timeout_secs: u64,
+
+    #[serde(default)]
+    pub start_on_first_request: bool,
+
+    /// Optional bandwidth cap in Gbit/s, enforced against *actual received*
+    /// rpc1 response bytes. Acts as an upper bound together with `target_rps`:
+    /// if byte throughput hits this limit below `target_rps`, effective RPS is
+    /// reduced so the average stays under the cap. Omit/0 to disable.
+    #[serde(default)]
+    pub target_gbits: Option<f64>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -75,16 +85,25 @@ pub enum SourceConfig {
         url: String,
         /// Time window in minutes. If omitted, no time constraint is applied.
         minutes: Option<u32>,
+        window_seconds: Option<u32>,
         #[serde(default = "defaults::vlogs_limit")]
         limit: u32,
         min_request_size: Option<u64>,
         max_request_size: Option<u64>,
         encoding: Option<String>,
+        /// Value for the `pool_dedicated` VictoriaLogs filter (e.g. `"liquid"`).
+        /// When omitted, no `pool_dedicated` constraint is added to the query.
+        #[serde(default)]
+        pool_dedicated: Option<String>,
         /// If true, when a no-context mismatch is detected, re-sends the request
         /// with `withContext: true` injected and runs slot compensation before
         /// deciding whether it's a real mismatch.
         #[serde(default)]
         inject_context: bool,
+        #[serde(default = "defaults::poll_interval_secs")]
+        poll_interval_secs: u64,
+        #[serde(default)]
+        replay_once: bool,
     },
 
     #[serde(rename = "mismatch_dir")]
@@ -105,6 +124,13 @@ impl SourceConfig {
     pub fn retry_with_context(&self) -> bool {
         match self {
             SourceConfig::VictoriaLogs { inject_context, .. } => *inject_context,
+            _ => false,
+        }
+    }
+
+    pub fn replay_once(&self) -> bool {
+        match self {
+            SourceConfig::VictoriaLogs { replay_once, .. } => *replay_once,
             _ => false,
         }
     }
@@ -170,6 +196,9 @@ mod defaults {
     }
     pub fn vlogs_limit() -> u32 {
         1000
+    }
+    pub fn poll_interval_secs() -> u64 {
+        60
     }
     pub fn compare_ratio() -> f64 {
         1.0

@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde_json::Value as JsonValue;
 use tokio::sync::watch;
 
+use crate::sources::BenchRequest;
 use crate::utils;
 
 /// Reads all `mismatch_*.json` files from a directory and extracts the `request`
@@ -16,7 +17,7 @@ use crate::utils;
 /// its params object (creates the object if needed). This is necessary for GPA
 /// requests that were originally sent without context, so that slot compensation
 /// can work on the re-run.
-pub fn load_requests(dir: &str, inject_context: bool) -> Result<watch::Receiver<Vec<JsonValue>>> {
+pub fn load_requests(dir: &str, inject_context: bool) -> Result<watch::Receiver<Vec<BenchRequest>>> {
     let entries: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("Failed to read mismatch directory: {dir}"))?
         .filter_map(|e| e.ok())
@@ -39,7 +40,11 @@ pub fn load_requests(dir: &str, inject_context: bool) -> Result<watch::Receiver<
             if inject_context {
                 utils::inject_with_context(&mut request);
             }
-            requests.push(request);
+            // No size estimate available for this source → uncapped.
+            requests.push(BenchRequest {
+                body: request,
+                est_bytes: None,
+            });
         } else {
             tracing::warn!(
                 target: "bench_source",

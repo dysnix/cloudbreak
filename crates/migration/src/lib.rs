@@ -18,6 +18,8 @@ mod m20260325_000000_drop_temp_tables;
 mod m20260414_000000_create_indexer_filters_table;
 mod m20260522_000000_create_environment_info_table;
 mod m20260528_000000_create_epoch_stakes_table;
+mod m20260703_000000_create_recent_blockhashes_table;
+mod m20260709_000000_add_block_height_to_recent_blockhashes;
 mod m20260711_000000_create_index_patterns_table;
 
 pub struct Migrator;
@@ -37,6 +39,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260414_000000_create_indexer_filters_table::Migration),
             Box::new(m20260522_000000_create_environment_info_table::Migration),
             Box::new(m20260528_000000_create_epoch_stakes_table::Migration),
+            Box::new(m20260703_000000_create_recent_blockhashes_table::Migration),
+            Box::new(m20260709_000000_add_block_height_to_recent_blockhashes::Migration),
             Box::new(m20260711_000000_create_index_patterns_table::Migration),
         ]
     }

@@ -19,6 +19,7 @@ pub async fn send_rpc_request(
     client: &reqwest::Client,
     endpoint: &RpcEndpoint,
     request: &JsonValue,
+    meter: Option<&std::sync::Arc<crate::bandwidth::BwMeter>>,
 ) -> Result<(JsonValue, u128)> {
     let start = Instant::now();
 
@@ -30,11 +31,23 @@ pub async fn send_rpc_request(
         .await
         .with_context(|| format!("Failed to connect to {}", endpoint.name))?;
 
-    let json = response
-        .json()
+    // Read the raw body first so we can account the true received wire size
+    // cheaply: `reqwest::Response::json()` already buffers the full body into
+    // `bytes()` internally, so doing it ourselves adds no extra copy — we just
+    // get `.len()` for free and parse from the slice. The re-serialized JSON
+    // length used for the size buckets is computed by the caller as before.
+    let body = response
+        .bytes()
         .await
         .with_context(|| format!("Failed to read response from {}", endpoint.name))?;
     let duration = start.elapsed().as_millis();
+
+    if let Some(meter) = meter {
+        meter.record(body.len() as u64);
+    }
+
+    let json = serde_json::from_slice(&body)
+        .with_context(|| format!("Failed to parse response from {}", endpoint.name))?;
 
     Ok((json, duration))
 }
@@ -97,7 +110,8 @@ pub fn extract_commitment_from_request(request: &JsonValue, request_type: Reques
         | RequestType::GetAccountInfo
         | RequestType::GetMultipleAccounts
         | RequestType::GetBalance
-        | RequestType::GetTokenAccountBalance => 1,
+        | RequestType::GetTokenAccountBalance
+        | RequestType::SimulateTransaction => 1,
         RequestType::Gtabo | RequestType::Gtabd => 2,
     };
     request
@@ -138,7 +152,8 @@ pub fn extract_encoding_from_request(request: &JsonValue, request_type: RequestT
         | RequestType::GpaTokenOwner
         | RequestType::GpaTokenMint
         | RequestType::GetAccountInfo
-        | RequestType::GetMultipleAccounts => 1,
+        | RequestType::GetMultipleAccounts
+        | RequestType::SimulateTransaction => 1,
         RequestType::Gtabo | RequestType::Gtabd => 2,
         RequestType::GetBalance | RequestType::GetTokenAccountBalance => unreachable!(),
     };
@@ -158,6 +173,7 @@ pub fn extract_encoding_from_request(request: &JsonValue, request_type: RequestT
             RequestType::Gtabo | RequestType::Gtabd => "jsonParsed".to_string(),
             RequestType::GetAccountInfo => "binary".to_string(),
             RequestType::GetMultipleAccounts => "base64".to_string(),
+            RequestType::SimulateTransaction => "base58".to_string(),
             RequestType::GetBalance | RequestType::GetTokenAccountBalance => unreachable!(),
         },
     }

@@ -11,6 +11,10 @@ target_rps = 5.0
 max_in_flight = 100
 duration_secs = 100
 timeout_secs = 60
+# Optional bandwidth cap in Gbit/s, enforced against actual received rpc1 bytes.
+# Works together with target_rps: if throughput hits this limit below target_rps,
+# effective RPS is throttled so the average stays under the cap. Omit to disable.
+# target_gbits = 1.0
 
 [source]
 type = "json_file"
@@ -27,6 +31,7 @@ path = "crates/integration_tests/gpa_benchmark_requests.json"
 # # If set it will filter the requests by the encoding, if empty it will return all encodings
 # # "base64" | "base58" | "base64+zstd" | "jsonParsed"
 # encoding = "jsonParsed"
+# pool_dedicated = "liquid"  # Value for the `pool_dedicated` VictoriaLogs filter; omit for no constraint
 # inject_context = true  # On no-context mismatch, re-sends with withContext:true and slot compensation before deciding
 
 # Example of mismatch_dir source (re-run previously mismatched requests)
