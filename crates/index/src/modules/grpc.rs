@@ -136,7 +136,7 @@ pub fn subscribe_grpc_with_reconnection(
                 let last = *last_slot_received
                     .lock()
                     .expect("Failed to lock last_slot_received");
-                (last != 0).then_some(last)
+                (last != 0).then_some(last + 1)
             } else {
                 None
             };
