@@ -177,6 +177,16 @@ cargo run -p cloudbreak-migration -- fresh     # Drop all, reapply
 cargo run -p cloudbreak-migration -- refresh   # Rollback all, reapply
 ```
 
+> **⚠️ The database is ephemeral, and each run expects a clean, empty schema.** The main
+> data tables (`accounts`, `snapshot_accounts`, and their partitions) are created as Postgres
+> **`UNLOGGED`** tables — they trade crash-durability for write throughput, so a Postgres
+> crash or restart **truncates** them. Cloudbreak is designed around this: the indexer
+> rebuilds state from the snapshot + live gRPC stream, it does **not** treat the database as
+> durable storage. Because of that, **do not reuse a dirty database between runs** — start each
+> run against a freshly-created, empty schema. Reset with `cargo run -p cloudbreak-migration --
+> fresh` (drop all + reapply) or `refresh` (rollback all + reapply), or drop and recreate the
+> database, rather than pointing a new run at leftover tables from a previous one.
+
 See [`crates/migration/README.md`](crates/migration/README.md) for the full config reference (partitioning shapes, per-index toggles, env vars, and CLI flags).
 
 ##### Table Partitioning & Indexes

@@ -8,10 +8,12 @@ use std::{
     time::Duration,
 };
 
+use cloudbreak_core::{IndexConfig, modules::account_owner_map::AccountOwnerMap};
+use cloudbreak_entity::{accounts, service_health, slots};
 use sea_orm::{
     ActiveValue::{NotSet, Set},
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
-    QueryFilter, Statement, Value,
+    QueryFilter, Statement, TransactionTrait, Value,
     prelude::Expr,
     sea_query::{Alias, OnConflict},
 };
@@ -20,8 +22,6 @@ use tokio::{
     time::{Instant, timeout},
 };
 use yellowstone_grpc_proto::{geyser::CommitmentLevel, prelude::UnixTimestamp};
-use cloudbreak_core::{IndexConfig, modules::account_owner_map::AccountOwnerMap};
-use cloudbreak_entity::{accounts, service_health, slots};
 
 use crate::metrics;
 
@@ -29,69 +29,55 @@ use crate::metrics;
 ///  to unhealthy when we get a slot gap.
 ///
 /// By default we set the service as unhealthy on migration.
+///
+/// The authoritative `service_health` row and the denormalised `slots.health` flag are written
+/// in a single transaction so they can never diverge.
 pub async fn update_service_health(db: &DatabaseConnection, healthy: bool) {
-    let query = service_health::Entity::insert(service_health::ActiveModel {
-        id: Set(1), //It will always write to the one default record
-        healthy: Set(healthy),
-        last_updated_at: NotSet,
-    })
-    .on_conflict(
-        OnConflict::columns([service_health::Column::Id])
-            .update_columns([
-                service_health::Column::Healthy,
-                service_health::Column::LastUpdatedAt,
-            ])
-            .to_owned(),
-    )
-    .exec_without_returning(db);
+    let result = timeout(Duration::from_secs(30), async {
+        let txn = db.begin().await?;
 
-    let result = timeout(Duration::from_secs(30), query)
-        .await
-        .unwrap_or_else(|elapsed| {
-            tracing::error!("update_service_health timeout ERROR: {}", elapsed);
-            metrics::increment_db_errors();
-            Err(sea_orm::DbErr::RecordNotInserted)
-        });
+        service_health::Entity::insert(service_health::ActiveModel {
+            id: Set(1), //It will always write to the one default record
+            healthy: Set(healthy),
+            last_updated_at: NotSet,
+        })
+        .on_conflict(
+            OnConflict::columns([service_health::Column::Id])
+                .update_columns([
+                    service_health::Column::Healthy,
+                    service_health::Column::LastUpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec_without_returning(&txn)
+        .await?;
+
+        // Denormalise the same health state onto every `slots` row so the API can read
+        // the latest slot and the health flag in a single lookup.
+        slots::Entity::update_many()
+            .col_expr(slots::Column::Health, Expr::value(healthy))
+            .exec(&txn)
+            .await?;
+
+        txn.commit().await?;
+
+        Ok::<(), sea_orm::DbErr>(())
+    })
+    .await
+    .unwrap_or_else(|elapsed| {
+        tracing::error!("update_service_health timeout ERROR: {}", elapsed);
+        Err(sea_orm::DbErr::RecordNotInserted)
+    });
 
     match result {
-        Ok(result) => {
-            tracing::debug!("update_service_health: updated service health: {}", result);
-        }
-        Err(e) => {
-            tracing::error!(
-                "update_service_health: failed to update service health: {}",
-                e
-            );
-            metrics::increment_db_errors();
-        }
-    }
-
-    // Denormalise the same health state onto every `slots` row so the API can read
-    // the latest slot and the health flag in a single lookup.
-    let slots_query = slots::Entity::update_many()
-        .col_expr(slots::Column::Health, Expr::value(healthy))
-        .exec(db);
-
-    let slots_result = timeout(Duration::from_secs(30), slots_query)
-        .await
-        .unwrap_or_else(|elapsed| {
-            tracing::error!("update_service_health (slots) timeout ERROR: {}", elapsed);
-            metrics::increment_db_errors();
-            Err(sea_orm::DbErr::RecordNotUpdated)
-        });
-
-    match slots_result {
-        Ok(result) => {
+        Ok(()) => {
             tracing::debug!(
-                "update_service_health: updated health on {} slot rows",
-                result.rows_affected
+                "update_service_health: updated service + slots health to {}",
+                healthy
             );
         }
         Err(e) => {
-            tracing::error!(
-                "update_service_health: failed to update slots health: {}",
-                e
-            );
+            tracing::error!("update_service_health: failed to update health: {}", e);
             metrics::increment_db_errors();
         }
     }
