@@ -342,6 +342,7 @@ pub async fn insert_slot(
     slot: u64,
     block_time: Option<UnixTimestamp>,
     commitment: CommitmentLevel,
+    healthy: bool,
     db: &DatabaseConnection,
     config: &IndexConfig,
 ) {
@@ -353,9 +354,11 @@ pub async fn insert_slot(
         slot: Set(slot as i64),
         commitment: Set(commitment as i32),
         block_time: Set(block_time),
-        // Health is owned by `update_service_health`; leave it to the column default
-        // on insert and never clobber it on conflict.
-        health: NotSet,
+        // Stamp the current health so a freshly inserted row is consistent with the
+        // live health state even if it is created after the last health transition.
+        // `update_service_health` remains the sole authority for transitions on
+        // existing rows, so we never clobber `health` on conflict.
+        health: Set(healthy),
     })
     .on_conflict(
         OnConflict::columns([slots::Column::Commitment])
