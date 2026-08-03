@@ -58,7 +58,7 @@ pub async fn get_vote_accounts(
             target: "get_vote_accounts",
             "stakes cache not yet populated; indexer has not finished a snapshot pass with stake data"
         );
-        return Err(RpcError::NodeUnhealthy);
+        return Err(state.node_unhealthy());
     }
 
     let finalized_slot = match state

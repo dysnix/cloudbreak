@@ -494,6 +494,23 @@ Example:
 processed-commitment = "use-confirmed"
 ```
 
+#### `unhealthy-response` (top-level, optional)
+
+Controls how the API responds to requests while the node is unhealthy (the `slots.health` flag is unset / the slot syncronizer reports unhealthy). This is a top-level key (not inside any section).
+
+| Value                | Description                                                                                                      |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `"json-rpc-error"`   | **(default)** Return a `NODE_UNHEALTHY` JSON-RPC error (code `-32005`) with HTTP `200 OK`.                        |
+| `"http-unavailable"` | Return an HTTP `503 Service Unavailable` response instead.                                                        |
+
+> **Note:** `http-unavailable` only applies to single requests. Batch requests always return HTTP `200 OK` with per-item JSON-RPC errors, since an HTTP status cannot be expressed per batch item.
+
+Example:
+
+```toml
+unhealthy-response = "http-unavailable"
+```
+
 #### `[tracing]` (optional)
 
 OpenTelemetry tracing configuration. If this section is omitted, OTel is disabled and only `tracing-subscriber` is used.

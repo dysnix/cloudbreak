@@ -574,6 +574,18 @@ pub enum ProcessedCommitmentBehavior {
     UseConfirmed,
 }
 
+/// How the API responds when the node is unhealthy (the `slots.health` flag is
+/// unset / the slot syncronizer reports unhealthy).
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnhealthyResponseBehavior {
+    /// Return a JSON-RPC error (`NODE_UNHEALTHY`) with HTTP `200 OK` (default).
+    #[default]
+    JsonRpcError,
+    /// Return an HTTP `503 Service Unavailable` response instead.
+    HttpUnavailable,
+}
+
 #[derive(Deserialize, Debug)]
 pub struct ApiConfig {
     pub database: DatabaseConfig,
@@ -591,6 +603,9 @@ pub struct ApiConfig {
     pub slot_syncronizer: SlotSyncronizerConfig,
     #[serde(rename = "processed-commitment", default)]
     pub processed_commitment: ProcessedCommitmentBehavior,
+    /// How the API responds to requests while the node is unhealthy.
+    #[serde(rename = "unhealthy-response", default)]
+    pub unhealthy_response: UnhealthyResponseBehavior,
     #[serde(rename = "gpa-cache")]
     pub gpa_cache: Option<GpaCacheConfig>,
     #[serde(rename = "genesis-hash", default = "ApiConfig::default_genesis_hash")]
