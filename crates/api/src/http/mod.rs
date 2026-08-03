@@ -7,16 +7,20 @@ use crate::http::server::HttpHandlerResponse;
 use crate::http::server::ResponseBody;
 use crate::modules::cache::GpaProcessor;
 use crate::modules::vote_accounts_cache::SharedStakesSnapshot;
+use crate::error::RpcError;
 use crate::query_tracker_client::QueryTrackerClient;
 use crate::slot_syncronizer::SlotSyncronizerData;
 use agave_feature_set::FeatureSet;
 use hyper::StatusCode;
-use sea_orm::DatabaseConnection;
+use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
+use solana_commitment_config::CommitmentLevel;
 use solana_rpc_client_api::response::Response as RpcResponse;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use tracing::Instrument;
 use cloudbreak_core::{AccountSelectorConfig, ProcessedCommitmentBehavior};
+use cloudbreak_entity::slots;
 
 #[derive(Clone)]
 pub struct CachedFeatureSet {
@@ -85,6 +89,46 @@ impl CloudbreakRpcState {
             max_multiple_accounts,
             simulation_supported,
             feature_set_cache: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Resolves the latest slot and its block time for the given commitment.
+    ///
+    /// When the slot syncronizer is enabled the cached in-memory value is used,
+    /// otherwise the `slots` table is queried directly. If the service is marked
+    /// unhealthy (via the denormalised `slots.health` flag) this returns
+    /// [`RpcError::NodeUnhealthy`] instead of a slot.
+    pub async fn latest_slot_and_block_time(
+        &self,
+        commitment: CommitmentLevel,
+    ) -> Result<(u64, i64), RpcError> {
+        match &self.slot_syncronizer_data {
+            Some(data) => {
+                let data = data.read().expect("Failed to read slot syncronizer data");
+
+                if !data.is_healthy() {
+                    return Err(RpcError::NodeUnhealthy);
+                }
+
+                Ok((
+                    data.get_slot_for_commitment(commitment),
+                    data.get_block_time_for_commitment(commitment),
+                ))
+            }
+            None => {
+                let slot_model = slots::Entity::find_by_id(commitment as i32)
+                    .one(&self.database)
+                    .instrument(tracing::info_span!("slot_db"))
+                    .await?;
+
+                let model = slot_model.ok_or(RpcError::InternalError)?;
+
+                if !model.health {
+                    return Err(RpcError::NodeUnhealthy);
+                }
+
+                Ok((model.slot as u64, model.block_time))
+            }
         }
     }
 }
