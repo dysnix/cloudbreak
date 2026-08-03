@@ -132,6 +132,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         gpa_stream_batch_size,
         request_timeout,
         config.processed_commitment,
+        config.unhealthy_response,
         gpa_processor,
         config.genesis_hash.clone(),
         vote_accounts_supported,

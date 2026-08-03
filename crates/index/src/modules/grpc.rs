@@ -3,6 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use cloudbreak_core::{EnvironmentInfo, IndexConfig};
 use futures::StreamExt;
 use sea_orm::DatabaseConnection;
 use std::{
@@ -27,7 +28,6 @@ use yellowstone_grpc_proto::{
     },
     tonic::codec::CompressionEncoding,
 };
-use cloudbreak_core::{EnvironmentInfo, IndexConfig};
 
 use crate::metrics;
 
@@ -47,7 +47,10 @@ async fn store_grpc_version(version_json: &str, db: &DatabaseConnection) {
                 tracing::error!("Failed to upsert grpc version: {:?}", e);
             }
         }
-        None => tracing::error!("Failed to parse grpc version from response: {}", version_json),
+        None => tracing::error!(
+            "Failed to parse grpc version from response: {}",
+            version_json
+        ),
     }
 }
 
@@ -55,9 +58,12 @@ async fn store_grpc_version(version_json: &str, db: &DatabaseConnection) {
 /// Spawns a background task to handle the stream and forwards updates to the buffer channel.
 /// Automatically reconnects on stream timeouts , stream `None` or errors (only after exceeding
 ///  the `max_grpc_errors` count). It also resets the is_startup flag when the connection is lost.
-const GRPC_RECONNECT_GIVE_UP: Duration = Duration::from_secs(600);
-const GRPC_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
-
+///
+/// Reconnection is governed by a single give-up window: `reconnect_failed_since` records when we
+/// started failing to (re)connect/subscribe and is only cleared once we successfully connect AND
+/// subscribe. Connect/subscribe failures log an error and `continue`; the loop backs off by
+/// `config.grpc.reconnect_backoff` between attempts and panics once the failing window exceeds
+/// `config.grpc.reconnect_give_up`.
 pub fn subscribe_grpc_with_reconnection(
     config: IndexConfig,
     buffer_channel_tx: Sender<SubscribeUpdate>,
@@ -69,13 +75,33 @@ pub fn subscribe_grpc_with_reconnection(
     tokio::spawn(async move {
         let _guard = metrics::TokioTaskCounterGuard::new("grpc");
         let mut log_first_message = true;
-        let mut connect_failed_since: Option<Instant> = None;
+        let mut reconnect_failed_since: Option<Instant> = None;
         let mut is_reconnect = false;
+
+        let give_up = config.grpc.reconnect_give_up;
+        let backoff = config.grpc.reconnect_backoff;
+        let from_slot_retain = config.grpc.reconnect_from_slot_retain;
 
         loop {
             if cancel.load(Ordering::SeqCst) {
                 tracing::info!("GRPC subscription cancelled");
                 return;
+            }
+
+            // Centralized reconnection backoff / give-up: `reconnect_failed_since` is `Some` while
+            // we are failing to (re)connect or subscribe and only cleared once both succeed.
+            if let Some(started) = reconnect_failed_since {
+                if started.elapsed() >= give_up {
+                    tracing::error!(
+                        "Failed to (re)connect to Yellowstone GRPC after {:?}",
+                        started.elapsed()
+                    );
+                    panic!(
+                        "Failed to (re)connect to Yellowstone GRPC after {:?}",
+                        started.elapsed()
+                    );
+                }
+                tokio::time::sleep(backoff).await;
             }
 
             let grpc_timeout = Duration::from_secs(config.grpc.timeout);
@@ -100,7 +126,6 @@ pub fn subscribe_grpc_with_reconnection(
                 .await
             {
                 Ok(mut c) => {
-                    connect_failed_since = None;
                     match c.get_version().await {
                         Ok(response) => store_grpc_version(&response.version, &db).await,
                         Err(e) => tracing::error!("Failed to get grpc version: {:?}", e),
@@ -108,17 +133,9 @@ pub fn subscribe_grpc_with_reconnection(
                     c
                 }
                 Err(e) => {
-                    let started = *connect_failed_since.get_or_insert_with(Instant::now);
-                    if started.elapsed() >= GRPC_RECONNECT_GIVE_UP {
-                        panic!(
-                            "Failed to connect to Yellowstone GRPC for {:?}: {:?}",
-                            started.elapsed(),
-                            e
-                        );
-                    }
+                    reconnect_failed_since.get_or_insert_with(Instant::now);
                     tracing::error!("Failed to connect to Yellowstone GRPC: {:?}", e);
                     metrics::increment_grpc_errors();
-                    tokio::time::sleep(GRPC_RECONNECT_BACKOFF).await;
                     continue;
                 }
             };
@@ -132,7 +149,12 @@ pub fn subscribe_grpc_with_reconnection(
 
             // tracing::debug!("Account include: {:?}", account_include);
 
-            let from_slot = if is_reconnect {
+            // Replay from the last received slot on reconnect, but only while we have been failing
+            // for less than `from_slot_retain`; after that, drop it since the server may no longer
+            // have that slot buffered.
+            let keep_from_slot =
+                reconnect_failed_since.is_none_or(|started| started.elapsed() < from_slot_retain);
+            let from_slot = if is_reconnect && keep_from_slot {
                 let last = *last_slot_received
                     .lock()
                     .expect("Failed to lock last_slot_received");
@@ -170,32 +192,32 @@ pub fn subscribe_grpc_with_reconnection(
             };
 
             let (_sub_tx, stream) = match client
-                .subscribe_with_request(Some(blocks_subscribe_request.clone()))
+                .subscribe_with_request(Some(blocks_subscribe_request))
                 .await
             {
                 Ok(subscription) => {
                     if let Some(slot) = from_slot {
-                        tracing::info!("Reconnected to Yellowstone GRPC replaying from slot {}", slot);
+                        tracing::info!(
+                            "Reconnected to Yellowstone GRPC replaying from slot {}",
+                            slot
+                        );
                     }
                     subscription
                 }
-                Err(e) if from_slot.is_some() => {
+                Err(e) => {
+                    reconnect_failed_since.get_or_insert_with(Instant::now);
                     tracing::error!(
-                        "Failed to subscribe to Yellowstone GRPC with from_slot {:?}, retrying without it: {:?}",
+                        "Failed to subscribe to Yellowstone GRPC (from_slot {:?}): {:?}",
                         from_slot,
                         e
                     );
                     metrics::increment_grpc_errors();
-                    client
-                        .subscribe_with_request(Some(SubscribeRequest {
-                            from_slot: None,
-                            ..blocks_subscribe_request
-                        }))
-                        .await
-                        .expect("Failed to subscribe to Yellowstone GRPC")
+                    continue;
                 }
-                Err(e) => panic!("Failed to subscribe to Yellowstone GRPC: {:?}", e),
             };
+
+            // Connected and subscribed: reset the give-up window.
+            reconnect_failed_since = None;
 
             let buffer_channel_rx_len_clone = buffer_channel_rx_len.clone();
             let mut grpc_current_errors = 0;
