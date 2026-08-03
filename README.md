@@ -177,6 +177,16 @@ cargo run -p cloudbreak-migration -- fresh     # Drop all, reapply
 cargo run -p cloudbreak-migration -- refresh   # Rollback all, reapply
 ```
 
+> **⚠️ The database is ephemeral, and each run expects a clean, empty schema.** The main
+> data tables (`accounts`, `snapshot_accounts`, and their partitions) are created as Postgres
+> **`UNLOGGED`** tables — they trade crash-durability for write throughput, so a Postgres
+> crash or restart **truncates** them. Cloudbreak is designed around this: the indexer
+> rebuilds state from the snapshot + live gRPC stream, it does **not** treat the database as
+> durable storage. Because of that, **do not reuse a dirty database between runs** — start each
+> run against a freshly-created, empty schema. Reset with `cargo run -p cloudbreak-migration --
+> fresh` (drop all + reapply) or `refresh` (rollback all + reapply), or drop and recreate the
+> database, rather than pointing a new run at leftover tables from a previous one.
+
 See [`crates/migration/README.md`](crates/migration/README.md) for the full config reference (partitioning shapes, per-index toggles, env vars, and CLI flags).
 
 ##### Table Partitioning & Indexes
@@ -228,7 +238,7 @@ cargo run -p cloudbreak -- --config ./cloudbreak.query-tracker.toml query-tracke
 **First startup notes:**
 
 - If `[snapshot]` is configured, the indexer will download a full Solana snapshot on first start. This can be **very large** (100+ GB for mainnet) and take significant time. With the default `tracker-config.yml` (which uses the public, rate-limited `https://api.mainnet.solana.com` endpoint), the download can also be throttled, so allow extra time or point `tracker-config.yml` at your own snapshot source — see [Cluster Tracker](#cluster-tracker). For a lighter local setup, either remove the `[snapshot]` section to skip snapshot loading entirely (the indexer will begin from live gRPC data only), or index a small program like `Stake11111111111111111111111111111111111111`.
-- **The correct, healthy steady state requires the snapshot to be loaded.** Until the indexer finishes snapshot processing, the database holds only the partial data streamed in live from gRPC, and the `service_health` row stays unhealthy — so `getHealth` will return an error. This is expected: `getSlot` and `getProgramAccounts` work immediately as data flows in, but `getHealth` is intentionally the last thing to clear. **Running without `[snapshot]` is only meant for a quick smoke test of the full setup, or for iterating on a code change that doesn't need a complete dataset** — in that mode `getHealth` will *never* clear, by design. See [Troubleshooting: `getHealth` returns `INTERNAL_ERROR`](#gethealth-returns-internal_error) for details.
+- **The correct, healthy steady state requires the snapshot to be loaded.** When `[snapshot]` is configured, the indexer stays unhealthy until snapshot processing finishes — the database holds only the partial data streamed in live from gRPC until then, and the `service_health` row (and `getHealth`) stays unhealthy. This is expected: `getSlot` works immediately as data flows in, but health is intentionally the last thing to clear, and while it is unhealthy the slot-gated account methods (`getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`, the token methods, `simulateTransaction`) return `NODE_UNHEALTHY`. **Running without `[snapshot]` is only meant for a quick smoke test of the full setup, or for iterating on a code change that doesn't need a complete dataset** — in that mode there is no startup snapshot to wait on, so the node reports **healthy** as soon as it begins processing blocks and serves those account methods against the partial live dataset (do **not** treat a no-snapshot node as a source of complete state). See [Troubleshooting: `getHealth` returns `INTERNAL_ERROR`](#gethealth-returns-internal_error) for details.
 - The API example config has `[tracing] enabled = true`, which sends traces to the Tempo instance from Docker Compose. If you're not running the compose stack, set `enabled = false` or remove the `[tracing]` section to avoid connection errors in logs.
 
 #### Manual PostgreSQL Setup (Alternative)
@@ -322,9 +332,10 @@ If you want to run a tracker outside Compose, point `endpoint` at it.
 
 When this section is present, the indexer downloads and processes snapshots on startup for fast bootstrapping.
 
-| Key                        | Type    | Default | Description                                                     |
-| -------------------------- | ------- | ------- | --------------------------------------------------------------- |
-| `accounts-file-concurency` | `usize` | (none)  | Max number of `AccountsFile` entries to process simultaneously. |
+| Key                             | Type    | Default | Description                                                                                                                                                                                                             |
+| ------------------------------- | ------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `accounts-file-concurency`      | `usize` | (none)  | Max number of `AccountsFile` entries to process simultaneously.                                                                                                                                                       |
+| `gap-fill-max-snapshot-retries` | `u32`   | `10`    | Max consecutive gap-filling iterations (~30 s each) allowed to fail fetching a covering snapshot pair from the tracker before the self-healing task gives up and fails the indexer. Resets on the first successful fetch. |
 
 #### `[snapshot.tracker_endpoint]` (optional)
 
@@ -619,7 +630,7 @@ The indexer includes a self-healing mechanism that automatically detects and rep
 
 2. **Pause + mark unhealthy:** The instant a gap is confirmed, finalization is **paused** and the service is flagged **unhealthy** via the `service_health` table. Live finalized notifications keep buffering (bounded by `finalize-slot-buffer-size`, then back-pressuring the stream) but are not applied until the gap is repaired, preserving in-order finalization.
 
-3. **Gap filling via incremental snapshots:** Every 30 s a background task processes confirmed gaps by asking the cluster tracker for an incremental snapshot pair covering the newest missing slot, downloading it (into a timestamped directory), and processing **only the gap slots**. Repaired accounts are written to the database and enqueued for finalization directly (snapshot data is already finalized). Gap slots that have **no accounts in the snapshot** are empty/skipped slots: they are logged (target `self_healing_empty_slots`) and dropped from the list. If the tracker has no covering pair yet, the task retries on the next tick.
+3. **Gap filling via incremental snapshots:** Every 30 s a background task processes confirmed gaps by asking the cluster tracker for an incremental snapshot pair covering the newest missing slot, downloading it (into a timestamped directory), and processing **only the gap slots**. Repaired accounts are written to the database and enqueued for finalization directly (snapshot data is already finalized). Gap slots that have **no accounts in the snapshot** are empty/skipped slots: they are logged (target `self_healing_empty_slots`) and dropped from the list. If the tracker has no covering pair yet, the task retries on the next tick, up to `gap-fill-max-snapshot-retries` (default 10) consecutive attempts — past that the indexer gives up and exits with an error rather than staying unhealthy forever. The counter resets as soon as a snapshot pair is fetched successfully.
 
 4. **Missed finalized notifications:** A reconnect can also drop finalized notifications for slots just *below* a large gap. When finalizing a live slot the finalizer walks its ancestor chain (hash-checked) to finalize any ancestors whose notification was missed; additionally the slot just before each repaired gap (`gap_start - 1`) is seeded so its ancestors are caught even though repaired slots carry no chain data to bridge the walk.
 

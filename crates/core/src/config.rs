@@ -418,6 +418,20 @@ pub struct SnapshotConfigOnIndexer {
     /// startup processing) uses the same per-index toggles as a stand-alone snapshot run.
     #[serde(rename = "pg-indexes", default)]
     pub pg_indexes: SnapshotPgIndexesConfig,
+    /// Maximum number of consecutive gap-filling iterations that may fail to fetch a covering
+    /// snapshot pair from the tracker before the self-healing task gives up and fails the indexer.
+    /// The counter resets as soon as a snapshot pair is fetched successfully.
+    #[serde(
+        rename = "gap-fill-max-snapshot-retries",
+        default = "SnapshotConfigOnIndexer::default_gap_fill_max_snapshot_retries"
+    )]
+    pub gap_fill_max_snapshot_retries: u32,
+}
+
+impl SnapshotConfigOnIndexer {
+    pub fn default_gap_fill_max_snapshot_retries() -> u32 {
+        10
+    }
 }
 
 impl TryLoadConfig for IndexConfig {}

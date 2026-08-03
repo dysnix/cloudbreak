@@ -21,10 +21,8 @@ use async_stream::try_stream;
 use cloudbreak_core::modules::rpc_filter_type::{
     RpcProgramAccountsConfig, account_matches_value_cmps, has_value_cmp,
 };
-use cloudbreak_entity::slots;
 use futures::{Stream, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
-use sea_orm::EntityTrait;
 use sea_orm::sqlx::postgres::PgRow;
 use sea_orm::sqlx::{self, Row};
 use solana_account::AccountSharedData;
@@ -95,27 +93,7 @@ pub async fn get_program_accounts(
         .transpose()?
         .unwrap_or(CommitmentLevel::Finalized);
 
-    // If the slot syncronizer is enabled, use the cached slot data, otherwise query the database
-    let (latest_slot, block_time) = match &state.slot_syncronizer_data {
-        Some(data) => {
-            let data = data.read().expect("Failed to read slot syncronizer data");
-
-            (
-                data.get_slot_for_commitment(commitment),
-                data.get_block_time_for_commitment(commitment),
-            )
-        }
-        None => {
-            let slot_model = slots::Entity::find_by_id(commitment as i32)
-                .one(&state.database)
-                .instrument(tracing::info_span!("slot_db"))
-                .await?;
-
-            let model = slot_model.ok_or(RpcError::InternalError)?;
-
-            (model.slot as u64, model.block_time)
-        }
-    };
+    let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 
     let context_slot = if let Some(with_context) = config.with_context {
         if with_context {

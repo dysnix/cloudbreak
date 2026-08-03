@@ -3,6 +3,8 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use cloudbreak_core::IndexConfig;
+use cloudbreak_entity::accounts;
 use sea_orm::{
     ActiveValue::{NotSet, Set},
     DatabaseConnection,
@@ -14,8 +16,6 @@ use tokio::{
 };
 use yellowstone_grpc_proto::geyser::CommitmentLevel;
 use yellowstone_grpc_proto::geyser::SubscribeUpdateBlock;
-use cloudbreak_core::IndexConfig;
-use cloudbreak_entity::accounts;
 
 use crate::indexer::{AccountsReceivedPerBlock, IndexerState};
 use crate::modules::snapshot::SnapshotProcessingState;
@@ -33,7 +33,7 @@ pub async fn save_block(
         snapshot_processing_state,
         self_healing_state: _,
         slot_finalizer,
-        updated_accounts_during_startup: _,
+        updated_accounts_during_startup,
         buffer_channel_rx_len: _,
         finalize_slot_buffer_size,
         accounts_owner_map,
@@ -48,7 +48,7 @@ pub async fn save_block(
     modules::snapshot::process_snapshot_if_needed(
         config.clone(),
         slot,
-        snapshot_processing_state.clone(),
+        &updated_accounts_during_startup,
         finalize_slot_buffer_size.clone(),
         accounts_owner_map.clone(),
     )
@@ -232,6 +232,7 @@ pub async fn save_block(
         slot,
         block.block_time,
         CommitmentLevel::Confirmed,
+        updated_accounts_during_startup.health.is_healthy(),
         db,
         &config,
     )

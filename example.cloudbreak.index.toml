@@ -4,6 +4,10 @@ accounts-owner-map-enabled = false
 
 [snapshot]
 accounts-file-concurency = 32
+# Max consecutive gap-filling iterations allowed to fail fetching a covering
+# snapshot from the tracker before the indexer gives up and exits. Resets on the
+# first successful fetch. (~30s per attempt.)
+gap-fill-max-snapshot-retries = 10
 
 [snapshot.pg-indexes]
 idx_snapshot_accounts_pubkey = false
