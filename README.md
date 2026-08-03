@@ -381,6 +381,9 @@ Shared across all services. Controls the SeaORM/SQLx connection pool and query t
 | `chunk-size`           | `usize`  | `1000`            | Chunk size for subscription events.                                                  |
 | `max-chunk-bytes-data` | `usize`  | `2097152` (2 MiB) | Max bytes per data chunk.                                                            |
 | `max-grpc-errors`      | `usize`  | **required**      | Max gRPC errors before attempting reconnection (always reconnects on stream `None`). |
+| `reconnect-give-up`    | `Duration` | `"600s"`        | How long to keep retrying (re)connection/subscription before giving up and panicking. |
+| `reconnect-backoff`    | `Duration` | `"5s"`          | Delay between (re)connection/subscription attempts.                                  |
+| `reconnect-from-slot-retain` | `Duration` | `"300s"`  | How long a reconnection keeps replaying from the last received slot before dropping `from_slot` (the server may no longer have it buffered). |
 
 #### `[programs]`
 

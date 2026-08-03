@@ -59,6 +59,29 @@ pub struct GrpcConfig {
     ///  (it will always reconnect on a single stream `None`)
     #[serde(rename = "max-grpc-errors")]
     pub max_grpc_errors: usize,
+    /// How long to keep retrying (re)connection/subscription before giving up and panicking.
+    #[serde(
+        rename = "reconnect-give-up",
+        default = "GrpcConfig::default_reconnect_give_up",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub reconnect_give_up: Duration,
+    /// Delay between (re)connection/subscription attempts.
+    #[serde(
+        rename = "reconnect-backoff",
+        default = "GrpcConfig::default_reconnect_backoff",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub reconnect_backoff: Duration,
+    /// How long a reconnection keeps replaying from the last received slot (`from_slot`). Once we
+    /// have been failing for longer than this, subscribe without `from_slot` (the server may not
+    /// have it buffered).
+    #[serde(
+        rename = "reconnect-from-slot-retain",
+        default = "GrpcConfig::default_reconnect_from_slot_retain",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub reconnect_from_slot_retain: Duration,
 }
 
 impl GrpcConfig {
@@ -78,6 +101,15 @@ impl GrpcConfig {
     }
     const fn default_max_chunk_bytes_data() -> usize {
         2 * 1024 * 1024
+    }
+    const fn default_reconnect_give_up() -> Duration {
+        Duration::from_secs(600)
+    }
+    const fn default_reconnect_backoff() -> Duration {
+        Duration::from_secs(5)
+    }
+    const fn default_reconnect_from_slot_retain() -> Duration {
+        Duration::from_secs(300)
     }
 }
 
