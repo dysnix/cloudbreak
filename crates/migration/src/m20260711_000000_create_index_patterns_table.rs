@@ -32,6 +32,9 @@
 //!   `last_create_error`
 //! - supply (Postgres side): `last_idx_scan`, `last_seen_used`, `index_bytes`
 //! - discrepancy: `discrepancy_state`, `discrepancy_ratio`, `discrepancy_at`
+//! - explain (optional pass): `explain_state` — which physical tables the
+//!   planner would use the index on (`none` / `accounts_table` /
+//!   `snapshot_accounts_table` / `both`), `NULL` until the pass runs
 //!
 //! `status` is one of `candidate` / `created` / `evicted` / `rejected` (the last
 //! set by the latency regression guard and, unlike `evicted`, not resurrected by
@@ -107,7 +110,13 @@ CREATE TABLE IF NOT EXISTS index_patterns (
 
     discrepancy_state TEXT,
     discrepancy_ratio DOUBLE PRECISION,
-    discrepancy_at    TIMESTAMPTZ
+    discrepancy_at    TIMESTAMPTZ,
+
+    -- latest verdict from the optional EXPLAIN sampling pass: which physical
+    -- tables the planner would actually use this index on. NULL until the pass
+    -- has run (or when explain-enabled is off). One of 'none' / 'accounts_table'
+    -- / 'snapshot_accounts_table' / 'both'.
+    explain_state     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_index_patterns_status ON index_patterns (status);
 ";

@@ -34,6 +34,7 @@
 
 use crate::modules::INDEX_TABLES;
 use crate::modules::store::Store;
+use crate::modules::store::patterns::explain_state;
 use cloudbreak_core::QueryTrackerConfig;
 use cloudbreak_core::modules::index_identity::IndexIdentity;
 use cloudbreak_core::modules::rpc_filter_type::{RpcFilterType, RpcProgramAccountsConfig};
@@ -66,11 +67,14 @@ async fn run_pass(store: &Store) -> Result<(), DbErr> {
         };
         // Real memcmp values from the stored example (empty ⇒ fall back to zeros).
         let example = example_memcmps(row.example_request.as_ref());
-        // The index pair spans both tables; probe each and report per table.
-        for table in INDEX_TABLES {
+        // The index pair spans both tables; probe each, report per table, and
+        // fold the two verdicts into one persisted state (`accounts` = table 0,
+        // `snapshot_accounts` = table 1).
+        let mut used = [false; INDEX_TABLES.len()];
+        for (i, table) in INDEX_TABLES.iter().enumerate() {
             let index_name = identity.pg_index_name(table);
             match planner_would_use(store, &identity, &index_name, table, &example).await {
-                Ok(true) => {}
+                Ok(true) => used[i] = true,
                 Ok(false) => warn!(
                     target: "query_tracker_explain",
                     "planner would NOT use '{}' on {table} for its own probe query — likely stale \
@@ -81,6 +85,20 @@ async fn run_pass(store: &Store) -> Result<(), DbErr> {
                     "EXPLAIN probe failed for '{}' on {table}: {e:?}", row.human_name
                 ),
             }
+        }
+        // INDEX_TABLES is [accounts, snapshot_accounts]; persist the combined
+        // verdict so the debug endpoints can surface it.
+        let state = match (used[0], used[1]) {
+            (false, false) => explain_state::NONE,
+            (true, false) => explain_state::ACCOUNTS,
+            (false, true) => explain_state::SNAPSHOT,
+            (true, true) => explain_state::BOTH,
+        };
+        if let Err(e) = store.set_explain_state(&row.pattern_id, state).await {
+            error!(
+                target: "query_tracker_explain",
+                "failed to persist explain_state for '{}': {e:?}", row.human_name
+            );
         }
     }
     Ok(())

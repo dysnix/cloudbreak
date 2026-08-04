@@ -27,6 +27,21 @@ pub mod status {
     pub const REJECTED: &str = "rejected";
 }
 
+/// Latest verdict of the optional `EXPLAIN` sampling pass: which physical tables
+/// the planner would actually use the index on. Stored as text for legibility
+/// (like [`status`]); the column is `NULL` until the pass runs (or when
+/// `explain-enabled` is off). See `crate::stats::explain`.
+pub mod explain_state {
+    /// Planner would not use the index on either table.
+    pub const NONE: &str = "none";
+    /// Planner would use it on `accounts` only.
+    pub const ACCOUNTS: &str = "accounts_table";
+    /// Planner would use it on `snapshot_accounts` only.
+    pub const SNAPSHOT: &str = "snapshot_accounts_table";
+    /// Planner would use it on both tables.
+    pub const BOTH: &str = "both";
+}
+
 /// In-memory view of an `index_patterns` row (only the columns consumers need).
 ///
 /// Each field maps 1:1 to a column defined in the `index_patterns` migration
@@ -88,6 +103,10 @@ pub struct PatternRow {
     pub discrepancy_state: Option<String>,
     /// Last computed demand/supply divergence ratio backing `discrepancy_state`.
     pub discrepancy_ratio: Option<f64>,
+    /// Latest `EXPLAIN` sampling verdict — which physical tables the planner
+    /// would use this index on. One of the [`explain_state`] constants, or
+    /// `None` until the (optional) explain pass has run for this pattern.
+    pub explain_state: Option<String>,
 }
 
 impl PatternRow {

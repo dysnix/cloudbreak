@@ -34,7 +34,8 @@ const PATTERN_COLUMNS: &str = "pattern_id, program, human_name, offsets_lengths,
      example_request, \
      demand_count, demand_at_create, total_cost_us, failed_count, \
      cost_with_index_us, cost_with_index_count, cost_without_index_us, cost_without_index_count, \
-     variety_estimate, status, last_idx_scan, index_bytes, discrepancy_state, discrepancy_ratio";
+     variety_estimate, status, last_idx_scan, index_bytes, discrepancy_state, discrepancy_ratio, \
+     explain_state";
 
 /// Aggregate counts for metrics. `created`/`candidate`/`evicted`/`rejected`
 /// partition the table by lifecycle status (their sum is the total);
@@ -469,6 +470,21 @@ impl Store {
             .map(|_| ())
     }
 
+    /// Record the latest `EXPLAIN` sampling verdict for a pattern (which physical
+    /// tables the planner would use its index on). `state` is one of the
+    /// [`patterns::explain_state`] constants. Written only by the optional
+    /// explain pass, so the column stays `NULL` when that pass is disabled.
+    pub async fn set_explain_state(&self, pattern_id: &str, state: &str) -> Result<(), DbErr> {
+        self.db
+            .execute(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                "UPDATE index_patterns SET explain_state = $2 WHERE pattern_id = $1",
+                [pattern_id.into(), state.into()],
+            ))
+            .await
+            .map(|_| ())
+    }
+
     // ---- catalog reads ----------------------------------------------------
 
     /// `(index_name, summed idx_scan, summed bytes)` for every auto-index on the
@@ -622,5 +638,6 @@ fn row_to_pattern(row: &QueryResult) -> Result<PatternRow, DbErr> {
         index_bytes: row.try_get("", "index_bytes")?,
         discrepancy_state: row.try_get("", "discrepancy_state")?,
         discrepancy_ratio: row.try_get("", "discrepancy_ratio")?,
+        explain_state: row.try_get("", "explain_state")?,
     })
 }
