@@ -121,7 +121,12 @@ async fn run_pass(store: &Store, config: &QueryTrackerConfig) -> Result<(), DbEr
     // Least-useful-first, each with its score (the inverse of the creation
     // ranking), so we drop straight from the top until back at target.
     let candidates = store
-        .eviction_candidates(config.priority_mode, min_idle, min_age)
+        .eviction_candidates(
+            config.priority_mode,
+            config.without_index_compensation_factor,
+            min_idle,
+            min_age,
+        )
         .await?;
     if candidates.is_empty() {
         return Ok(());
@@ -220,6 +225,7 @@ async fn run_regression_guard(store: &Store, config: &QueryTrackerConfig) -> Res
         .regression_candidates(
             config.index_min_age_grace.as_secs() as i64,
             config.index_regression_ratio,
+            config.without_index_compensation_factor,
         )
         .await?;
 
@@ -229,15 +235,18 @@ async fn run_regression_guard(store: &Store, config: &QueryTrackerConfig) -> Res
 
     for row in &rows {
         let avg_with = avg_us(row.cost_with_index_us, row.cost_with_index_count);
-        let avg_without = avg_us(row.cost_without_index_us, row.cost_without_index_count);
+        let avg_without_raw = avg_us(row.cost_without_index_us, row.cost_without_index_count);
+        let avg_without = avg_without_raw * config.without_index_compensation_factor;
 
         match config.index_regression_guard {
             IndexRegressionGuard::Warn => {
                 warn!(
                     target: "query_tracker_regression",
                     "index '{}' is slower WITH the index than without: with~{avg_with:.0}us vs \
-                     without~{avg_without:.0}us (>{:.2}x; {}/{} with/without requests); warn mode, keeping it",
-                    row.human_name, config.index_regression_ratio,
+                     without~{avg_without:.0}us (raw~{avg_without_raw:.0}us ×{:.2} compensation; \
+                     >{:.2}x; {}/{} with/without requests); warn mode, keeping it",
+                    row.human_name, config.without_index_compensation_factor,
+                    config.index_regression_ratio,
                     row.cost_with_index_count, row.cost_without_index_count
                 );
             }
@@ -302,6 +311,7 @@ async fn pending_creation_scores(
     let scored = store
         .top_candidates_scored(
             config.priority_mode,
+            config.without_index_compensation_factor,
             config.index_generation_threshold,
             config.cost_eligibility_threshold_us,
             limit,

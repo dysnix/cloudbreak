@@ -162,12 +162,13 @@ impl Store {
     pub async fn top_candidates(
         &self,
         mode: PriorityMode,
+        compensation: f64,
         threshold: u32,
         cost_eligibility_us: Option<u64>,
         limit: u64,
     ) -> Result<Vec<PatternRow>, DbErr> {
         Ok(self
-            .top_candidates_scored(mode, threshold, cost_eligibility_us, limit)
+            .top_candidates_scored(mode, compensation, threshold, cost_eligibility_us, limit)
             .await?
             .into_iter()
             .map(|(row, _)| row)
@@ -180,11 +181,12 @@ impl Store {
     pub async fn top_candidates_scored(
         &self,
         mode: PriorityMode,
+        compensation: f64,
         threshold: u32,
         cost_eligibility_us: Option<u64>,
         limit: u64,
     ) -> Result<Vec<(PatternRow, f64)>, DbErr> {
-        let score = prioritization::score_expr(mode);
+        let score = prioritization::score_expr(mode, compensation);
         let cost_gate = match cost_eligibility_us {
             Some(us) => format!(" AND (total_cost_us::float8 / GREATEST(demand_count, 1)) >= {us}"),
             None => String::new(),
@@ -312,10 +314,11 @@ impl Store {
     pub async fn eviction_candidates(
         &self,
         mode: PriorityMode,
+        compensation: f64,
         min_idle_secs: i64,
         min_age_secs: i64,
     ) -> Result<Vec<(PatternRow, f64)>, DbErr> {
-        let score = prioritization::score_expr(mode);
+        let score = prioritization::score_expr(mode, compensation);
         let sql = format!(
             "SELECT {PATTERN_COLUMNS}, ({score})::float8 AS score FROM index_patterns \
              WHERE status = '{created}' \
@@ -358,12 +361,16 @@ impl Store {
     /// `min_age_secs` (the same lifetime grace idle eviction uses), by which
     /// point it has had time to gather with-index latency to compare against its
     /// frozen without-index baseline. Patterns with no with-index traffic have a
-    /// zero with-index average and so never trip the ratio. These are the
-    /// drop/warn candidates for the regression guard.
+    /// zero with-index average and so never trip the ratio. The without-index
+    /// average is first scaled by `compensation`
+    /// (`without-index-compensation-factor`), so a scan whose wall-clock is
+    /// deflated by parallel workers is not mistaken for a cheaper alternative.
+    /// These are the drop/warn candidates for the regression guard.
     pub async fn regression_candidates(
         &self,
         min_age_secs: i64,
         ratio: f64,
+        compensation: f64,
     ) -> Result<Vec<PatternRow>, DbErr> {
         let sql = format!(
             "SELECT {PATTERN_COLUMNS} FROM index_patterns \
@@ -371,9 +378,10 @@ impl Store {
                AND cost_with_index_count > 0 \
                AND EXTRACT(EPOCH FROM (now() - COALESCE(created_at, first_seen_at))) > {min_age_secs} \
                AND (cost_with_index_us::float8 / GREATEST(cost_with_index_count, 1)) \
-                 > (cost_without_index_us::float8 / GREATEST(cost_without_index_count, 1)) * {ratio} \
+                 > {without} * {ratio} \
              ORDER BY pattern_id ASC",
             created = status::CREATED,
+            without = prioritization::compensated_without_avg_expr(compensation),
         );
         let rows = self
             .db
@@ -406,13 +414,14 @@ impl Store {
     /// Flip `rejected` patterns back to `candidate` once fresh evidence justifies
     /// retrying the index. A pattern must have been rejected for at least
     /// `retry_delay_secs` — time spent accumulating without-index samples again —
-    /// and its without-index average measured **since rejection** must exceed the
-    /// with-index average recorded then (times `ratio` for hysteresis).
-    /// Returns the number promoted.
+    /// and its without-index average measured **since rejection** (scaled by
+    /// `compensation`, as in detection) must exceed the with-index average
+    /// recorded then (times `ratio` for hysteresis). Returns the number promoted.
     pub async fn promote_recovered_rejections(
         &self,
         retry_delay_secs: i64,
         ratio: f64,
+        compensation: f64,
     ) -> Result<u64, DbErr> {
         let res = self
             .db
@@ -429,7 +438,7 @@ impl Store {
                        AND (cost_without_index_count - COALESCE(without_index_at_reject_count, 0)) > 0 \
                        AND ((cost_without_index_us - COALESCE(without_index_at_reject_us, 0))::float8 \
                             / GREATEST(cost_without_index_count \
-                                       - COALESCE(without_index_at_reject_count, 0), 1)) \
+                                       - COALESCE(without_index_at_reject_count, 0), 1)) * {compensation} \
                            > rejected_with_index_avg_us * {ratio}"
                 ),
             ))
@@ -493,6 +502,40 @@ impl Store {
                 ))
             })
             .collect()
+    }
+
+    /// Physical index names that a query plan may actually reference for the
+    /// partitioned index `parent`: every leaf of its partition tree plus the
+    /// parent itself. On a partitioned table `CREATE INDEX <parent> ON accounts`
+    /// builds a partitioned parent index (never scanned directly, so it never
+    /// appears in a plan) and an auto-named child index on each partition — and
+    /// those child names are what `EXPLAIN` prints. So a probe that wants to know
+    /// "does the plan use this index" must match against these members, not the
+    /// parent name alone. Mirrors the partition-tree walk in
+    /// [`Store::read_auto_index_supply`]; a plain (non-partitioned) index yields
+    /// no tree rows and falls back to its own name via `COALESCE`.
+    pub async fn index_member_names(&self, parent: &str) -> Result<Vec<String>, DbErr> {
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                "SELECT m.relname AS name \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public' \
+                 LEFT JOIN LATERAL pg_partition_tree(c.oid) t ON true \
+                 JOIN pg_class m ON m.oid = COALESCE(t.relid, c.oid) \
+                 WHERE c.relkind IN ('i', 'I') AND c.relname = $1",
+                [parent.into()],
+            ))
+            .await?;
+        let mut names: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.try_get::<String>("", "name").ok())
+            .collect();
+        if !names.iter().any(|n| n == parent) {
+            names.push(parent.to_string());
+        }
+        Ok(names)
     }
 
     /// Number of indexes on `table` (used for the cap / fill ratio).

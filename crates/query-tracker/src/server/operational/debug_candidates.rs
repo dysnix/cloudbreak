@@ -27,6 +27,7 @@ pub async fn handle(state: &Arc<AppState>) -> Response<Full<Bytes>> {
         .store
         .top_candidates_scored(
             cfg.priority_mode,
+            cfg.without_index_compensation_factor,
             cfg.index_generation_threshold,
             cfg.cost_eligibility_threshold_us,
             DEBUG_CANDIDATE_LIMIT,

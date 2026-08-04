@@ -13,6 +13,14 @@
 //! executes) on a synthetic probe query shaped like the index's partial
 //! predicate, and checking whether the plan references the index.
 //!
+//! Because `accounts` / `snapshot_accounts` are partitioned, the physical index
+//! is a partitioned *parent* (never scanned directly, so it never appears in a
+//! plan) plus an auto-named child index on each partition — and those child
+//! names are what `EXPLAIN` prints. The check therefore matches the plan against
+//! every member of the index's partition tree (see `Store::index_member_names`),
+//! not the parent name, which alone would look "unused" for every index even
+//! while its leaves are being scanned.
+//!
 //! The probe uses the row's stored `example_request` (a real request that maps to
 //! the identity) so the memcmp constants are realistic values Postgres has
 //! statistics for, it falls back to zeros per column when no
@@ -80,6 +88,13 @@ async fn run_pass(store: &Store) -> Result<(), DbErr> {
 
 /// Run `EXPLAIN` on a synthetic query matching the index's partial predicate on
 /// `table` and return whether the resulting plan references `index_name`.
+///
+/// On a partitioned table the plan never names the partitioned parent index
+/// (`index_name`) — it scans the partitions and prints their auto-named child
+/// indexes — so we match the plan against every physical member of the index
+/// (parent + partition leaves) as resolved by [`Store::index_member_names`].
+/// Matching the parent name alone would report "not used" for every index even
+/// while its leaves are being scanned.
 async fn planner_would_use(
     store: &Store,
     identity: &IndexIdentity,
@@ -103,7 +118,9 @@ async fn planner_would_use(
             plan.push('\n');
         }
     }
-    Ok(plan.contains(index_name))
+
+    let members = store.index_member_names(index_name).await?;
+    Ok(members.iter().any(|name| plan.contains(name.as_str())))
 }
 
 /// A representative query for `identity` on `table`: filters on `owner` (+

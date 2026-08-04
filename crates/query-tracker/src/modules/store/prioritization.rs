@@ -39,7 +39,11 @@ pub const SCANS_PER_REQUEST: i64 = 2;
 /// appends `DESC`, eviction appends `ASC`; the expression itself is direction-
 /// agnostic so both stay in lockstep. Weights in [`PriorityMode::Weighted`] are
 /// numeric and embedded directly; they never come from untrusted input.
-pub fn score_expr(mode: PriorityMode) -> String {
+///
+/// `compensation` is the `without-index-compensation-factor`, inflating the
+/// without-index cost inside the latency [`gain_expr`] (see there); it is inert
+/// for every mode except `Weighted` with a non-zero `latency_weight`.
+pub fn score_expr(mode: PriorityMode, compensation: f64) -> String {
     match mode {
         PriorityMode::Frequency => "demand_count".to_string(),
         PriorityMode::Cost => "total_cost_us".to_string(),
@@ -66,7 +70,7 @@ pub fn score_expr(mode: PriorityMode) -> String {
                  (1 + {dw} * {demand} + {sw} * ({supply}::float8 / {spr}) + {fw} * {failed})",
                 avg = avg_cost_expr(),
                 lw = latency_weight,
-                gain = gain_expr(),
+                gain = gain_expr(compensation),
                 dw = demand_weight,
                 sw = supply_weight,
                 fw = failure_weight,
@@ -81,16 +85,30 @@ fn avg_cost_expr() -> String {
     "total_cost_us::float8 / GREATEST(demand_count, 1)".to_string()
 }
 
-/// Ratio of the without-index average cost to the with-index average — how many
-/// times faster the pattern is served with the index (`> 1` helps, `< 1` hurts).
-/// Returns `1` (neutral) until the pattern has served requests both with and
-/// without the index, so a ratio can actually be formed. Averages are floored at
-/// 1µs so the ratio (and the `LN` taken of it in [`score_expr`]) stays finite
-/// regardless of how cheap a side became.
-pub fn gain_expr() -> String {
-    "CASE WHEN cost_with_index_count > 0 AND cost_without_index_count > 0 \
-          THEN GREATEST(cost_without_index_us::float8 / GREATEST(cost_without_index_count, 1), 1) \
-             / GREATEST(cost_with_index_us::float8 / GREATEST(cost_with_index_count, 1), 1) \
-          ELSE 1 END"
-        .to_string()
+/// Ratio of the (compensated) without-index average cost to the with-index
+/// average — how many times faster the pattern is served with the index (`> 1`
+/// helps, `< 1` hurts). Returns `1` (neutral) until the pattern has served
+/// requests both with and without the index, so a ratio can actually be formed.
+/// Averages are floored at 1µs so the ratio (and the `LN` taken of it in
+/// [`score_expr`]) stays finite regardless of how cheap a side became.
+///
+/// `compensation` (`without-index-compensation-factor`) multiplies the
+/// without-index average before the ratio is formed, so a without-index scan
+/// whose wall-clock time is deflated by parallel workers is credited with the
+/// cost it really incurred. `1.0` leaves the raw averages untouched.
+pub fn gain_expr(compensation: f64) -> String {
+    format!(
+        "CASE WHEN cost_with_index_count > 0 AND cost_without_index_count > 0 \
+              THEN GREATEST({without}, 1) \
+                 / GREATEST(cost_with_index_us::float8 / GREATEST(cost_with_index_count, 1), 1) \
+              ELSE 1 END",
+        without = compensated_without_avg_expr(compensation),
+    )
+}
+
+/// SQL for the without-index average cost per request, scaled by
+/// `without-index-compensation-factor`. Shared by the latency [`gain_expr`] and
+/// the regression guard so both judge the with/without comparison identically.
+pub fn compensated_without_avg_expr(compensation: f64) -> String {
+    format!("(cost_without_index_us::float8 / GREATEST(cost_without_index_count, 1)) * {compensation}")
 }

@@ -29,7 +29,8 @@ index-creation-delay = "10s"
 #                                + failure-weight*failed), each count being the
 # value seen in the last rate-window. supply is halved because a served GPA scans
 # both tables of the pair (~2 idx_scan per request). "gain" scales avg_cost by the
-# measured latency win from the index: gain = 1 + latency-weight*ln(without/with),
+# measured latency win from the index:
+#   gain = 1 + latency-weight*ln((without-index-compensation-factor*without)/with),
 # neutral (=1) until the pattern has served requests both with and without the
 # index. All weights default 0.0, which degenerates to plain average cost-per-hit
 # (and needs no rate roll).
@@ -81,6 +82,15 @@ index-regression-ratio = 1.2
 # detection side needs no window of its own: an index is judged once it is older
 # than index-min-age-grace, the same grace idle eviction uses.
 index-regression-retry-delay = "6h"
+# Multiplier applied to the WITHOUT-index average cost wherever it is compared to
+# the with-index average: the weighted latency gain above AND this guard's
+# detection/recovery. Compensates for pg settings that keep the two sides from
+# being strictly comparable — e.g. a without-index getProgramAccounts fans out
+# across parallel workers, so its wall-clock looks cheap while it burns far more
+# CPU/IO than a single-worker index scan. factor > 1 inflates that measured
+# without-index cost so the index earns proportional credit (and is less likely
+# to be judged a regression). 1.0 (default) compares raw wall-clock as-is.
+without-index-compensation-factor = 1.0
 
 # --- discrepancy detection (demand vs. supply) ---
 discrepancy-enabled = true

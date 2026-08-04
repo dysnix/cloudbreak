@@ -60,6 +60,7 @@ pub async fn run(store: Store, config: QueryTrackerConfig) {
                 .promote_recovered_rejections(
                     config.index_regression_retry_delay.as_secs() as i64,
                     config.index_regression_ratio,
+                    config.without_index_compensation_factor,
                 )
                 .await
             {
@@ -107,6 +108,7 @@ pub async fn run(store: Store, config: QueryTrackerConfig) {
         let candidates = match store
             .top_candidates(
                 config.priority_mode,
+                config.without_index_compensation_factor,
                 config.index_generation_threshold,
                 config.cost_eligibility_threshold_us,
                 CANDIDATE_FETCH_LIMIT,

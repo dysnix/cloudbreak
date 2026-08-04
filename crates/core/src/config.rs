@@ -717,7 +717,8 @@ pub enum PriorityMode {
     /// total_cost_us / demand_count`, each count is the value observed in the
     /// last window, and `gain = 1 + latency_weight * ln(latency_ratio)` scales
     /// `avg_cost` by how much faster the pattern is *with* the index than without
-    /// (see `latency_weight`). The `ln` is what keeps that scaling well-behaved:
+    /// (see `latency_weight`), where `latency_ratio = (without_index_compensation_factor
+    /// × without) / with`. The `ln` is what keeps that scaling well-behaved:
     /// it grows slowly, so a wildly faster index (`latency_ratio` in the tens or
     /// hundreds) is compressed instead of dominating the ranking, while staying
     /// symmetric — `ln(1) = 0` is neutral and a harmful index (`ratio < 1`) gives
@@ -746,13 +747,15 @@ pub enum PriorityMode {
         #[serde(rename = "failure-weight", default)]
         failure_weight: f64,
         /// Weight on the measured latency **gain** from the index — the ratio of
-        /// the without-index average cost to the with-index average. Applied to
-        /// `avg_cost` as `gain = 1 + latency_weight * ln(latency_ratio)`, so a
-        /// clearly helpful index (ratio > 1) boosts the score while a harmful one
-        /// (ratio < 1) drags it down; `ln` smooths extreme ratios. Stays neutral
-        /// (`gain = 1`) until the pattern has served requests both with and
-        /// without the index (so a ratio can be formed), or when the weight is
-        /// `0`. Default `0.0`.
+        /// the (compensated) without-index average cost to the with-index
+        /// average. Applied to `avg_cost` as `gain = 1 + latency_weight *
+        /// ln(latency_ratio)`, so a clearly helpful index (ratio > 1) boosts the
+        /// score while a harmful one (ratio < 1) drags it down; `ln` smooths
+        /// extreme ratios. The without-index side is first scaled by
+        /// `without-index-compensation-factor` (a top-level key, since the
+        /// regression guard applies it too). Stays neutral (`gain = 1`) until the
+        /// pattern has served requests both with and without the index (so a
+        /// ratio can be formed), or when the weight is `0`. Default `0.0`.
         #[serde(rename = "latency-weight", default)]
         latency_weight: f64,
         /// Window over which the demand/supply/failure counts are measured. A
@@ -977,6 +980,24 @@ pub struct QueryTrackerConfig {
         deserialize_with = "deserialize_duration_required"
     )]
     pub index_regression_retry_delay: Duration,
+    /// Multiplier applied to the **without-index** average cost wherever it is
+    /// compared against the with-index average — that is, in the `weighted`
+    /// priority mode's latency gain (`ln((factor × without) / with)`) *and* in
+    /// the latency regression guard's detection and recovery comparisons.
+    ///
+    /// It compensates for Postgres settings that keep the two sides from being
+    /// strictly comparable: a without-index `getProgramAccounts` may fan out
+    /// across several parallel workers, so its wall-clock time looks small even
+    /// though it burns far more CPU/IO than a single-worker index scan. A
+    /// `factor > 1` inflates that measured without-index cost to reflect the
+    /// resources it actually consumed, so the index earns proportionally more
+    /// credit (and is less likely to be judged a regression). `1.0` (default) is
+    /// a no-op — the raw wall-clock averages are compared as-is.
+    #[serde(
+        rename = "without-index-compensation-factor",
+        default = "QueryTrackerConfig::default_without_index_compensation_factor"
+    )]
+    pub without_index_compensation_factor: f64,
 
     // ---- discrepancy detection -------------------------------------------
     /// Emit a metric/log when demand (API) and supply (`idx_scan`) diverge,
@@ -1048,6 +1069,10 @@ impl QueryTrackerConfig {
 
     fn default_index_regression_retry_delay() -> Duration {
         Duration::from_secs(6 * 3600)
+    }
+
+    const fn default_without_index_compensation_factor() -> f64 {
+        1.0
     }
 
     const fn default_discrepancy_enabled() -> bool {
@@ -1123,6 +1148,7 @@ impl Default for QueryTrackerConfig {
             index_regression_guard: IndexRegressionGuard::default(),
             index_regression_ratio: Self::default_index_regression_ratio(),
             index_regression_retry_delay: Self::default_index_regression_retry_delay(),
+            without_index_compensation_factor: Self::default_without_index_compensation_factor(),
             discrepancy_enabled: Self::default_discrepancy_enabled(),
             discrepancy_delta: Self::default_discrepancy_delta(),
             explain_enabled: Self::default_explain_enabled(),
