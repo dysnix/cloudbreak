@@ -4,4 +4,5 @@
  */
 
 pub mod account_owner_map;
+pub mod largest_accounts;
 pub mod rpc_filter_type;

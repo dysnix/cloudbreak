@@ -94,6 +94,31 @@ pub async fn get_token_largest_accounts(
             mint: pubkey.to_string(),
         })?;
 
+    let tracked = state
+        .largest_accounts_mints
+        .as_ref()
+        .is_some_and(|mints| mints.contains(&pubkey));
+    if tracked {
+        let rows =
+            crate::methods::get_largest_accounts::fetch_largest_snapshot(state, &pubkey, latest_slot)
+                .await?;
+        if !rows.is_empty() {
+            return Ok(RpcResponse {
+                context: RpcResponseContext {
+                    slot: latest_slot,
+                    api_version: None,
+                },
+                value: rows
+                    .into_iter()
+                    .map(|(address, amount)| RpcTokenAccountBalance {
+                        address: address.to_string(),
+                        amount: token_amount_to_ui_amount_v3(amount, additional_data),
+                    })
+                    .collect(),
+            });
+        }
+    }
+
     let sql_template = include_str!("../db/getTokenLargestAccounts.sql");
     let sql = sql_template.replace("$1", &mint_hex);
     let sql = sql.replace("$2", &latest_slot.to_string());

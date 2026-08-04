@@ -487,6 +487,14 @@ async fn finalize_slot(
         });
     }
 
+    if config.largest_accounts_enabled() {
+        let db_clone = db.clone();
+        let config_clone = config.clone();
+        join_set.spawn(async move {
+            db_queries::prune_largest_accounts(&db_clone, slot, &config_clone).await;
+        });
+    }
+
     let closed_accounts = updated_accounts.closed_accounts.clone();
     let db_clone = db.clone();
     let config_clone = config.clone();

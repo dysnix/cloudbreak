@@ -476,6 +476,40 @@ async fn process_single_request(
 
             json_response
         }
+        "getLargestAccounts" => {
+            let start_time = Instant::now();
+
+            let config: Option<solana_rpc_client_api::config::RpcLargestAccountsConfig> =
+                extract_param(&rpc_request.params, 0).ok().flatten();
+
+            let result = methods::get_largest_accounts::get_largest_accounts(state, config).await;
+
+            let status_label = match &result {
+                Ok(_) => "success",
+                Err(e) => {
+                    tracing::error!(
+                        target: "api_request_errors_count",
+                        "getLargestAccounts error: {:?}",
+                        e
+                    );
+                    "error"
+                }
+            };
+            metrics::CLOUDBREAK_API_REQUESTS_TOTAL
+                .with_label_values(&["getLargestAccounts", status_label])
+                .inc();
+
+            let json_response = json_serialize_response(id, result).await;
+
+            metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
+                .with_label_values(&[
+                    "getLargestAccounts",
+                    metrics::bytes_bucket(json_response.0.len() as u64),
+                ])
+                .observe(start_time.elapsed().as_millis() as f64);
+
+            json_response
+        }
         "getTokenLargestAccounts" => {
             let start_time = Instant::now();
 

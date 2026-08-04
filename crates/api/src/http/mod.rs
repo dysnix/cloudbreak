@@ -15,7 +15,9 @@ use hyper::StatusCode;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
 use solana_commitment_config::CommitmentLevel;
+use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::Response as RpcResponse;
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
@@ -52,6 +54,7 @@ pub struct CloudbreakRpcState {
     pub max_multiple_accounts: usize,
     pub simulation_supported: bool,
     pub feature_set_cache: Arc<RwLock<Option<CachedFeatureSet>>>,
+    pub largest_accounts_mints: Option<Arc<HashSet<Pubkey>>>,
 }
 
 impl CloudbreakRpcState {
@@ -73,6 +76,7 @@ impl CloudbreakRpcState {
         stakes_cache: SharedStakesSnapshot,
         max_multiple_accounts: usize,
         simulation_supported: bool,
+        largest_accounts_mints: Option<Arc<HashSet<Pubkey>>>,
     ) -> Self {
         Self {
             database,
@@ -92,6 +96,7 @@ impl CloudbreakRpcState {
             max_multiple_accounts,
             simulation_supported,
             feature_set_cache: Arc::new(RwLock::new(None)),
+            largest_accounts_mints,
         }
     }
 

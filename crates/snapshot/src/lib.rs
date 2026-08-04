@@ -15,8 +15,16 @@ use yellowstone_grpc_proto::geyser::{
     SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
 };
 use cloudbreak_core::{
-    Result, SnapshotConfig, modules::account_owner_map::AccountOwnerMap,
+    Result, SnapshotConfig,
+    modules::{
+        account_owner_map::AccountOwnerMap,
+        largest_accounts::{
+            self, LargestAccountsTracker, SOL_SENTINEL_MINT, TOKEN_2022_PROGRAM_ID,
+            TOKEN_PROGRAM_ID,
+        },
+    },
 };
+use solana_pubkey::Pubkey;
 
 use crate::{
     db_queries::SnapshotAccountVersion,
@@ -45,6 +53,7 @@ pub async fn run(
     metrics_registry: Option<prometheus::Registry>,
     buffer_size: Option<Arc<Mutex<usize>>>,
     accounts_owner_map: AccountOwnerMap,
+    largest_accounts: LargestAccountsTracker,
 ) -> Result<()> {
     let start_time = Instant::now();
 
@@ -72,6 +81,7 @@ pub async fn run(
         &database,
         config.clone(),
         accounts_owner_map.clone(),
+        largest_accounts.clone(),
     );
 
     // Process incremental snapshot only if needed
@@ -83,6 +93,7 @@ pub async fn run(
             &database,
             config.clone(),
             accounts_owner_map.clone(),
+            largest_accounts.clone(),
         )
         .await??;
 
@@ -106,12 +117,57 @@ pub async fn run(
     db_queries::clean_up_closed_accounts(&database).await?;
     db_queries::create_database_indexes(&database, &config.pg_indexes).await?;
 
+    finish_largest_accounts_bootstrap(&database, &largest_accounts).await;
+
     tracing::info!(
         "Total snapshot processing time after cleanup: {} secs",
         start_time.elapsed().as_secs_f64()
     );
 
     Ok(())
+}
+
+async fn finish_largest_accounts_bootstrap(
+    database: &DatabaseConnection,
+    largest_accounts: &LargestAccountsTracker,
+) {
+    if !largest_accounts.is_enabled() {
+        return;
+    }
+
+    let outcome = largest_accounts.finish_bootstrap();
+    for mint in &outcome.newly_stale {
+        tracing::error!(
+            target: "largest_accounts",
+            "largest accounts bootstrap left mint {} unsound, marking stale",
+            mint
+        );
+    }
+
+    if outcome.snapshots.is_empty() {
+        return;
+    }
+
+    match largest_accounts::persist_snapshots(database, &outcome.snapshots).await {
+        Ok(()) => {
+            tracing::info!(
+                target: "largest_accounts",
+                "largest accounts bootstrap persisted {} mint snapshot(s)",
+                outcome.snapshots.len()
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "largest_accounts",
+                "failed to persist largest accounts bootstrap snapshots, marking {} mint(s) stale: {:?}",
+                outcome.snapshots.len(),
+                e
+            );
+            for snapshot in &outcome.snapshots {
+                largest_accounts.mark_mint_stale(&snapshot.mint);
+            }
+        }
+    }
 }
 
 fn download_and_process_snapshot(
@@ -121,6 +177,7 @@ fn download_and_process_snapshot(
     database: &DatabaseConnection,
     config: SnapshotConfig,
     accounts_owner_map: AccountOwnerMap,
+    largest_accounts: LargestAccountsTracker,
 ) -> JoinHandle<Result<()>> {
     let db_clone = database.clone();
 
@@ -137,7 +194,14 @@ fn download_and_process_snapshot(
             tracing::error!("Failed to download snapshot: {:?} ({:?})", e, snapshot_type);
         })?;
 
-        process_downloaded_snapshot(&db_clone, snapshot_data, config, accounts_owner_map).await?;
+        process_downloaded_snapshot(
+            &db_clone,
+            snapshot_data,
+            config,
+            accounts_owner_map,
+            largest_accounts,
+        )
+        .await?;
 
         Ok(())
     })
@@ -149,6 +213,7 @@ async fn process_downloaded_snapshot(
     snapshot_data: SnapshotData,
     config: SnapshotConfig,
     accounts_owner_map: AccountOwnerMap,
+    largest_accounts: LargestAccountsTracker,
 ) -> Result<()> {
     let start_time = Instant::now();
     let total_accounts_files_opening_time_micros = Arc::new(Mutex::new(0));
@@ -229,6 +294,7 @@ async fn process_downloaded_snapshot(
             insert_into_temp_snapshot_account_versions_tx.clone();
 
         let accounts_owner_map = accounts_owner_map.clone();
+        let largest_accounts = largest_accounts.clone();
 
         account_file_workers.spawn(async move {
             let start_time = Instant::now();
@@ -246,6 +312,7 @@ async fn process_downloaded_snapshot(
             let mut all_accounts_chunks = Vec::new();
             let mut current_accounts_chunk = Vec::new();
             let mut snapshot_account_versions = Vec::new();
+            let mut largest_seed = largest_accounts.new_seed();
 
             // Collect all account offsets first
             let mut offsets = Vec::new();
@@ -263,6 +330,34 @@ async fn process_downloaded_snapshot(
                         slot: account_file_slot,
                         owner: account.owner.to_bytes().to_vec(),
                     });
+
+                    if let Some(seed) = largest_seed.as_mut() {
+                        let seed_pubkey = *account.pubkey();
+                        if account.lamports == 0 {
+                            seed.observe_close(seed_pubkey, account_file_slot, write_version);
+                        } else {
+                            seed.observe(
+                                SOL_SENTINEL_MINT,
+                                seed_pubkey,
+                                account.lamports,
+                                account_file_slot,
+                                write_version,
+                            );
+                            if (account.owner == &TOKEN_PROGRAM_ID
+                                || account.owner == &TOKEN_2022_PROGRAM_ID)
+                                && account.data.len() >= 72
+                                && largest_accounts.is_tracked(&account.data[0..32])
+                            {
+                                seed.observe(
+                                    Pubkey::try_from(&account.data[0..32]).unwrap(),
+                                    seed_pubkey,
+                                    u64::from_le_bytes(account.data[64..72].try_into().unwrap()),
+                                    account_file_slot,
+                                    write_version,
+                                );
+                            }
+                        }
+                    }
 
                     if !programs_include.is_empty() {
                         if !programs_include.contains(account.owner) {
@@ -319,6 +414,10 @@ async fn process_downloaded_snapshot(
                 }
 
                 db_queries::upsert_accounts_batched(&database, chunk).await?;
+            }
+
+            if let Some(seed) = largest_seed {
+                largest_accounts.merge_seed(seed);
             }
 
             // Send the closed accounts to the insert_into_temp_snapshot_account_versions_tx channel

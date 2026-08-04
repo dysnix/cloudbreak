@@ -473,6 +473,33 @@ pub async fn get_chain_tips(db: &DatabaseConnection) -> ChainTips {
     }
 }
 
+pub async fn prune_largest_accounts(db: &DatabaseConnection, slot: u64, config: &IndexConfig) {
+    let query_timeout = Duration::from_secs(config.database.finalize_slot_queries_timeout);
+
+    let query = db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "DELETE FROM largest_accounts la USING ( \
+            SELECT mint, MAX(slot) AS keep_slot FROM largest_accounts \
+            WHERE slot <= $1 GROUP BY mint \
+         ) keep WHERE la.mint = keep.mint AND la.slot < keep.keep_slot",
+        [Value::BigInt(Some(slot as i64))],
+    ));
+
+    let result = timeout(query_timeout, query).await.unwrap_or_else(|elapsed| {
+        tracing::error!("prune_largest_accounts timeout ERROR: {}", elapsed);
+        Err(sea_orm::DbErr::RecordNotInserted)
+    });
+
+    if let Err(e) = result {
+        metrics::LARGEST_ACCOUNTS_DB_ERRORS.inc();
+        tracing::error!(
+            "prune_largest_accounts: failed to prune for slot {}: {}",
+            slot,
+            e
+        );
+    }
+}
+
 pub async fn insert_accounts_chunk(
     db: &DatabaseConnection,
     chunk: Vec<accounts::ActiveModel>,

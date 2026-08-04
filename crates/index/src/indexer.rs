@@ -5,7 +5,10 @@
 
 use cloudbreak_core::{
     EnvironmentInfo, IndexConfig, Result as CloudbreakResult, TryLoadConfig,
-    modules::account_owner_map::AccountOwnerMap,
+    modules::{
+        account_owner_map::AccountOwnerMap,
+        largest_accounts::{self, LargestAccountsTracker, PERSISTED_TOP_N},
+    },
 };
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use std::{
@@ -49,6 +52,7 @@ pub struct IndexerState {
     pub finalize_slot_buffer_size: Arc<Mutex<usize>>,
     /// Used to track the accounts owner
     pub accounts_owner_map: AccountOwnerMap,
+    pub largest_accounts: LargestAccountsTracker,
 }
 
 pub async fn run(config: &str) -> CloudbreakResult<()> {
@@ -90,6 +94,52 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         AccountOwnerMap::default()
     };
 
+    let largest_accounts = match &config.largest_accounts {
+        Some(largest_config) if largest_config.enabled => {
+            if !config.programs.supports_simulation() {
+                panic!("largest-accounts requires an empty [programs] filter");
+            }
+            if config.snapshot.is_none() {
+                panic!("largest-accounts requires the [snapshot] section");
+            }
+            if largest_config.accounts_per_mint < PERSISTED_TOP_N {
+                panic!("largest-accounts accounts-per-mint must be at least {PERSISTED_TOP_N}");
+            }
+            LargestAccountsTracker::new(
+                largest_config
+                    .tracked_mints
+                    .iter()
+                    .map(|mint| mint.0)
+                    .collect(),
+                largest_config.accounts_per_mint,
+            )
+        }
+        _ => LargestAccountsTracker::default(),
+    };
+
+    EnvironmentInfo::upsert_largest_accounts_mints(
+        &db,
+        config
+            .largest_accounts
+            .as_ref()
+            .filter(|largest_config| largest_config.enabled)
+            .map(|largest_config| {
+                largest_config
+                    .tracked_mints
+                    .iter()
+                    .map(|mint| mint.0)
+                    .collect()
+            }),
+    )
+    .await
+    .expect("Failed to upsert largest accounts mints");
+
+    if largest_accounts.is_enabled() {
+        largest_accounts::clear_largest_accounts(&db)
+            .await
+            .expect("Failed to clear largest_accounts table");
+    }
+
     // Service health is tracked as a set of reasons (Startup is set until the startup snapshot is
     // processed; GapFill is set while a gap fill is in progress).
     let health = ServiceHealth::new(db.clone());
@@ -112,6 +162,7 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         updated_accounts_during_startup,
         finalize_slot_buffer_size: finalize_slot_buffer_size.clone(),
         accounts_owner_map,
+        largest_accounts,
     };
 
     // Used for the hash-checker to signal the main loop to stop

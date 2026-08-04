@@ -278,6 +278,16 @@ lazy_static::lazy_static! {
         "cloudbreak_finalize_slot_handler_queue_size", "Size of the finalize slot handler queue"
     )
     .expect("Failed to create finalize slot handler queue size gauge");
+
+    pub static ref LARGEST_ACCOUNTS_DB_ERRORS: Counter = Counter::new(
+        "cloudbreak_largest_accounts_db_errors", "Number of largest accounts DB write/prune errors"
+    )
+    .expect("Failed to create largest accounts DB errors counter");
+
+    pub static ref LARGEST_ACCOUNTS_STALE_MINTS: IntGauge = IntGauge::new(
+        "cloudbreak_largest_accounts_stale_mints", "Number of tracked mints marked stale in the largest accounts tracker"
+    )
+    .expect("Failed to create largest accounts stale mints gauge");
 }
 
 /// We use a guard to increment the current tokio tasks metric when a task is created and
@@ -414,5 +424,7 @@ pub fn register_collectors() {
         register!(GRPC_TOTAL_UPDATES_RECEIVED);
         register!(GRPC_BUFFER_CHANNEL_SIZE_SENDER);
         register!(FINALIZE_SLOT_DELETED_ACCOUNTS);
+        register!(LARGEST_ACCOUNTS_DB_ERRORS);
+        register!(LARGEST_ACCOUNTS_STALE_MINTS);
     });
 }

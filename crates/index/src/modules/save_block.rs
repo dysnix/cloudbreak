@@ -4,15 +4,20 @@
  */
 
 use cloudbreak_core::IndexConfig;
+use cloudbreak_core::modules::largest_accounts::{
+    self, LargestAccountsTracker, PendingLargestAccount, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID,
+};
 use cloudbreak_entity::accounts;
 use sea_orm::{
     ActiveValue::{NotSet, Set},
     DatabaseConnection,
 };
 use solana_pubkey::Pubkey;
+use std::collections::HashMap;
+use std::time::Duration;
 use tokio::{
     task::{JoinHandle, JoinSet},
-    time::Instant,
+    time::{Instant, timeout},
 };
 use yellowstone_grpc_proto::geyser::CommitmentLevel;
 use yellowstone_grpc_proto::geyser::SubscribeUpdateBlock;
@@ -37,6 +42,7 @@ pub async fn save_block(
         buffer_channel_rx_len: _,
         finalize_slot_buffer_size,
         accounts_owner_map,
+        largest_accounts,
     } = indexer_state;
 
     let start_time = Instant::now();
@@ -51,6 +57,7 @@ pub async fn save_block(
         &updated_accounts_during_startup,
         finalize_slot_buffer_size.clone(),
         accounts_owner_map.clone(),
+        largest_accounts.clone(),
     )
     .await;
 
@@ -77,9 +84,42 @@ pub async fn save_block(
         .map(|pubkey| pubkey.0.to_bytes().to_vec())
         .collect::<Vec<_>>();
 
+    let largest_enabled = largest_accounts.is_enabled();
+    let mut largest_pending: HashMap<Pubkey, PendingLargestAccount> = HashMap::new();
+
     // Create the chunks for updating the "accounts" table
     let system_program_id = [0u8; 32].to_vec();
     for account in block.accounts {
+        if largest_enabled {
+            let pubkey = Pubkey::try_from(account.pubkey.as_slice()).unwrap();
+            let is_token_owner = account.owner.as_slice() == TOKEN_PROGRAM_ID.as_ref()
+                || account.owner.as_slice() == TOKEN_2022_PROGRAM_ID.as_ref();
+            let token = if is_token_owner
+                && account.data.len() >= 72
+                && largest_accounts.is_tracked(&account.data[0..32])
+            {
+                Some((
+                    Pubkey::try_from(&account.data[0..32]).unwrap(),
+                    u64::from_le_bytes(account.data[64..72].try_into().unwrap()),
+                ))
+            } else {
+                None
+            };
+            let pending = largest_pending
+                .entry(pubkey)
+                .or_insert_with(|| PendingLargestAccount {
+                    write_version: account.write_version,
+                    lamports: account.lamports,
+                    token,
+                });
+            if account.write_version > pending.write_version {
+                *pending = PendingLargestAccount {
+                    write_version: account.write_version,
+                    lamports: account.lamports,
+                    token,
+                };
+            }
+        }
         // If the account is being closed we still add it to the hashmap for cleanup
         //  but we don't add it to the "accounts" table in a normal fashion, instead we added using [`db_queries::insert_closed_accounts`]
         if account.lamports == 0 {
@@ -227,6 +267,10 @@ pub async fn save_block(
         tracing::error!(target: "save_block_closed_accounts_insert", "failed to insert closed accounts: {:?}", e);
     }
 
+    if largest_enabled {
+        commit_largest_accounts(&largest_accounts, largest_pending, slot, db, &config).await;
+    }
+
     // Wait until the chunk processing is finished to insert the slot (this ensures that gPA calls can only read from completed slots)
     db_queries::insert_slot(
         slot,
@@ -249,4 +293,67 @@ pub async fn save_block(
 
     let elapsed = start_time.elapsed().as_secs_f64();
     metrics::record_block_processing(elapsed, "block");
+}
+
+async fn commit_largest_accounts(
+    largest_accounts: &LargestAccountsTracker,
+    largest_pending: HashMap<Pubkey, PendingLargestAccount>,
+    slot: u64,
+    db: &DatabaseConnection,
+    config: &IndexConfig,
+) {
+    let query_timeout = Duration::from_secs(config.database.save_block_queries_timeout);
+    let outcome = largest_accounts.apply_block(slot, largest_pending);
+
+    for mint in outcome.newly_stale.iter().chain(outcome.cleared.iter()) {
+        if outcome.newly_stale.contains(mint) {
+            tracing::error!(
+                target: "largest_accounts",
+                "largest accounts reservoir unsound for mint {} at slot {}, marking stale",
+                mint,
+                slot
+            );
+        }
+        let delete = timeout(query_timeout, largest_accounts::delete_mint_rows(db, mint)).await;
+        if !matches!(delete, Ok(Ok(()))) {
+            metrics::LARGEST_ACCOUNTS_DB_ERRORS.inc();
+            tracing::error!(
+                target: "largest_accounts",
+                "failed to delete largest_accounts rows for mint {}: {:?}",
+                mint,
+                delete
+            );
+        }
+    }
+
+    if !outcome.snapshots.is_empty() {
+        let persist = timeout(
+            query_timeout,
+            largest_accounts::persist_snapshots(db, &outcome.snapshots),
+        )
+        .await;
+        if !matches!(persist, Ok(Ok(()))) {
+            metrics::LARGEST_ACCOUNTS_DB_ERRORS.inc();
+            tracing::error!(
+                target: "largest_accounts",
+                "failed to persist largest_accounts snapshots for slot {}, marking {} mint(s) stale: {:?}",
+                slot,
+                outcome.snapshots.len(),
+                persist
+            );
+            for snapshot in &outcome.snapshots {
+                largest_accounts.mark_mint_stale(&snapshot.mint);
+                let delete = timeout(
+                    query_timeout,
+                    largest_accounts::delete_mint_rows(db, &snapshot.mint),
+                )
+                .await;
+                if !matches!(delete, Ok(Ok(()))) {
+                    metrics::LARGEST_ACCOUNTS_DB_ERRORS.inc();
+                }
+            }
+        }
+    }
+
+    metrics::LARGEST_ACCOUNTS_STALE_MINTS.set(largest_accounts.stale_count() as i64);
 }

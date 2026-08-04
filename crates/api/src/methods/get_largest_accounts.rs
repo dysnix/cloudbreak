@@ -1,0 +1,106 @@
+use cloudbreak_core::modules::largest_accounts::SOL_SENTINEL_MINT;
+use sea_orm::sqlx::Row;
+use sea_orm::sqlx::{self};
+use solana_commitment_config::CommitmentLevel;
+use solana_pubkey::Pubkey;
+use solana_rpc_client_api::config::RpcLargestAccountsConfig;
+use solana_rpc_client_api::response::{
+    Response as RpcResponse, RpcAccountBalance, RpcResponseContext,
+};
+use tokio::time::timeout;
+use tracing::Instrument;
+
+use crate::error::RpcError;
+use crate::http::CloudbreakRpcState;
+use crate::methods::resolve_commitment;
+use crate::{db_query, metrics};
+
+pub async fn fetch_largest_snapshot(
+    state: &CloudbreakRpcState,
+    mint: &Pubkey,
+    latest_slot: u64,
+) -> Result<Vec<(Pubkey, u64)>, RpcError> {
+    let sql_template = include_str!("../db/getLargestAccountsSnapshot.sql");
+    let mint_hex = format!("'\\x{}'::bytea", hex::encode(mint.as_ref()));
+    let sql = sql_template.replace("$1", &mint_hex);
+    let sql = sql.replace("$2", &latest_slot.to_string());
+    let sql = db_query::add_trace_traceparent_to_query(&sql);
+
+    let pool = state.database.get_postgres_connection_pool();
+    let rows = timeout(state.queries_timeout, async {
+        let span = tracing::info_span!("get_largest_accounts_snapshot_db");
+        sqlx::raw_sql(&sql).fetch_all(pool).instrument(span).await
+    })
+    .await
+    .map_err(|_elapsed| {
+        tracing::error!("largest accounts snapshot query timed out");
+        RpcError::InternalError
+    })?
+    .map_err(|e| {
+        tracing::error!("Database query error: {}", e);
+        RpcError::InternalError
+    })?;
+
+    let mut result = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let pubkey_bytes: Vec<u8> = row.get("pubkey");
+        let pubkey =
+            Pubkey::try_from(pubkey_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
+        let amount: String = row.get("amount");
+        let amount: u64 = amount.parse().map_err(|_| RpcError::InternalError)?;
+        result.push((pubkey, amount));
+    }
+
+    Ok(result)
+}
+
+#[tracing::instrument(name = "get_largest_accounts_rpc", skip_all)]
+pub async fn get_largest_accounts(
+    state: &CloudbreakRpcState,
+    config: Option<RpcLargestAccountsConfig>,
+) -> Result<RpcResponse<Vec<RpcAccountBalance>>, RpcError> {
+    let _guard = metrics::InFlightRequestGuard::new("getLargestAccounts");
+
+    if state.largest_accounts_mints.is_none() {
+        return Err(RpcError::InvalidParamsWithMessage(
+            "getLargestAccounts is not supported on this node".to_string(),
+        ));
+    }
+
+    let config = config.unwrap_or_default();
+    if config.filter.is_some() {
+        return Err(RpcError::InvalidParamsWithMessage(
+            "getLargestAccounts filter is not supported on this node".to_string(),
+        ));
+    }
+
+    let commitment = config
+        .commitment
+        .map(|commitment_config| {
+            resolve_commitment(commitment_config.commitment, state.processed_commitment)
+        })
+        .transpose()?
+        .unwrap_or(CommitmentLevel::Finalized);
+
+    let (latest_slot, _block_time) = state.latest_slot_and_block_time(commitment).await?;
+
+    let rows = fetch_largest_snapshot(state, &SOL_SENTINEL_MINT, latest_slot).await?;
+    if rows.is_empty() {
+        tracing::error!("getLargestAccounts has no snapshot at slot {}", latest_slot);
+        return Err(RpcError::InternalError);
+    }
+
+    Ok(RpcResponse {
+        context: RpcResponseContext {
+            slot: latest_slot,
+            api_version: None,
+        },
+        value: rows
+            .into_iter()
+            .map(|(pubkey, lamports)| RpcAccountBalance {
+                address: pubkey.to_string(),
+                lamports,
+            })
+            .collect(),
+    })
+}

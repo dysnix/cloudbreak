@@ -1,0 +1,815 @@
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, Statement, TransactionTrait};
+use solana_pubkey::Pubkey;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+pub const PERSISTED_TOP_N: usize = 20;
+
+pub const SOL_SENTINEL_MINT: Pubkey = Pubkey::new_from_array([0u8; 32]);
+
+pub const TOKEN_PROGRAM_ID: Pubkey =
+    Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+pub const TOKEN_2022_PROGRAM_ID: Pubkey =
+    Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+pub struct PendingLargestAccount {
+    pub write_version: u64,
+    pub lamports: u64,
+    pub token: Option<(Pubkey, u64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintSnapshot {
+    pub mint: Pubkey,
+    pub slot: u64,
+    pub rows: Vec<(Pubkey, u64)>,
+}
+
+#[derive(Debug, Default)]
+pub struct BlockOutcome {
+    pub snapshots: Vec<MintSnapshot>,
+    pub newly_stale: Vec<Pubkey>,
+    pub cleared: Vec<Pubkey>,
+}
+
+#[derive(Clone, Copy)]
+struct Entry {
+    amount: u64,
+    slot: u64,
+    write_version: u64,
+    seed: bool,
+}
+
+#[derive(Default)]
+struct MintTop {
+    entries: HashMap<Pubkey, Entry>,
+    dropped_floor: u64,
+    stale: bool,
+    last_snapshot: Vec<(Pubkey, u64)>,
+}
+
+enum ComputedTop {
+    Sound(Vec<(Pubkey, u64)>),
+    Unsound,
+}
+
+impl MintTop {
+    fn min_entry(&self) -> Option<(Pubkey, u64)> {
+        self.entries
+            .iter()
+            .min_by_key(|(pubkey, entry)| (entry.amount, *pubkey))
+            .map(|(pubkey, entry)| (*pubkey, entry.amount))
+    }
+
+    fn compute_top(&self) -> ComputedTop {
+        if self.stale {
+            return ComputedTop::Unsound;
+        }
+        let mut rows: Vec<(Pubkey, u64)> = self
+            .entries
+            .iter()
+            .map(|(pubkey, entry)| (*pubkey, entry.amount))
+            .collect();
+        rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+        rows.truncate(PERSISTED_TOP_N);
+        if rows.len() < PERSISTED_TOP_N && self.dropped_floor > 0 {
+            return ComputedTop::Unsound;
+        }
+        if let Some(last) = rows.last()
+            && last.1 < self.dropped_floor
+        {
+            return ComputedTop::Unsound;
+        }
+        ComputedTop::Sound(rows)
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Status {
+    #[default]
+    Bootstrapping,
+    Live,
+}
+
+#[derive(Default)]
+struct TrackerState {
+    status: Status,
+    max_applied_slot: u64,
+    mints: HashMap<Pubkey, MintTop>,
+    member_index: HashMap<Pubkey, Pubkey>,
+    tombstones: HashMap<Pubkey, (u64, u64)>,
+}
+
+impl TrackerState {
+    fn record_tombstone(&mut self, pubkey: Pubkey, slot: u64, write_version: u64) {
+        let entry = self.tombstones.entry(pubkey).or_insert((slot, write_version));
+        if (slot, write_version) > *entry {
+            *entry = (slot, write_version);
+        }
+    }
+
+    fn remove_member(
+        &mut self,
+        mint: Pubkey,
+        pubkey: Pubkey,
+        slot: u64,
+        write_version: u64,
+        touched: &mut HashSet<Pubkey>,
+    ) {
+        let Some(top) = self.mints.get_mut(&mint) else {
+            return;
+        };
+        let Some(entry) = top.entries.get(&pubkey) else {
+            return;
+        };
+        if (slot, write_version) > (entry.slot, entry.write_version) {
+            top.entries.remove(&pubkey);
+            if mint != SOL_SENTINEL_MINT {
+                self.member_index.remove(&pubkey);
+            }
+            touched.insert(mint);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_update(
+        &mut self,
+        mint: Pubkey,
+        pubkey: Pubkey,
+        amount: u64,
+        slot: u64,
+        write_version: u64,
+        bootstrapping: bool,
+        old_block: bool,
+        seed: bool,
+        k: usize,
+        touched: &mut HashSet<Pubkey>,
+    ) {
+        if bootstrapping
+            && let Some(tombstone) = self.tombstones.get(&pubkey)
+            && *tombstone >= (slot, write_version)
+        {
+            return;
+        }
+        let Some(top) = self.mints.get_mut(&mint) else {
+            return;
+        };
+        if let Some(entry) = top.entries.get_mut(&pubkey) {
+            if (slot, write_version) > (entry.slot, entry.write_version) {
+                *entry = Entry {
+                    amount,
+                    slot,
+                    write_version,
+                    seed,
+                };
+                touched.insert(mint);
+            }
+            return;
+        }
+        if bootstrapping {
+            top.entries.insert(
+                pubkey,
+                Entry {
+                    amount,
+                    slot,
+                    write_version,
+                    seed,
+                },
+            );
+            if mint != SOL_SENTINEL_MINT {
+                self.member_index.insert(pubkey, mint);
+            }
+            touched.insert(mint);
+            return;
+        }
+        if old_block {
+            if amount > top.dropped_floor {
+                top.dropped_floor = amount;
+                touched.insert(mint);
+            }
+            return;
+        }
+        if top.entries.len() >= k {
+            let (min_pubkey, min_amount) = top.min_entry().expect("non-empty full map");
+            if amount <= min_amount {
+                if amount > top.dropped_floor {
+                    top.dropped_floor = amount;
+                    touched.insert(mint);
+                }
+                return;
+            }
+            top.entries.remove(&min_pubkey);
+            if mint != SOL_SENTINEL_MINT {
+                self.member_index.remove(&min_pubkey);
+            }
+            top.dropped_floor = top.dropped_floor.max(min_amount);
+        }
+        top.entries.insert(
+            pubkey,
+            Entry {
+                amount,
+                slot,
+                write_version,
+                seed,
+            },
+        );
+        if mint != SOL_SENTINEL_MINT {
+            self.member_index.insert(pubkey, mint);
+        }
+        touched.insert(mint);
+    }
+
+    fn trim(&mut self, mint: Pubkey, k: usize, seed_only: bool) {
+        loop {
+            let Some(top) = self.mints.get_mut(&mint) else {
+                return;
+            };
+            if top.entries.len() <= k {
+                return;
+            }
+            let victim = top
+                .entries
+                .iter()
+                .filter(|(_, entry)| !seed_only || entry.seed)
+                .min_by_key(|(pubkey, entry)| (entry.amount, **pubkey))
+                .map(|(pubkey, entry)| (*pubkey, entry.amount));
+            let Some((pubkey, amount)) = victim else {
+                return;
+            };
+            top.entries.remove(&pubkey);
+            top.dropped_floor = top.dropped_floor.max(amount);
+            if mint != SOL_SENTINEL_MINT {
+                self.member_index.remove(&pubkey);
+            }
+        }
+    }
+
+    fn emit(&mut self, mint: Pubkey, slot: u64, outcome: &mut BlockOutcome) {
+        let Some(top) = self.mints.get_mut(&mint) else {
+            return;
+        };
+        match top.compute_top() {
+            ComputedTop::Unsound => {
+                if !top.stale {
+                    top.stale = true;
+                    outcome.newly_stale.push(mint);
+                }
+            }
+            ComputedTop::Sound(rows) if rows.is_empty() => {
+                if !top.last_snapshot.is_empty() {
+                    top.last_snapshot = Vec::new();
+                    outcome.cleared.push(mint);
+                }
+            }
+            ComputedTop::Sound(rows) => {
+                if rows != top.last_snapshot {
+                    top.last_snapshot = rows.clone();
+                    outcome.snapshots.push(MintSnapshot { mint, slot, rows });
+                }
+            }
+        }
+    }
+}
+
+pub struct SeedAccount {
+    pub pubkey: Pubkey,
+    pub amount: u64,
+    pub slot: u64,
+    pub write_version: u64,
+}
+
+pub struct LargestAccountsSeed {
+    k: usize,
+    mints: HashMap<Pubkey, Vec<SeedAccount>>,
+    closes: Vec<(Pubkey, u64, u64)>,
+}
+
+impl LargestAccountsSeed {
+    pub fn observe(&mut self, mint: Pubkey, pubkey: Pubkey, amount: u64, slot: u64, write_version: u64) {
+        let entries = self.mints.entry(mint).or_default();
+        entries.push(SeedAccount {
+            pubkey,
+            amount,
+            slot,
+            write_version,
+        });
+        if entries.len() >= self.k * 8 {
+            Self::shrink(entries, self.k);
+        }
+    }
+
+    pub fn observe_close(&mut self, pubkey: Pubkey, slot: u64, write_version: u64) {
+        self.closes.push((pubkey, slot, write_version));
+    }
+
+    fn shrink(entries: &mut Vec<SeedAccount>, k: usize) {
+        entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.amount));
+        entries.truncate(k);
+    }
+}
+
+struct Inner {
+    tracked_mints: HashSet<Pubkey>,
+    k_per_mint: usize,
+    state: Mutex<TrackerState>,
+}
+
+impl Inner {
+    fn state(&self) -> MutexGuard<'_, TrackerState> {
+        self.state
+            .lock()
+            .expect("Failed to lock largest accounts state")
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct LargestAccountsTracker(Option<Arc<Inner>>);
+
+impl LargestAccountsTracker {
+    pub fn new(tracked_mints: HashSet<Pubkey>, k_per_mint: usize) -> Self {
+        let mut mints: HashMap<Pubkey, MintTop> = tracked_mints
+            .iter()
+            .map(|mint| (*mint, MintTop::default()))
+            .collect();
+        mints.insert(SOL_SENTINEL_MINT, MintTop::default());
+        Self(Some(Arc::new(Inner {
+            tracked_mints,
+            k_per_mint,
+            state: Mutex::new(TrackerState {
+                mints,
+                ..TrackerState::default()
+            }),
+        })))
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub fn is_tracked(&self, mint_bytes: &[u8]) -> bool {
+        let Some(inner) = &self.0 else {
+            return false;
+        };
+        Pubkey::try_from(mint_bytes)
+            .is_ok_and(|mint| inner.tracked_mints.contains(&mint))
+    }
+
+    pub fn new_seed(&self) -> Option<LargestAccountsSeed> {
+        let inner = self.0.as_deref()?;
+        Some(LargestAccountsSeed {
+            k: inner.k_per_mint,
+            mints: HashMap::new(),
+            closes: Vec::new(),
+        })
+    }
+
+    pub fn merge_seed(&self, seed: LargestAccountsSeed) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        let mut state = inner.state();
+        if state.status != Status::Bootstrapping {
+            return;
+        }
+        let mut touched = HashSet::new();
+        for (pubkey, slot, write_version) in seed.closes {
+            state.max_applied_slot = state.max_applied_slot.max(slot);
+            state.record_tombstone(pubkey, slot, write_version);
+            if let Some(mint) = state.member_index.get(&pubkey).copied() {
+                state.remove_member(mint, pubkey, slot, write_version, &mut touched);
+            }
+            state.remove_member(SOL_SENTINEL_MINT, pubkey, slot, write_version, &mut touched);
+        }
+        for (mint, mut entries) in seed.mints {
+            LargestAccountsSeed::shrink(&mut entries, inner.k_per_mint);
+            for account in entries {
+                state.max_applied_slot = state.max_applied_slot.max(account.slot);
+                state.apply_update(
+                    mint,
+                    account.pubkey,
+                    account.amount,
+                    account.slot,
+                    account.write_version,
+                    true,
+                    false,
+                    true,
+                    inner.k_per_mint,
+                    &mut touched,
+                );
+            }
+            state.trim(mint, inner.k_per_mint, true);
+        }
+    }
+
+    pub fn apply_block(
+        &self,
+        slot: u64,
+        pending: HashMap<Pubkey, PendingLargestAccount>,
+    ) -> BlockOutcome {
+        let Some(inner) = &self.0 else {
+            return BlockOutcome::default();
+        };
+        let mut state = inner.state();
+        let bootstrapping = state.status == Status::Bootstrapping;
+        let old_block = !bootstrapping && slot <= state.max_applied_slot;
+        state.max_applied_slot = state.max_applied_slot.max(slot);
+        let mut touched = HashSet::new();
+        for (pubkey, update) in pending {
+            let update_mint = update.token.map(|(mint, _)| mint);
+            if let Some(current_mint) = state.member_index.get(&pubkey).copied()
+                && update_mint != Some(current_mint)
+            {
+                state.remove_member(current_mint, pubkey, slot, update.write_version, &mut touched);
+            }
+            if update.lamports == 0 {
+                if bootstrapping {
+                    state.record_tombstone(pubkey, slot, update.write_version);
+                }
+                state.remove_member(
+                    SOL_SENTINEL_MINT,
+                    pubkey,
+                    slot,
+                    update.write_version,
+                    &mut touched,
+                );
+                continue;
+            }
+            if let Some((mint, amount)) = update.token {
+                state.apply_update(
+                    mint,
+                    pubkey,
+                    amount,
+                    slot,
+                    update.write_version,
+                    bootstrapping,
+                    old_block,
+                    false,
+                    inner.k_per_mint,
+                    &mut touched,
+                );
+            }
+            state.apply_update(
+                SOL_SENTINEL_MINT,
+                pubkey,
+                update.lamports,
+                slot,
+                update.write_version,
+                bootstrapping,
+                old_block,
+                false,
+                inner.k_per_mint,
+                &mut touched,
+            );
+        }
+        let mut outcome = BlockOutcome::default();
+        if bootstrapping {
+            return outcome;
+        }
+        let effective_slot = state.max_applied_slot;
+        for mint in touched {
+            state.emit(mint, effective_slot, &mut outcome);
+        }
+        outcome
+    }
+
+    pub fn finish_bootstrap(&self) -> BlockOutcome {
+        let Some(inner) = &self.0 else {
+            return BlockOutcome::default();
+        };
+        let mut state = inner.state();
+        if state.status != Status::Bootstrapping {
+            return BlockOutcome::default();
+        }
+        state.tombstones = HashMap::new();
+        state.status = Status::Live;
+        let mints: Vec<Pubkey> = state.mints.keys().copied().collect();
+        let effective_slot = state.max_applied_slot;
+        let mut outcome = BlockOutcome::default();
+        for mint in mints {
+            state.trim(mint, inner.k_per_mint, false);
+            state.emit(mint, effective_slot, &mut outcome);
+        }
+        outcome
+    }
+
+    pub fn mark_mint_stale(&self, mint: &Pubkey) -> bool {
+        let Some(inner) = &self.0 else {
+            return false;
+        };
+        let mut state = inner.state();
+        let Some(top) = state.mints.get_mut(mint) else {
+            return false;
+        };
+        if top.stale {
+            return false;
+        }
+        top.stale = true;
+        true
+    }
+
+    pub fn stale_count(&self) -> usize {
+        let Some(inner) = &self.0 else {
+            return 0;
+        };
+        inner
+            .state()
+            .mints
+            .values()
+            .filter(|top| top.stale)
+            .count()
+    }
+}
+
+pub async fn persist_snapshots(
+    db: &DatabaseConnection,
+    snapshots: &[MintSnapshot],
+) -> Result<(), DbErr> {
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+    let txn = db.begin().await?;
+    for snapshot in snapshots {
+        let mint_hex = hex::encode(snapshot.mint.as_ref());
+        txn.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "DELETE FROM largest_accounts WHERE mint = '\\x{mint_hex}'::bytea AND slot = {}",
+                snapshot.slot
+            ),
+        ))
+        .await?;
+        if snapshot.rows.is_empty() {
+            continue;
+        }
+        let values = snapshot
+            .rows
+            .iter()
+            .map(|(pubkey, amount)| {
+                format!(
+                    "('\\x{mint_hex}'::bytea, '\\x{}'::bytea, {amount}, {})",
+                    hex::encode(pubkey.as_ref()),
+                    snapshot.slot
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        txn.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("INSERT INTO largest_accounts (mint, pubkey, amount, slot) VALUES {values}"),
+        ))
+        .await?;
+    }
+    txn.commit().await
+}
+
+pub async fn delete_mint_rows(db: &DatabaseConnection, mint: &Pubkey) -> Result<(), DbErr> {
+    db.execute(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "DELETE FROM largest_accounts WHERE mint = '\\x{}'::bytea",
+            hex::encode(mint.as_ref())
+        ),
+    ))
+    .await?;
+    Ok(())
+}
+
+pub async fn clear_largest_accounts(db: &DatabaseConnection) -> Result<(), DbErr> {
+    db.execute(Statement::from_string(
+        DatabaseBackend::Postgres,
+        "DELETE FROM largest_accounts".to_string(),
+    ))
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pk(byte: u8) -> Pubkey {
+        Pubkey::new_from_array([byte; 32])
+    }
+
+    fn tracker(k: usize) -> LargestAccountsTracker {
+        LargestAccountsTracker::new([pk(200)].into_iter().collect(), k)
+    }
+
+    fn pending_sol(lamports: u64, write_version: u64) -> PendingLargestAccount {
+        PendingLargestAccount {
+            write_version,
+            lamports,
+            token: None,
+        }
+    }
+
+    fn pending_token(amount: u64, write_version: u64) -> PendingLargestAccount {
+        PendingLargestAccount {
+            write_version,
+            lamports: 1_000_000,
+            token: Some((pk(200), amount)),
+        }
+    }
+
+    fn go_live(tracker: &LargestAccountsTracker) {
+        tracker.finish_bootstrap();
+    }
+
+    fn token_rows(outcome: &BlockOutcome) -> Option<&Vec<(Pubkey, u64)>> {
+        outcome
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.mint == pk(200))
+            .map(|snapshot| &snapshot.rows)
+    }
+
+    #[test]
+    fn out_of_order_slot_does_not_clobber_member() {
+        let tracker = tracker(25);
+        go_live(&tracker);
+        tracker.apply_block(100, [(pk(1), pending_token(500, 5))].into());
+        let outcome = tracker.apply_block(90, [(pk(1), pending_token(900, 9))].into());
+        assert!(outcome.snapshots.is_empty());
+        let outcome = tracker.apply_block(101, [(pk(2), pending_token(1, 1))].into());
+        let rows = token_rows(&outcome).unwrap();
+        assert_eq!(rows[0], (pk(1), 500));
+    }
+
+    #[test]
+    fn same_block_dedup_is_callers_job_but_write_version_guard_holds() {
+        let tracker = tracker(25);
+        go_live(&tracker);
+        tracker.apply_block(100, [(pk(1), pending_token(500, 9))].into());
+        let outcome = tracker.apply_block(100, [(pk(1), pending_token(100, 5))].into());
+        assert!(token_rows(&outcome).is_none());
+    }
+
+    #[test]
+    fn close_promotes_reservoir_and_reopen_reenters() {
+        let tracker = tracker(25);
+        go_live(&tracker);
+        let pending: HashMap<_, _> = (1..=22)
+            .map(|i| (pk(i), pending_token(1000 + i as u64, i as u64)))
+            .collect();
+        let outcome = tracker.apply_block(100, pending);
+        let rows = token_rows(&outcome).unwrap();
+        assert_eq!(rows.len(), PERSISTED_TOP_N);
+        assert!(!rows.iter().any(|(pubkey, _)| *pubkey == pk(2)));
+        let outcome = tracker.apply_block(
+            101,
+            [(pk(22), pending_sol(0, 23))].into(),
+        );
+        let rows = token_rows(&outcome).unwrap();
+        assert_eq!(rows.len(), PERSISTED_TOP_N);
+        assert!(rows.iter().any(|(pubkey, _)| *pubkey == pk(2)));
+        assert!(!rows.iter().any(|(pubkey, _)| *pubkey == pk(22)));
+        let outcome = tracker.apply_block(102, [(pk(22), pending_token(5000, 24))].into());
+        let rows = token_rows(&outcome).unwrap();
+        assert_eq!(rows[0], (pk(22), 5000));
+    }
+
+    #[test]
+    fn decrease_drops_member_from_top() {
+        let tracker = tracker(25);
+        go_live(&tracker);
+        let pending: HashMap<_, _> = (1..=21)
+            .map(|i| (pk(i), pending_token(1000 + i as u64, i as u64)))
+            .collect();
+        tracker.apply_block(100, pending);
+        let outcome = tracker.apply_block(101, [(pk(21), pending_token(1, 22))].into());
+        let rows = token_rows(&outcome).unwrap();
+        assert!(!rows.iter().any(|(pubkey, _)| *pubkey == pk(21)));
+        assert!(rows.iter().any(|(pubkey, _)| *pubkey == pk(1)));
+    }
+
+    #[test]
+    fn reservoir_exhaustion_marks_stale() {
+        let tracker = tracker(21);
+        go_live(&tracker);
+        let pending: HashMap<_, _> = (1..=30)
+            .map(|i| (pk(i), pending_token(1000 + i as u64, i as u64)))
+            .collect();
+        let outcome = tracker.apply_block(100, pending);
+        assert!(outcome.newly_stale.is_empty());
+        let closes: HashMap<_, _> = (10..=30)
+            .map(|i| (pk(i), pending_sol(0, 100 + i as u64)))
+            .collect();
+        let outcome = tracker.apply_block(101, closes);
+        assert!(outcome.newly_stale.contains(&pk(200)));
+        let outcome = tracker.apply_block(102, [(pk(1), pending_token(9999, 200))].into());
+        assert!(outcome.snapshots.iter().all(|s| s.mint != pk(200)));
+    }
+
+    #[test]
+    fn old_block_non_member_ratchets_floor_and_can_stale() {
+        let tracker = tracker(25);
+        go_live(&tracker);
+        let pending: HashMap<_, _> = (1..=20)
+            .map(|i| (pk(i), pending_token(1000 + i as u64, i as u64)))
+            .collect();
+        tracker.apply_block(100, pending);
+        let outcome = tracker.apply_block(50, [(pk(99), pending_token(999_999, 1))].into());
+        assert!(outcome.newly_stale.contains(&pk(200)));
+    }
+
+    #[test]
+    fn bootstrap_live_update_wins_over_older_seed() {
+        let tracker = tracker(25);
+        tracker.apply_block(200, [(pk(1), pending_token(5, 7))].into());
+        let mut seed = tracker.new_seed().unwrap();
+        seed.observe(pk(200), pk(1), 1_000_000, 150, 3);
+        seed.observe(pk(200), pk(2), 700, 150, 3);
+        tracker.merge_seed(seed);
+        let outcome = tracker.finish_bootstrap();
+        let rows = token_rows(&outcome).unwrap();
+        assert_eq!(rows[0], (pk(2), 700));
+        assert!(rows.contains(&(pk(1), 5)));
+    }
+
+    #[test]
+    fn bootstrap_close_tombstone_blocks_seed_resurrection() {
+        let tracker = tracker(25);
+        tracker.apply_block(200, [(pk(1), pending_sol(0, 7))].into());
+        let mut seed = tracker.new_seed().unwrap();
+        seed.observe(pk(200), pk(1), 1_000_000, 150, 3);
+        tracker.merge_seed(seed);
+        let outcome = tracker.finish_bootstrap();
+        assert!(token_rows(&outcome).is_none());
+    }
+
+    #[test]
+    fn seed_tombstone_from_snapshot_blocks_older_seed_file() {
+        let tracker = tracker(25);
+        let mut incremental = tracker.new_seed().unwrap();
+        incremental.observe_close(pk(1), 160, 2);
+        tracker.merge_seed(incremental);
+        let mut full = tracker.new_seed().unwrap();
+        full.observe(pk(200), pk(1), 1_000_000, 150, 1);
+        full.observe(pk(200), pk(2), 10, 150, 1);
+        tracker.merge_seed(full);
+        let outcome = tracker.finish_bootstrap();
+        let rows = token_rows(&outcome).unwrap();
+        assert_eq!(rows, &vec![(pk(2), 10)]);
+    }
+
+    #[test]
+    fn all_holders_closed_clears_mint() {
+        let tracker = tracker(25);
+        go_live(&tracker);
+        tracker.apply_block(100, [(pk(1), pending_token(10, 1))].into());
+        let outcome = tracker.apply_block(101, [(pk(1), pending_sol(0, 2))].into());
+        assert!(outcome.cleared.contains(&pk(200)));
+        assert!(token_rows(&outcome).is_none());
+    }
+
+    #[test]
+    fn snapshot_only_emitted_on_change() {
+        let tracker = tracker(25);
+        go_live(&tracker);
+        tracker.apply_block(100, [(pk(1), pending_token(10, 1))].into());
+        let outcome = tracker.apply_block(101, [(pk(1), pending_token(10, 2))].into());
+        assert!(token_rows(&outcome).is_none());
+    }
+
+    #[test]
+    fn sol_sentinel_tracks_lamports() {
+        let tracker = tracker(25);
+        go_live(&tracker);
+        let outcome = tracker.apply_block(
+            100,
+            [
+                (pk(1), pending_sol(500, 1)),
+                (pk(2), pending_sol(900, 1)),
+            ]
+            .into(),
+        );
+        let sol = outcome
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.mint == SOL_SENTINEL_MINT)
+            .unwrap();
+        assert_eq!(sol.rows[0], (pk(2), 900));
+        assert_eq!(sol.slot, 100);
+    }
+
+    #[test]
+    fn untracked_mint_is_ignored() {
+        let tracker = tracker(25);
+        go_live(&tracker);
+        let outcome = tracker.apply_block(
+            100,
+            [(
+                pk(1),
+                PendingLargestAccount {
+                    write_version: 1,
+                    lamports: 5,
+                    token: Some((pk(201), 777)),
+                },
+            )]
+            .into(),
+        );
+        assert!(token_rows(&outcome).is_none());
+        assert!(!tracker.is_tracked(pk(201).as_ref()));
+        assert!(tracker.is_tracked(pk(200).as_ref()));
+    }
+}

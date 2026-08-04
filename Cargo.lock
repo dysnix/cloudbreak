@@ -1651,6 +1651,7 @@ dependencies = [
  "clap",
  "cloudbreak-entity",
  "env_logger",
+ "hex",
  "humantime",
  "rust_decimal",
  "sea-orm",
