@@ -19,10 +19,11 @@
 //!    per-index metrics. Skipped entirely if `track_counts` is off (stats
 //!    frozen), since stale `idx_scan` must never drive a drop.
 //! 2. **Flags discrepancies** (see `stats::discrepancy`) — records the
-//!    demand-vs-supply verdict for observability only. It does not gate drops: a
-//!    starved-but-demanded index is safe simply because step 3 requires *both*
-//!    demand and scans to be idle, so a still-demanded index is never a drop
-//!    candidate.
+//!    demand-vs-supply verdict for observability only, and emits **one summary
+//!    line per pass** (counts plus the worst offenders) rather than a warning per
+//!    index. It does not gate drops: a starved-but-demanded index is safe simply
+//!    because step 3 requires *both* demand and scans to be idle, so a
+//!    still-demanded index is never a drop candidate.
 //! 3. **Drops (unconditional trim to target)** — when the capped table is above
 //!    the fill target (`floor(eviction-fill-threshold × max-auto-indexes)`), the
 //!    idlest eligible pairs (no demand *and* no scans for `index-min-idle`, older
@@ -51,6 +52,10 @@ use cloudbreak_core::{IndexRegressionGuard, QueryTrackerConfig};
 use sea_orm::{ConnectionTrait, DbErr, Statement, TransactionTrait};
 use std::collections::HashMap;
 use tracing::{error, info, warn};
+
+/// Max indexes named in a per-pass summary log before it collapses the rest into
+/// a `[+N more]` suffix — keeps the discrepancy/EXPLAIN summaries to one line.
+const LOG_LIST_LIMIT: usize = 10;
 
 #[tracing::instrument(name = "query_tracker_eviction", skip_all)]
 pub async fn run(store: Store, config: QueryTrackerConfig) {
@@ -280,6 +285,14 @@ async fn refresh_supply_and_discrepancy(
     config: &QueryTrackerConfig,
     supply: &HashMap<String, (i64, i64)>,
 ) -> Result<(), DbErr> {
+    // Per-pass discrepancy tally, emitted as one summary line at the end instead
+    // of a warning per index. `flagged` collects `(name, ratio, demand, supply)`
+    // for the non-`ok` verdicts so the summary can name the worst offenders.
+    let mut checked = 0i64;
+    let mut ok = 0i64;
+    let mut starved: Vec<(String, f64, i64, i64)> = Vec::new();
+    let mut over_scanned: Vec<(String, f64, i64, i64)> = Vec::new();
+
     for row in store.list_created().await? {
         let (idx_scan, bytes) = supply.get(&row.pattern_id).copied().unwrap_or((0, 0));
         store
@@ -311,18 +324,83 @@ async fn refresh_supply_and_discrepancy(
             store
                 .set_discrepancy(&row.pattern_id, state.as_stored(), ratio)
                 .await?;
-            if state == DiscrepancyState::Starved {
-                warn!(
-                    target: "query_tracker_discrepancy",
-                    "index '{}' looks STARVED: demand~{demand_since_create} but \
-                     compensated_idx_scan~{compensated_idx_scan} (ratio {:.2}); Postgres may be \
-                     ignoring it — check ANALYZE/planner, not evicting",
-                    row.human_name, ratio.unwrap_or(0.0)
-                );
+            checked += 1;
+            let entry = (
+                row.human_name.clone(),
+                ratio.unwrap_or(0.0),
+                demand_since_create,
+                compensated_idx_scan,
+            );
+            match state {
+                DiscrepancyState::Ok => ok += 1,
+                DiscrepancyState::Starved => starved.push(entry),
+                DiscrepancyState::OverScanned => over_scanned.push(entry),
             }
         }
     }
+
+    if config.discrepancy_enabled {
+        log_discrepancy_summary(checked, ok, starved, over_scanned);
+    }
     Ok(())
+}
+
+/// One line per discrepancy pass instead of a warning per index. `warn` when any
+/// index is **starved** (Postgres ignoring a wanted index — actionable); `info`
+/// otherwise (all healthy, or only the informational over-scanned case).
+fn log_discrepancy_summary(
+    checked: i64,
+    ok: i64,
+    mut starved: Vec<(String, f64, i64, i64)>,
+    mut over_scanned: Vec<(String, f64, i64, i64)>,
+) {
+    if starved.is_empty() && over_scanned.is_empty() {
+        info!(
+            target: "query_tracker_discrepancy",
+            "discrepancy pass: {checked} checked — all ok"
+        );
+        return;
+    }
+
+    let mut detail = format!(
+        "discrepancy pass: {checked} checked — {ok} ok, {} starved, {} over_scanned",
+        starved.len(),
+        over_scanned.len()
+    );
+    if !starved.is_empty() {
+        // Worst = lowest ratio (least supply for the demand).
+        starved.sort_by(|a, b| a.1.total_cmp(&b.1));
+        detail.push_str(&format!("; starved: {}", fmt_flagged(&starved)));
+    }
+    if !over_scanned.is_empty() {
+        // Worst = highest ratio (most excess scanning).
+        over_scanned.sort_by(|a, b| b.1.total_cmp(&a.1));
+        detail.push_str(&format!("; over_scanned: {}", fmt_flagged(&over_scanned)));
+    }
+
+    if starved.is_empty() {
+        info!(target: "query_tracker_discrepancy", "{detail}");
+    } else {
+        warn!(target: "query_tracker_discrepancy", "{detail}");
+    }
+}
+
+/// Render up to [`LOG_LIST_LIMIT`] already-sorted flagged indexes as
+/// `name (ratio R, demand~D/supply~S)`, with a `[+N more]` suffix when truncated.
+fn fmt_flagged(list: &[(String, f64, i64, i64)]) -> String {
+    let shown = list
+        .iter()
+        .take(LOG_LIST_LIMIT)
+        .map(|(name, ratio, demand, supply)| {
+            format!("{name} (ratio {ratio:.2}, demand~{demand}/supply~{supply})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if list.len() > LOG_LIST_LIMIT {
+        format!("{shown} [+{} more]", list.len() - LOG_LIST_LIMIT)
+    } else {
+        shown
+    }
 }
 
 async fn refresh_aggregate_metrics(store: &Store) {

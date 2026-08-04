@@ -25,15 +25,16 @@
 //! the identity) so the memcmp constants are realistic values Postgres has
 //! statistics for, it falls back to zeros per column when no
 //! example is available. Each index pair is probed on **both** physical tables
-//! (`accounts` and `snapshot_accounts`), one log line per table.
+//! (`accounts` and `snapshot_accounts`).
 //!
 //! It is diagnostic only — it never creates or drops anything. Per pass it:
-//! logs a warning (corroborating `discrepancy`, with the compensated `idx_scan`
-//! for context) when the planner would not use an index; persists the combined
-//! verdict to `index_patterns.explain_state` (`none` / `accounts_table` /
-//! `snapshot_accounts_table` / `both`) for the debug endpoints; and refreshes
-//! the `query_tracker_explain_state` gauge with this pass's per-state counts.
-//! Off unless `explain-enabled = true`.
+//! persists each pattern's combined verdict to `index_patterns.explain_state`
+//! (`none` / `accounts_table` / `snapshot_accounts_table` / `both`) for the debug
+//! endpoints; refreshes the `query_tracker_explain_state` gauge with this pass's
+//! per-state counts; and emits **one summary line** (the per-state counts plus the
+//! fully unused indexes with their compensated `idx_scan`) rather than a warning
+//! per index. The `/debug/created?filter=explain_incomplete` view is the detailed
+//! per-index source of truth. Off unless `explain-enabled = true`.
 
 use crate::modules::INDEX_TABLES;
 use crate::modules::store::Store;
@@ -46,6 +47,10 @@ use cloudbreak_core::modules::rpc_filter_type::{RpcFilterType, RpcProgramAccount
 use sea_orm::{ConnectionTrait, DbErr, Statement};
 use std::collections::HashMap;
 use tracing::{error, info, warn};
+
+/// Max unused indexes named in the per-pass summary before the rest collapse
+/// into a `[+N more]` suffix — keeps the summary to one line.
+const LOG_LIST_LIMIT: usize = 10;
 
 #[tracing::instrument(name = "query_tracker_explain", skip_all)]
 pub async fn run(store: Store, config: QueryTrackerConfig) {
@@ -73,6 +78,12 @@ async fn run_pass(store: &Store) -> Result<(), DbErr> {
     ]
     .into_iter()
     .collect();
+    // Accumulated for the one-line per-pass summary (instead of a warning per
+    // index): how many were probed, how many table-probes errored, and the fully
+    // unused (`none`) indexes with their compensated supply to name inline.
+    let mut probed = 0i64;
+    let mut probe_errors = 0i64;
+    let mut none_indexes: Vec<(String, i64)> = Vec::new();
 
     for row in store.list_created().await? {
         let identity = match row.identity() {
@@ -82,30 +93,29 @@ async fn run_pass(store: &Store) -> Result<(), DbErr> {
                 continue;
             }
         };
+        probed += 1;
         // Real memcmp values from the stored example (empty ⇒ fall back to zeros).
         let example = example_memcmps(row.example_request.as_ref());
         // Compensated supply (raw idx_scan is ~2x per request; a GPA scans both
-        // tables of the pair), shown in the warn so "planner says unused but it
-        // is clearly being scanned" is obvious inline.
+        // tables of the pair), named in the summary so "planner says unused but
+        // it is clearly being scanned" is obvious inline.
         let compensated_idx_scan = row.last_idx_scan / SCANS_PER_REQUEST;
-        // The index pair spans both tables; probe each, report per table, and
-        // fold the two verdicts into one persisted state (`accounts` = table 0,
-        // `snapshot_accounts` = table 1).
+        // The index pair spans both tables; probe each and fold the two verdicts
+        // into one persisted state (`accounts` = table 0, `snapshot_accounts` =
+        // table 1). A failing probe still logs its own error line.
         let mut used = [false; INDEX_TABLES.len()];
         for (i, table) in INDEX_TABLES.iter().enumerate() {
             let index_name = identity.pg_index_name(table);
             match planner_would_use(store, &identity, &index_name, table, &example).await {
                 Ok(true) => used[i] = true,
-                Ok(false) => warn!(
-                    target: "query_tracker_explain",
-                    "planner would NOT use '{}' on {table} for its own probe query — likely stale \
-                     stats or predicate mismatch (compensated_idx_scan~{compensated_idx_scan})",
-                    row.human_name
-                ),
-                Err(e) => error!(
-                    target: "query_tracker_explain",
-                    "EXPLAIN probe failed for '{}' on {table}: {e:?}", row.human_name
-                ),
+                Ok(false) => {}
+                Err(e) => {
+                    probe_errors += 1;
+                    error!(
+                        target: "query_tracker_explain",
+                        "EXPLAIN probe failed for '{}' on {table}: {e:?}", row.human_name
+                    );
+                }
             }
         }
         // INDEX_TABLES is [accounts, snapshot_accounts]; persist the combined
@@ -117,6 +127,9 @@ async fn run_pass(store: &Store) -> Result<(), DbErr> {
             (true, true) => explain_state::BOTH,
         };
         *counts.entry(state).or_insert(0) += 1;
+        if state == explain_state::NONE {
+            none_indexes.push((row.human_name.clone(), compensated_idx_scan));
+        }
         if let Err(e) = store.set_explain_state(&row.pattern_id, state).await {
             error!(
                 target: "query_tracker_explain",
@@ -131,7 +144,59 @@ async fn run_pass(store: &Store) -> Result<(), DbErr> {
             .with_label_values(&[state])
             .set(*count);
     }
+
+    log_explain_summary(probed, &counts, probe_errors, none_indexes);
     Ok(())
+}
+
+/// One line per EXPLAIN pass instead of a warning per (index, table). `warn` when
+/// something is actionable (any fully `none` index, or a probe error); `info`
+/// otherwise. Only the fully unused (`none`) indexes are named — partial usage is
+/// reported as a count (and persisted per-index in `explain_state`).
+fn log_explain_summary(
+    probed: i64,
+    counts: &HashMap<&'static str, i64>,
+    probe_errors: i64,
+    mut none_indexes: Vec<(String, i64)>,
+) {
+    let count = |state: &str| counts.get(state).copied().unwrap_or(0);
+    let (both, acc, snap, none) = (
+        count(explain_state::BOTH),
+        count(explain_state::ACCOUNTS),
+        count(explain_state::SNAPSHOT),
+        count(explain_state::NONE),
+    );
+
+    if none == 0 && probe_errors == 0 {
+        info!(
+            target: "query_tracker_explain",
+            "EXPLAIN pass: {probed} probed — {both} both, {acc} accounts_table, \
+             {snap} snapshot_accounts_table, 0 none"
+        );
+        return;
+    }
+
+    // Name the worst first: highest compensated supply among the unused (a
+    // scanned-yet-"unused" index is the sharpest contradiction to investigate).
+    none_indexes.sort_by_key(|(_, idx)| std::cmp::Reverse(*idx));
+    let listed = none_indexes
+        .iter()
+        .take(LOG_LIST_LIMIT)
+        .map(|(name, idx)| format!("{name} (idx~{idx})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if none_indexes.len() > LOG_LIST_LIMIT {
+        format!(" [+{} more]", none_indexes.len() - LOG_LIST_LIMIT)
+    } else {
+        String::new()
+    };
+
+    warn!(
+        target: "query_tracker_explain",
+        "EXPLAIN pass: {probed} probed — {both} both, {acc} accounts_table, \
+         {snap} snapshot_accounts_table, {none} none; {probe_errors} probe errors. \
+         unused (none): {listed}{suffix}"
+    );
 }
 
 /// Run `EXPLAIN` on a synthetic query matching the index's partial predicate on
