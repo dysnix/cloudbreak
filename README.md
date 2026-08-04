@@ -381,6 +381,9 @@ Shared across all services. Controls the SeaORM/SQLx connection pool and query t
 | `chunk-size`           | `usize`  | `1000`            | Chunk size for subscription events.                                                  |
 | `max-chunk-bytes-data` | `usize`  | `2097152` (2 MiB) | Max bytes per data chunk.                                                            |
 | `max-grpc-errors`      | `usize`  | **required**      | Max gRPC errors before attempting reconnection (always reconnects on stream `None`). |
+| `reconnect-give-up`    | `Duration` | `"600s"`        | How long to keep retrying (re)connection/subscription before giving up and panicking. |
+| `reconnect-backoff`    | `Duration` | `"5s"`          | Delay between (re)connection/subscription attempts.                                  |
+| `reconnect-from-slot-retain` | `Duration` | `"300s"`  | How long a reconnection keeps replaying from the last received slot before dropping `from_slot` (the server may no longer have it buffered). |
 
 #### `[programs]`
 
@@ -489,6 +492,23 @@ Example:
 
 ```toml
 processed-commitment = "use-confirmed"
+```
+
+#### `unhealthy-response` (top-level, optional)
+
+Controls how the API responds to requests while the node is unhealthy (the `slots.health` flag is unset / the slot syncronizer reports unhealthy). This is a top-level key (not inside any section).
+
+| Value                | Description                                                                                                      |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `"json-rpc-error"`   | **(default)** Return a `NODE_UNHEALTHY` JSON-RPC error (code `-32005`) with HTTP `200 OK`.                        |
+| `"http-unavailable"` | Return an HTTP `503 Service Unavailable` response instead.                                                        |
+
+> **Note:** `http-unavailable` only applies to single requests. Batch requests always return HTTP `200 OK` with per-item JSON-RPC errors, since an HTTP status cannot be expressed per batch item.
+
+Example:
+
+```toml
+unhealthy-response = "http-unavailable"
 ```
 
 #### `[tracing]` (optional)

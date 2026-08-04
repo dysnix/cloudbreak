@@ -19,7 +19,7 @@ use solana_rpc_client_api::response::Response as RpcResponse;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
-use cloudbreak_core::{AccountSelectorConfig, ProcessedCommitmentBehavior};
+use cloudbreak_core::{AccountSelectorConfig, ProcessedCommitmentBehavior, UnhealthyResponseBehavior};
 use cloudbreak_entity::slots;
 
 #[derive(Clone)]
@@ -44,6 +44,7 @@ pub struct CloudbreakRpcState {
     pub gpa_stream_batch_size: usize,
     pub request_timeout: Duration,
     pub processed_commitment: ProcessedCommitmentBehavior,
+    pub unhealthy_response: UnhealthyResponseBehavior,
     pub gpa_processor: GpaProcessor,
     pub genesis_hash: String,
     pub vote_accounts_supported: bool,
@@ -65,6 +66,7 @@ impl CloudbreakRpcState {
         gpa_stream_batch_size: usize,
         request_timeout: Duration,
         processed_commitment: ProcessedCommitmentBehavior,
+        unhealthy_response: UnhealthyResponseBehavior,
         gpa_processor: GpaProcessor,
         genesis_hash: String,
         vote_accounts_supported: bool,
@@ -82,6 +84,7 @@ impl CloudbreakRpcState {
             gpa_stream_batch_size,
             request_timeout,
             processed_commitment,
+            unhealthy_response,
             gpa_processor,
             genesis_hash,
             vote_accounts_supported,
@@ -89,6 +92,15 @@ impl CloudbreakRpcState {
             max_multiple_accounts,
             simulation_supported,
             feature_set_cache: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Builds a [`RpcError::NodeUnhealthy`], baking in whether it should be
+    /// surfaced as an HTTP `503` (per the `unhealthy-response` config) so the
+    /// response layer can decide the HTTP status purely from the error.
+    pub fn node_unhealthy(&self) -> RpcError {
+        RpcError::NodeUnhealthy {
+            service_unavailable: self.unhealthy_response == UnhealthyResponseBehavior::HttpUnavailable,
         }
     }
 
@@ -107,7 +119,7 @@ impl CloudbreakRpcState {
                 let data = data.read().expect("Failed to read slot syncronizer data");
 
                 if !data.is_healthy() {
-                    return Err(RpcError::NodeUnhealthy);
+                    return Err(self.node_unhealthy());
                 }
 
                 Ok((
@@ -124,7 +136,7 @@ impl CloudbreakRpcState {
                 let model = slot_model.ok_or(RpcError::InternalError)?;
 
                 if !model.health {
-                    return Err(RpcError::NodeUnhealthy);
+                    return Err(self.node_unhealthy());
                 }
 
                 Ok((model.slot as u64, model.block_time))
@@ -219,9 +231,32 @@ fn extract_param<T: serde::de::DeserializeOwned>(
 }
 
 fn make_error_response(id: serde_json::Value, code: i32, message: String) -> HttpHandlerResponse {
+    make_error_response_with_status(id, code, message, StatusCode::OK)
+}
+
+fn make_error_response_with_status(
+    id: serde_json::Value,
+    code: i32,
+    message: String,
+    status: StatusCode,
+) -> HttpHandlerResponse {
     let response = JsonRpcResponse::<()>::error(id, code, message);
     HttpHandlerResponse {
-        status: StatusCode::OK,
+        status,
         body: ResponseBody::Buffered(serde_json::to_vec(&response).unwrap()),
+    }
+}
+
+/// Maps an [`RpcError`] to the HTTP status the response should carry. Almost
+/// everything is a `200 OK` JSON-RPC error; the sole exception is an unhealthy
+/// node when `unhealthy-response = "http-unavailable"`, which is baked into the
+/// error at its source (see [`CloudbreakRpcState::node_unhealthy`]) and surfaced
+/// here as HTTP `503 Service Unavailable`.
+pub fn http_status_for_error(err: &RpcError) -> StatusCode {
+    match err {
+        RpcError::NodeUnhealthy {
+            service_unavailable: true,
+        } => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::OK,
     }
 }

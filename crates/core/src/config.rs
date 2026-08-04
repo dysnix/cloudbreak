@@ -59,6 +59,29 @@ pub struct GrpcConfig {
     ///  (it will always reconnect on a single stream `None`)
     #[serde(rename = "max-grpc-errors")]
     pub max_grpc_errors: usize,
+    /// How long to keep retrying (re)connection/subscription before giving up and panicking.
+    #[serde(
+        rename = "reconnect-give-up",
+        default = "GrpcConfig::default_reconnect_give_up",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub reconnect_give_up: Duration,
+    /// Delay between (re)connection/subscription attempts.
+    #[serde(
+        rename = "reconnect-backoff",
+        default = "GrpcConfig::default_reconnect_backoff",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub reconnect_backoff: Duration,
+    /// How long a reconnection keeps replaying from the last received slot (`from_slot`). Once we
+    /// have been failing for longer than this, subscribe without `from_slot` (the server may not
+    /// have it buffered).
+    #[serde(
+        rename = "reconnect-from-slot-retain",
+        default = "GrpcConfig::default_reconnect_from_slot_retain",
+        deserialize_with = "deserialize_duration_required"
+    )]
+    pub reconnect_from_slot_retain: Duration,
 }
 
 impl GrpcConfig {
@@ -78,6 +101,15 @@ impl GrpcConfig {
     }
     const fn default_max_chunk_bytes_data() -> usize {
         2 * 1024 * 1024
+    }
+    const fn default_reconnect_give_up() -> Duration {
+        Duration::from_secs(600)
+    }
+    const fn default_reconnect_backoff() -> Duration {
+        Duration::from_secs(5)
+    }
+    const fn default_reconnect_from_slot_retain() -> Duration {
+        Duration::from_secs(300)
     }
 }
 
@@ -542,6 +574,18 @@ pub enum ProcessedCommitmentBehavior {
     UseConfirmed,
 }
 
+/// How the API responds when the node is unhealthy (the `slots.health` flag is
+/// unset / the slot syncronizer reports unhealthy).
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnhealthyResponseBehavior {
+    /// Return a JSON-RPC error (`NODE_UNHEALTHY`) with HTTP `200 OK` (default).
+    #[default]
+    JsonRpcError,
+    /// Return an HTTP `503 Service Unavailable` response instead.
+    HttpUnavailable,
+}
+
 #[derive(Deserialize, Debug)]
 pub struct ApiConfig {
     pub database: DatabaseConfig,
@@ -559,6 +603,9 @@ pub struct ApiConfig {
     pub slot_syncronizer: SlotSyncronizerConfig,
     #[serde(rename = "processed-commitment", default)]
     pub processed_commitment: ProcessedCommitmentBehavior,
+    /// How the API responds to requests while the node is unhealthy.
+    #[serde(rename = "unhealthy-response", default)]
+    pub unhealthy_response: UnhealthyResponseBehavior,
     #[serde(rename = "gpa-cache")]
     pub gpa_cache: Option<GpaCacheConfig>,
     #[serde(rename = "genesis-hash", default = "ApiConfig::default_genesis_hash")]
