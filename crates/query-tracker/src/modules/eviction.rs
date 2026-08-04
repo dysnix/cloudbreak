@@ -58,12 +58,12 @@
 //! left for the next pass rather than blocking ingest.
 
 use crate::modules::store::patterns::status;
-use crate::modules::store::{prioritization, Store};
+use crate::modules::store::{Store, prioritization};
 use crate::modules::{CAP_TABLE, INDEX_TABLES, creation, indexer_backpressure};
 use crate::stats::discrepancy::{self, DiscrepancyState};
 use crate::stats::metrics;
-use cloudbreak_core::{IndexRegressionGuard, QueryTrackerConfig};
 use cloudbreak_core::modules::index_identity::IndexIdentity;
+use cloudbreak_core::{IndexRegressionGuard, QueryTrackerConfig};
 use sea_orm::{ConnectionTrait, DbErr, Statement, TransactionTrait};
 use std::collections::HashMap;
 use tracing::{error, info, warn};
@@ -362,9 +362,13 @@ async fn refresh_supply_and_discrepancy(
             .update_supply(&row.pattern_id, idx_scan, bytes)
             .await?;
 
-        metrics::INDEX_IDX_SCAN
+        // A served request scans both tables of the pair, so raw idx_scan is ~2x
+        // the request count; every surface (metric, log, endpoint) reports the
+        // compensated value so supply lines up ~1:1 with demand.
+        let compensated_idx_scan = idx_scan / prioritization::SCANS_PER_REQUEST;
+        metrics::INDEX_COMPENSATED_IDX_SCAN
             .with_label_values(&[&row.human_name])
-            .set(idx_scan);
+            .set(compensated_idx_scan);
         metrics::INDEX_DEMAND
             .with_label_values(&[&row.human_name])
             .set(row.demand_count);
@@ -374,12 +378,9 @@ async fn refresh_supply_and_discrepancy(
 
         if config.discrepancy_enabled {
             let demand_since_create = (row.demand_count - row.demand_at_create).max(0);
-            // A served request scans both tables of the pair, so raw idx_scan is
-            // ~2x the request count; normalize before comparing to demand.
-            let supply = idx_scan / prioritization::SCANS_PER_REQUEST;
             let (state, ratio) = discrepancy::evaluate(
                 demand_since_create,
-                supply,
+                compensated_idx_scan,
                 config.discrepancy_delta,
                 config.index_generation_threshold as i64,
             );
@@ -389,9 +390,9 @@ async fn refresh_supply_and_discrepancy(
             if state == DiscrepancyState::Starved {
                 warn!(
                     target: "query_tracker_discrepancy",
-                    "index '{}' looks STARVED: demand~{demand_since_create} but supply~{supply} \
-                     (idx_scan={idx_scan}, ratio {:.2}); Postgres may be ignoring it — \
-                     check ANALYZE/planner, not evicting",
+                    "index '{}' looks STARVED: demand~{demand_since_create} but \
+                     compensated_idx_scan~{compensated_idx_scan} (ratio {:.2}); Postgres may be \
+                     ignoring it — check ANALYZE/planner, not evicting",
                     row.human_name, ratio.unwrap_or(0.0)
                 );
             }
@@ -493,7 +494,7 @@ async fn drop_one(
 }
 
 fn clear_index_metrics(human_name: &str) {
-    let _ = metrics::INDEX_IDX_SCAN.remove_label_values(&[human_name]);
+    let _ = metrics::INDEX_COMPENSATED_IDX_SCAN.remove_label_values(&[human_name]);
     let _ = metrics::INDEX_DEMAND.remove_label_values(&[human_name]);
     let _ = metrics::INDEX_VARIETY.remove_label_values(&[human_name]);
 }

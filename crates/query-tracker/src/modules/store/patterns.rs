@@ -107,6 +107,10 @@ pub struct PatternRow {
     /// would use this index on. One of the [`explain_state`] constants, or
     /// `None` until the (optional) explain pass has run for this pattern.
     pub explain_state: Option<String>,
+    /// Unix epoch seconds at which the index was created (`created_at`), or
+    /// `None` for patterns that have never been built (`candidate`, `evicted`,
+    /// `rejected`). Used to order the `/debug/created` view by recency.
+    pub created_at_epoch: Option<f64>,
 }
 
 impl PatternRow {

@@ -11,10 +11,24 @@
 //! - `debug_created`       — `GET /debug/created`       (active indexes).
 //! - `debug_discrepancies` — `GET /debug/discrepancies` (demand/supply divergence).
 //! - `metrics`             — `GET /metrics`             (Prometheus text).
-//! - `health`              — `GET /health`              (liveness probe).
+//! - `health`             — `GET /health`             (liveness probe).
 //!
-//! The `debug_*` endpoints render the same row shape, so the shared JSON view
-//! and error helpers live here.
+//! ## Shared debug conventions
+//!
+//! The three `debug_*` endpoints share query-string handling, number formatting
+//! and the response envelope, all defined here:
+//!
+//! - Latencies are rendered in **milliseconds, 2 decimals** (`*_ms`); index size
+//!   in **MiB, 2 decimals** (`index_mb`). Raw `idx_scan` is never shown — only
+//!   `compensated_idx_scan` (÷ [`SCANS_PER_REQUEST`], since a served GPA scans
+//!   both tables of the pair), so supply lines up ~1:1 with demand.
+//! - `pattern_id` and `example_request` are **omitted unless explicitly
+//!   requested** via `?pattern_id=true` / `?example=true` (or `?verbose=true`
+//!   for both), keeping the default view compact.
+//! - Every response is `{ "total": <matching rows>, "count": <rows returned>,
+//!   "limit": <n|null>, "<items>": [...] }`. `?limit=N` caps the returned rows
+//!   (default: all); `?order=<key>` and `?dir=asc|desc` sort them.
+//! - Unknown query keys or malformed values are rejected with `400`.
 
 pub mod debug_candidates;
 pub mod debug_created;
@@ -23,35 +37,209 @@ pub mod health;
 pub mod metrics;
 
 use crate::modules::store::patterns::PatternRow;
+use crate::modules::store::prioritization::SCANS_PER_REQUEST;
 use crate::server::text;
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Response, StatusCode};
-use serde_json::json as jval;
+use serde_json::{Value, json as jval};
 use tracing::error;
 
-/// JSON view of a created pattern's demand vs. supply, shared by the
-/// `debug_created` and `debug_discrepancies` endpoints.
-fn created_view(r: &PatternRow) -> serde_json::Value {
-    let avg = |sum: i64, count: i64| (count > 0).then(|| sum as f64 / count as f64);
-    jval!({
-        "pattern_id": r.pattern_id,
-        "index": r.human_name,
-        "demand_count": r.demand_count,
-        "demand_since_create": (r.demand_count - r.demand_at_create).max(0),
-        "idx_scan": r.last_idx_scan,
-        "index_bytes": r.index_bytes,
-        "variety_estimate": r.variety_estimate,
-        "avg_cost_with_index_us": avg(r.cost_with_index_us, r.cost_with_index_count),
-        "avg_cost_without_index_us": avg(r.cost_without_index_us, r.cost_without_index_count),
-        "discrepancy_state": r.discrepancy_state,
-        "discrepancy_ratio": r.discrepancy_ratio,
-        "example_request": r.example_request,
+/// Sort direction for the `?dir=` query parameter.
+#[derive(Debug, Clone, Copy)]
+pub enum Dir {
+    Asc,
+    Desc,
+}
+
+/// Parsed common query parameters shared by the debug endpoints. Each endpoint
+/// validates `order` against its own whitelist; the rest are generic.
+#[derive(Debug, Default)]
+pub struct DebugQuery {
+    /// Max rows to return (`None` = all).
+    pub limit: Option<usize>,
+    /// Sort key (endpoint-specific whitelist); `None` = endpoint default.
+    pub order: Option<String>,
+    /// Sort direction; `None` = endpoint default.
+    pub dir: Option<Dir>,
+    /// Include `example_request` in each row.
+    pub show_example: bool,
+    /// Include `pattern_id` in each row.
+    pub show_pattern_id: bool,
+    /// Lower bound filter on `discrepancy_ratio` (`/discrepancies` only).
+    pub min_ratio: Option<f64>,
+    /// Upper bound filter on `discrepancy_ratio` (`/discrepancies` only).
+    pub max_ratio: Option<f64>,
+    /// Row subset selector (endpoint-specific; e.g. `/created` accepts
+    /// `eviction_candidates`). `None` = the endpoint's full set.
+    pub filter: Option<String>,
+}
+
+impl DebugQuery {
+    /// Parse a raw query string (the part after `?`). Returns a human-readable
+    /// message on any unknown key or malformed value, which the handler turns
+    /// into a `400`.
+    pub fn parse(query: Option<&str>) -> Result<Self, String> {
+        let mut q = DebugQuery::default();
+        let Some(raw) = query else { return Ok(q) };
+        for pair in raw.split('&').filter(|s| !s.is_empty()) {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            match key {
+                "limit" => {
+                    q.limit = Some(
+                        value
+                            .parse::<usize>()
+                            .map_err(|_| format!("invalid limit '{value}' (expected a number)"))?,
+                    )
+                }
+                "order" => q.order = Some(value.to_string()),
+                "dir" => q.dir = Some(parse_dir(value)?),
+                "example" => q.show_example = parse_bool("example", value)?,
+                "pattern_id" => q.show_pattern_id = parse_bool("pattern_id", value)?,
+                "verbose" => {
+                    if parse_bool("verbose", value)? {
+                        q.show_example = true;
+                        q.show_pattern_id = true;
+                    }
+                }
+                "min_ratio" => q.min_ratio = Some(parse_f64("min_ratio", value)?),
+                "max_ratio" => q.max_ratio = Some(parse_f64("max_ratio", value)?),
+                "filter" => q.filter = Some(value.to_string()),
+                other => return Err(format!("unknown query parameter '{other}'")),
+            }
+        }
+        Ok(q)
+    }
+}
+
+fn parse_dir(value: &str) -> Result<Dir, String> {
+    match value {
+        "asc" => Ok(Dir::Asc),
+        "desc" => Ok(Dir::Desc),
+        _ => Err(format!("invalid dir '{value}' (expected 'asc' or 'desc')")),
+    }
+}
+
+fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(format!("invalid {key} '{value}' (expected true/false)")),
+    }
+}
+
+fn parse_f64(key: &str, value: &str) -> Result<f64, String> {
+    value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid {key} '{value}' (expected a number)"))
+}
+
+/// Round to 2 decimals — the precision used for every rendered `*_ms` / `_mb` /
+/// ratio value on the debug endpoints.
+pub fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
+/// Average cost per request in **milliseconds** (2 dp), or `None` when the
+/// bucket has no requests.
+pub fn avg_ms(sum_us: i64, count: i64) -> Option<f64> {
+    (count > 0).then(|| round2(sum_us as f64 / count as f64 / 1000.0))
+}
+
+/// Bytes rendered as **MiB** (base-2), 2 dp.
+pub fn bytes_to_mib(bytes: i64) -> f64 {
+    round2(bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// Supply compensated for the fact that a served GPA scans both tables of the
+/// pair (raw `idx_scan` ≈ 2× requests). This is the only form ever surfaced.
+pub fn compensated_idx_scan(last_idx_scan: i64) -> i64 {
+    last_idx_scan / SCANS_PER_REQUEST
+}
+
+/// Raw measured latency gain from the index: without-index avg ÷ with-index avg
+/// (`> 1` means the index helps). `None` until the pattern has served requests
+/// both with and without the index. This is the *uncompensated* ratio — the two
+/// averages exactly as measured — so it demystifies the `gain` term the
+/// `weighted` score derives from it (which additionally applies
+/// `without-index-compensation-factor`).
+pub fn latency_gain(r: &PatternRow) -> Option<f64> {
+    (r.cost_with_index_count > 0 && r.cost_without_index_count > 0).then(|| {
+        let with = (r.cost_with_index_us as f64 / r.cost_with_index_count as f64).max(1.0);
+        let without = (r.cost_without_index_us as f64 / r.cost_without_index_count as f64).max(1.0);
+        round2(without / with)
     })
 }
 
+/// Sort `items` by `key` in `dir` and truncate to `limit`, returning the total
+/// count *before* limiting alongside the trimmed list — the two numbers the
+/// response envelope reports as `total` and `count`.
+pub fn order_and_limit<T>(
+    mut items: Vec<T>,
+    key: impl Fn(&T) -> f64,
+    dir: Dir,
+    limit: Option<usize>,
+) -> (usize, Vec<T>) {
+    let total = items.len();
+    items.sort_by(|a, b| {
+        let (ka, kb) = (key(a), key(b));
+        match dir {
+            Dir::Asc => ka.total_cmp(&kb),
+            Dir::Desc => kb.total_cmp(&ka),
+        }
+    });
+    if let Some(l) = limit {
+        items.truncate(l);
+    }
+    (total, items)
+}
+
+/// Wrap rendered `items` in the shared envelope.
+pub fn envelope(items_key: &str, total: usize, limit: Option<usize>, items: Vec<Value>) -> Value {
+    jval!({
+        "total": total,
+        "count": items.len(),
+        "limit": limit,
+        items_key: items,
+    })
+}
+
+/// JSON view of a created pattern's demand vs. supply, shared by the
+/// `debug_created` and `debug_discrepancies` endpoints. `pattern_id` and
+/// `example_request` are only included when `q` requests them.
+pub fn created_view(r: &PatternRow, q: &DebugQuery) -> Value {
+    let mut obj = jval!({
+        "index": r.human_name,
+        "explain_state": r.explain_state,
+        "created_at": r.created_at_epoch.map(|e| e as i64),
+        "demand_count": r.demand_count,
+        "demand_since_create": (r.demand_count - r.demand_at_create).max(0),
+        "compensated_idx_scan": compensated_idx_scan(r.last_idx_scan),
+        "index_mb": bytes_to_mib(r.index_bytes),
+        "variety_estimate": r.variety_estimate,
+        "avg_cost_with_index_ms": avg_ms(r.cost_with_index_us, r.cost_with_index_count),
+        "avg_cost_without_index_ms": avg_ms(r.cost_without_index_us, r.cost_without_index_count),
+        "latency_gain": latency_gain(r),
+        "discrepancy_state": r.discrepancy_state,
+        "discrepancy_ratio": r.discrepancy_ratio.map(round2),
+    });
+    let map = obj.as_object_mut().expect("jval! built an object");
+    if q.show_pattern_id {
+        map.insert("pattern_id".into(), jval!(r.pattern_id));
+    }
+    if q.show_example {
+        map.insert("example_request".into(), r.example_request.clone().into());
+    }
+    obj
+}
+
+/// Turn a query-parse error message into a `400`.
+pub fn bad_request(msg: String) -> Response<Full<Bytes>> {
+    text(StatusCode::BAD_REQUEST, &msg)
+}
+
 /// Log a debug-endpoint DB failure (with target) and return a 500.
-fn db_error(what: &str, e: sea_orm::DbErr) -> Response<Full<Bytes>> {
+pub fn db_error(what: &str, e: sea_orm::DbErr) -> Response<Full<Bytes>> {
     error!(target: "query_tracker_server", "debug /{what} query failed: {e:?}");
     text(StatusCode::INTERNAL_SERVER_ERROR, "database error")
 }

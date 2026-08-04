@@ -50,7 +50,10 @@ pub async fn apply_batch(store: &Store, batch: TrackBatch) -> Result<TrackRespon
         // Keep the representative request as an example for the row (used by the
         // EXPLAIN probe and shown on the debug endpoints). Best-effort: a
         // serialization failure just means no example, never a lost observation.
-        let example_request = obs.config.as_ref().and_then(|c| serde_json::to_value(c).ok());
+        let example_request = obs
+            .config
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok());
 
         store
             .record_demand(

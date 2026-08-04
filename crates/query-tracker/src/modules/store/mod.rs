@@ -35,7 +35,7 @@ const PATTERN_COLUMNS: &str = "pattern_id, program, human_name, offsets_lengths,
      demand_count, demand_at_create, total_cost_us, failed_count, \
      cost_with_index_us, cost_with_index_count, cost_without_index_us, cost_without_index_count, \
      variety_estimate, status, last_idx_scan, index_bytes, discrepancy_state, discrepancy_ratio, \
-     explain_state";
+     explain_state, EXTRACT(EPOCH FROM created_at)::float8 AS created_at_epoch";
 
 /// Aggregate counts for metrics. `created`/`candidate`/`evicted`/`rejected`
 /// partition the table by lifecycle status (their sum is the total);
@@ -639,5 +639,6 @@ fn row_to_pattern(row: &QueryResult) -> Result<PatternRow, DbErr> {
         discrepancy_state: row.try_get("", "discrepancy_state")?,
         discrepancy_ratio: row.try_get("", "discrepancy_ratio")?,
         explain_state: row.try_get("", "explain_state")?,
+        created_at_epoch: row.try_get("", "created_at_epoch")?,
     })
 }

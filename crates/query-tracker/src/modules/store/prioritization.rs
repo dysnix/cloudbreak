@@ -110,5 +110,7 @@ pub fn gain_expr(compensation: f64) -> String {
 /// `without-index-compensation-factor`. Shared by the latency [`gain_expr`] and
 /// the regression guard so both judge the with/without comparison identically.
 pub fn compensated_without_avg_expr(compensation: f64) -> String {
-    format!("(cost_without_index_us::float8 / GREATEST(cost_without_index_count, 1)) * {compensation}")
+    format!(
+        "(cost_without_index_us::float8 / GREATEST(cost_without_index_count, 1)) * {compensation}"
+    )
 }

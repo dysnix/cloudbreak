@@ -81,10 +81,13 @@ lazy_static::lazy_static! {
         "index",
     );
 
-    /// Per-index supply (`idx_scan`), labelled by index name.
-    pub static ref INDEX_IDX_SCAN: IntGaugeVec = register_gauge_vec(
-        "query_tracker_index_idx_scan",
-        "Postgres idx_scan (supply) per created index",
+    /// Per-index supply, labelled by index name. This is the **compensated**
+    /// `idx_scan` (raw ÷ `SCANS_PER_REQUEST`, since a served GPA scans both
+    /// tables of the pair), so it lines up ~1:1 with `INDEX_DEMAND` for a healthy
+    /// index — the raw Postgres counter is never exported.
+    pub static ref INDEX_COMPENSATED_IDX_SCAN: IntGaugeVec = register_gauge_vec(
+        "query_tracker_index_compensated_idx_scan",
+        "Compensated Postgres idx_scan (supply, raw idx_scan / 2) per created index",
         "index",
     );
 
@@ -93,6 +96,18 @@ lazy_static::lazy_static! {
         "query_tracker_index_variety",
         "Estimated distinct filter values served per created index",
         "index",
+    );
+
+    /// Result of the **last** EXPLAIN sampling pass: number of created indexes in
+    /// each `explain_state` (`none` / `accounts_table` / `snapshot_accounts_table`
+    /// / `both`). Overwritten every pass, so it is a snapshot of the latest run,
+    /// not a cumulative count; `none` is the "planner would not use it on either
+    /// table" bucket worth alerting on. Stays at its initial zeros when
+    /// `explain-enabled` is off (the pass never runs).
+    pub static ref EXPLAIN_STATE: IntGaugeVec = register_gauge_vec(
+        "query_tracker_explain_state",
+        "Created indexes by planner-usage verdict from the last EXPLAIN sampling pass",
+        "state",
     );
 }
 
@@ -141,6 +156,7 @@ pub fn init() {
     lazy_static::initialize(&REGRESSED_INDEXES);
     lazy_static::initialize(&OBSERVATIONS_TOTAL);
     lazy_static::initialize(&INDEX_DEMAND);
-    lazy_static::initialize(&INDEX_IDX_SCAN);
+    lazy_static::initialize(&INDEX_COMPENSATED_IDX_SCAN);
     lazy_static::initialize(&INDEX_VARIETY);
+    lazy_static::initialize(&EXPLAIN_STATE);
 }

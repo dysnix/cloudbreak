@@ -5,32 +5,62 @@
 
 //! `GET /debug/candidates` — the ranked creation queue.
 //!
-//! Read-only JSON view of the candidates in the exact order the creation loop
-//! would pick them, each annotated with its priority score under the active
+//! Read-only JSON view of the candidates the creation loop would build, each
+//! annotated with its priority score under the active
 //! [`PriorityMode`](cloudbreak_core::PriorityMode), so operators can see *why*
 //! an index will (or will not) be built without querying Postgres by hand.
+//!
+//! Alongside the `score` and its raw inputs (`demand_count`, `failed_count`,
+//! `variety_estimate`) it surfaces `avg_cost_ms` (total cost ÷ demand) and
+//! `avg_cost_without_index_ms` plus the measured `latency_gain`
+//! (without-index ÷ with-index) — the otherwise-opaque inputs to the score's
+//! `gain` term. Usually a candidate has never had an index, so `avg_cost_ms`
+//! and `avg_cost_without_index_ms` coincide and `latency_gain` is `null`; for a
+//! pattern that was previously created (then evicted/recovered) they diverge and
+//! carry real signal.
+//!
+//! ## Query parameters
+//!
+//! - `order` — `score` (default), `demand_count`, `avg_cost_ms`, `variety_estimate`.
+//! - `dir` — `asc` | `desc` (default `desc`).
+//! - `limit` — max rows (default: all).
+//! - `example`, `pattern_id`, `verbose` — include the heavier fields.
+//!
+//! Examples:
+//! - `GET /debug/candidates`
+//! - `GET /debug/candidates?order=demand_count&limit=20`
+//! - `GET /debug/candidates?order=avg_cost_ms&dir=desc&example=true&pattern_id=true`
 
-use super::db_error;
+use super::{
+    DebugQuery, Dir, avg_ms, bad_request, db_error, latency_gain, order_and_limit, round2,
+};
+use crate::modules::store::patterns::PatternRow;
 use crate::server::{AppState, json};
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Response, StatusCode};
-use serde_json::json as jval;
+use serde_json::{Value, json as jval};
 use std::sync::Arc;
 
-/// How many candidates the debug view returns; just a readable page size.
-const DEBUG_CANDIDATE_LIMIT: u64 = 100;
+/// Upper bound on candidates pulled for a debug listing before ordering/limit.
+/// The queue is demand-gated so this is generous; `total` is capped by it.
+const CANDIDATE_FETCH_CAP: u64 = 10_000;
 
-pub async fn handle(state: &Arc<AppState>) -> Response<Full<Bytes>> {
+pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full<Bytes>> {
+    let q = match DebugQuery::parse(query) {
+        Ok(q) => q,
+        Err(e) => return bad_request(e),
+    };
     let cfg = &state.config;
-    let rows = match state
+
+    let scored = match state
         .store
         .top_candidates_scored(
             cfg.priority_mode,
             cfg.without_index_compensation_factor,
             cfg.index_generation_threshold,
             cfg.cost_eligibility_threshold_us,
-            DEBUG_CANDIDATE_LIMIT,
+            CANDIDATE_FETCH_CAP,
         )
         .await
     {
@@ -38,24 +68,55 @@ pub async fn handle(state: &Arc<AppState>) -> Response<Full<Bytes>> {
         Err(e) => return db_error("candidates", e),
     };
 
-    let items: Vec<_> = rows
+    let order = q.order.as_deref().unwrap_or("score");
+    let key: fn(&(PatternRow, f64)) -> f64 = match order {
+        "score" => |x| x.1,
+        "demand_count" => |x| x.0.demand_count as f64,
+        "avg_cost_ms" => |x| avg_ms(x.0.total_cost_us, x.0.demand_count).unwrap_or(0.0),
+        "variety_estimate" => |x| x.0.variety_estimate as f64,
+        other => {
+            return bad_request(format!(
+                "invalid order '{other}' (candidates: score, demand_count, avg_cost_ms, variety_estimate)"
+            ));
+        }
+    };
+    let dir = q.dir.unwrap_or(Dir::Desc);
+
+    let (total, rows) = order_and_limit(scored, key, dir, q.limit);
+    let items: Vec<Value> = rows
         .iter()
-        .map(|(r, score)| {
-            jval!({
-                "pattern_id": r.pattern_id,
-                "index": r.human_name,
-                "score": score,
-                "demand_count": r.demand_count,
-                "total_cost_us": r.total_cost_us,
-                "failed_count": r.failed_count,
-                "variety_estimate": r.variety_estimate,
-                "example_request": r.example_request,
-            })
-        })
+        .map(|(r, score)| candidate_view(r, *score, &q))
         .collect();
 
     json(
         StatusCode::OK,
-        &jval!({ "priority_mode": format!("{:?}", cfg.priority_mode), "candidates": items }),
+        &jval!({
+            "priority_mode": format!("{:?}", cfg.priority_mode),
+            "total": total,
+            "count": items.len(),
+            "limit": q.limit,
+            "candidates": items,
+        }),
     )
+}
+
+fn candidate_view(r: &PatternRow, score: f64, q: &DebugQuery) -> Value {
+    let mut obj = jval!({
+        "index": r.human_name,
+        "score": round2(score),
+        "demand_count": r.demand_count,
+        "failed_count": r.failed_count,
+        "variety_estimate": r.variety_estimate,
+        "avg_cost_ms": avg_ms(r.total_cost_us, r.demand_count),
+        "avg_cost_without_index_ms": avg_ms(r.cost_without_index_us, r.cost_without_index_count),
+        "latency_gain": latency_gain(r),
+    });
+    let map = obj.as_object_mut().expect("jval! built an object");
+    if q.show_pattern_id {
+        map.insert("pattern_id".into(), jval!(r.pattern_id));
+    }
+    if q.show_example {
+        map.insert("example_request".into(), r.example_request.clone().into());
+    }
+    obj
 }

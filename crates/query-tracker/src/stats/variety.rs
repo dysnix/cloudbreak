@@ -180,7 +180,10 @@ mod tests {
         let mut restored = VarietySketch::from_bytes(Some(&s.to_bytes()));
         assert_eq!(before, restored.estimate());
         // Garbage / missing blob degrades to empty.
-        assert_eq!(VarietySketch::from_bytes(Some(&[0xFF, 0x00, 0x11])).estimate(), 0);
+        assert_eq!(
+            VarietySketch::from_bytes(Some(&[0xFF, 0x00, 0x11])).estimate(),
+            0
+        );
         assert_eq!(VarietySketch::from_bytes(None).estimate(), 0);
     }
 }

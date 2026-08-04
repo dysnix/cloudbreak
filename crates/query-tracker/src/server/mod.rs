@@ -82,10 +82,14 @@ async fn route(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<By
         (&Method::POST, cloudbreak_core::modules::query_tracker_api::TRACK_PATH) => {
             endpoints::track::handle(req, &state).await
         }
-        (&Method::GET, "/debug/candidates") => operational::debug_candidates::handle(&state).await,
-        (&Method::GET, "/debug/created") => operational::debug_created::handle(&state).await,
+        (&Method::GET, "/debug/candidates") => {
+            operational::debug_candidates::handle(&state, req.uri().query()).await
+        }
+        (&Method::GET, "/debug/created") => {
+            operational::debug_created::handle(&state, req.uri().query()).await
+        }
         (&Method::GET, "/debug/discrepancies") => {
-            operational::debug_discrepancies::handle(&state).await
+            operational::debug_discrepancies::handle(&state, req.uri().query()).await
         }
         (&Method::GET, "/metrics") => operational::metrics::handle(),
         (&Method::GET, "/health") => operational::health::handle(),

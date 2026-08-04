@@ -9,8 +9,8 @@
 
 use crate::stats::metrics;
 use http_body_util::Full;
-use hyper::body::Bytes;
 use hyper::Response;
+use hyper::body::Bytes;
 
 pub fn handle() -> Response<Full<Bytes>> {
     Response::builder()

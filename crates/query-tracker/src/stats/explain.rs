@@ -27,14 +27,19 @@
 //! example is available. Each index pair is probed on **both** physical tables
 //! (`accounts` and `snapshot_accounts`), one log line per table.
 //!
-//! It is purely diagnostic: it only emits a log warning (corroborating
-//! `discrepancy`) when the planner would not use an index — it writes nothing to
-//! the DB, updates no metrics, and never creates or drops anything. Off unless
-//! `explain-enabled = true`.
+//! It is diagnostic only — it never creates or drops anything. Per pass it:
+//! logs a warning (corroborating `discrepancy`, with the compensated `idx_scan`
+//! for context) when the planner would not use an index; persists the combined
+//! verdict to `index_patterns.explain_state` (`none` / `accounts_table` /
+//! `snapshot_accounts_table` / `both`) for the debug endpoints; and refreshes
+//! the `query_tracker_explain_state` gauge with this pass's per-state counts.
+//! Off unless `explain-enabled = true`.
 
 use crate::modules::INDEX_TABLES;
 use crate::modules::store::Store;
 use crate::modules::store::patterns::explain_state;
+use crate::modules::store::prioritization::SCANS_PER_REQUEST;
+use crate::stats::metrics;
 use cloudbreak_core::QueryTrackerConfig;
 use cloudbreak_core::modules::index_identity::IndexIdentity;
 use cloudbreak_core::modules::rpc_filter_type::{RpcFilterType, RpcProgramAccountsConfig};
@@ -57,6 +62,18 @@ pub async fn run(store: Store, config: QueryTrackerConfig) {
 }
 
 async fn run_pass(store: &Store) -> Result<(), DbErr> {
+    // Count each verdict so the last-pass gauge reflects only this run. Seed all
+    // four buckets at zero so a state that vanished this pass reports 0 rather
+    // than keeping a stale value.
+    let mut counts: HashMap<&'static str, i64> = [
+        (explain_state::NONE, 0),
+        (explain_state::ACCOUNTS, 0),
+        (explain_state::SNAPSHOT, 0),
+        (explain_state::BOTH, 0),
+    ]
+    .into_iter()
+    .collect();
+
     for row in store.list_created().await? {
         let identity = match row.identity() {
             Ok(i) => i,
@@ -67,6 +84,10 @@ async fn run_pass(store: &Store) -> Result<(), DbErr> {
         };
         // Real memcmp values from the stored example (empty ⇒ fall back to zeros).
         let example = example_memcmps(row.example_request.as_ref());
+        // Compensated supply (raw idx_scan is ~2x per request; a GPA scans both
+        // tables of the pair), shown in the warn so "planner says unused but it
+        // is clearly being scanned" is obvious inline.
+        let compensated_idx_scan = row.last_idx_scan / SCANS_PER_REQUEST;
         // The index pair spans both tables; probe each, report per table, and
         // fold the two verdicts into one persisted state (`accounts` = table 0,
         // `snapshot_accounts` = table 1).
@@ -78,7 +99,8 @@ async fn run_pass(store: &Store) -> Result<(), DbErr> {
                 Ok(false) => warn!(
                     target: "query_tracker_explain",
                     "planner would NOT use '{}' on {table} for its own probe query — likely stale \
-                     stats or predicate mismatch (starved)", row.human_name
+                     stats or predicate mismatch (compensated_idx_scan~{compensated_idx_scan})",
+                    row.human_name
                 ),
                 Err(e) => error!(
                     target: "query_tracker_explain",
@@ -94,12 +116,20 @@ async fn run_pass(store: &Store) -> Result<(), DbErr> {
             (false, true) => explain_state::SNAPSHOT,
             (true, true) => explain_state::BOTH,
         };
+        *counts.entry(state).or_insert(0) += 1;
         if let Err(e) = store.set_explain_state(&row.pattern_id, state).await {
             error!(
                 target: "query_tracker_explain",
                 "failed to persist explain_state for '{}': {e:?}", row.human_name
             );
         }
+    }
+
+    // Publish the last-pass snapshot (all four buckets, including zeros).
+    for (state, count) in &counts {
+        metrics::EXPLAIN_STATE
+            .with_label_values(&[state])
+            .set(*count);
     }
     Ok(())
 }
