@@ -12,11 +12,35 @@
 //! `snapshot_accounts`).
 //!
 //! There is no in-memory queue: candidates live in the DB and are ranked on
-//! read, so nothing is lost across restarts. When the count reaches
-//! `max-auto-indexes`, creation is *paused* until eviction makes room again —
-//! candidates are kept queued in `index_patterns` with no loss of data, never
-//! dropped. Physical `CREATE INDEX IF NOT EXISTS` plus a persisted `created`
-//! status means we never re-issue an index we already have.
+//! read, so nothing is lost across restarts. Physical `CREATE INDEX IF NOT
+//! EXISTS` plus a persisted `created` status means we never re-issue an index we
+//! already have.
+//!
+//! ## Two thresholds: fill target and hard cap
+//!
+//! Creation is bounded by two sizes derived from config:
+//! - **fill target** = `floor(eviction-fill-threshold × max-auto-indexes)` — the
+//!   operating size the eviction pass trims back to.
+//! - **hard cap** = `max-auto-indexes` — never exceeded.
+//!
+//! Below the target the top candidate is built freely. In the *buffer band*
+//! `(target, max]` the **value guard** ([`value_guard_allows`]) only builds an
+//! index that out-scores the index it would displace, so the table climbs toward
+//! the cap only for genuinely valuable indexes; the eviction pass later reclaims
+//! the buffer back to the target. The one exception: if nothing is currently
+//! reclaimable to displace (no eligible eviction candidate at that position), the
+//! candidate is built anyway up to the cap — the hard cap is the real ceiling and
+//! eviction reclaims once indexes go idle. At the cap, creation is *paused* —
+//! candidates stay queued in `index_patterns`, never dropped.
+//!
+//! ### Stickiness
+//!
+//! Both sides of the guard use the same `priority-mode` score, but a `created`
+//! index carries realized signal a fresh candidate cannot: its with-index
+//! latency `gain` and its `idx_scan` supply. That structurally favors incumbents
+//! ("stickiness") — usually desirable, since proven indexes should not yield to
+//! unproven ones — but tunable via `value-guard-creation-bias`, which scales the
+//! candidate's score in the comparison (`> 1` less sticky, `< 1` stickier).
 
 use crate::modules::indexer_backpressure;
 use crate::modules::store::{Store, patterns::PatternRow};
@@ -85,28 +109,35 @@ pub async fn run(store: Store, config: QueryTrackerConfig) {
             continue;
         }
 
-        // Cap check: a full table just defers creation; candidates persist.
-        if let Some(max) = config.max_auto_indexes {
-            match store.count_table_indexes(CAP_TABLE).await {
-                Ok(current) => {
-                    metrics::SNAPSHOT_ACCOUNTS_INDEXES.set(current);
-                    if current as usize >= max {
-                        warn!(
-                            target: "query_tracker_creation",
-                            "auto-index cap reached ({current}/{max}); deferring creation"
-                        );
-                        continue;
-                    }
+        // Snapshot the physical index count once — drives both the hard cap and
+        // the creation-time value guard below.
+        let current = match config.max_auto_indexes {
+            Some(_) => match store.count_table_indexes(CAP_TABLE).await {
+                Ok(c) => {
+                    metrics::SNAPSHOT_ACCOUNTS_INDEXES.set(c);
+                    c
                 }
                 Err(e) => {
                     error!(target: "query_tracker_creation", "failed to count indexes: {e:?}");
                     continue;
                 }
-            }
+            },
+            None => 0,
+        };
+
+        // Hard ceiling: never exceed the cap, whatever the value guard decides.
+        if let Some(max) = config.max_auto_indexes
+            && current as usize >= max
+        {
+            warn!(
+                target: "query_tracker_creation",
+                "auto-index cap reached ({current}/{max}); deferring creation"
+            );
+            continue;
         }
 
         let candidates = match store
-            .top_candidates(
+            .top_candidates_scored(
                 config.priority_mode,
                 config.without_index_compensation_factor,
                 config.index_generation_threshold,
@@ -122,9 +153,9 @@ pub async fn run(store: Store, config: QueryTrackerConfig) {
             }
         };
 
-        // Pick the highest-priority candidate that passes program scoping and
-        // parses back to a valid identity.
-        let chosen = candidates.into_iter().find_map(|row| {
+        // Highest-priority candidate that passes program scoping and parses back
+        // to a valid identity, carrying its score for the value guard.
+        let chosen = candidates.into_iter().find_map(|(row, score)| {
             let identity = match row.identity() {
                 Ok(i) => i,
                 Err(e) => {
@@ -132,14 +163,132 @@ pub async fn run(store: Store, config: QueryTrackerConfig) {
                     return None;
                 }
             };
-            program_allowed(identity.program, &config).then_some((row, identity))
+            program_allowed(identity.program, &config).then_some((row, identity, score))
         });
 
-        let Some((row, identity)) = chosen else {
+        let Some((row, identity, score)) = chosen else {
             continue;
         };
 
+        // Creation-time value guard (see module docs): in the buffer band, only
+        // build an index that out-values the one it would displace.
+        if !value_guard_allows(&store, &config, current, &identity, score).await {
+            continue;
+        }
+
         create_pair(&store, &row, &identity).await;
+    }
+}
+
+/// Creation-time value guard. While the capped table sits in the *buffer band*
+/// — at or above the fill target `floor(eviction-fill-threshold × max-auto-indexes)`
+/// — a new index is only built when it out-scores the index it would displace.
+///
+/// ## The `over` position — why it is not simply "beat the worst index"
+///
+/// `over = current − target` is how many indexes the table already holds beyond
+/// the operating size. The eviction pass will reclaim those `over` least-valuable
+/// eligible indexes back down to `target`, so they are already "spoken for" and
+/// leaving regardless. A *new* index therefore does not compete with the very
+/// worst index — it competes with the first index that would still **survive**
+/// that trim: the one at position `over` in eviction (ascending-score) order,
+/// `E[over]`. Building the candidate pushes the overflow to `over + 1`; the
+/// subsequent trim drops `E[0..=over]`, so the candidate keeps a lasting slot iff
+/// it out-scores `E[over]`.
+///
+/// Worked example (`max = 200`, `fill = 0.7` ⇒ `target = 140`):
+/// - `current = 140` (`over = 0`) → compare against `E[0]`, the single worst
+///   eligible index: a straight swap-the-worst.
+/// - `current = 176` (`over = 36`) → the 36 worst eligible indexes are headed for
+///   the next trim anyway, so the candidate must beat `E[36]` (the 37th-worst) to
+///   earn a lasting slot; if it does, the trim removes `E[0..=36]` and it stays.
+///
+/// `value-guard-creation-bias` scales the candidate's score before the
+/// comparison to tune stickiness (see its config docs). Returns `true` when the
+/// index may be built: below the target, when the guard does not apply (eviction
+/// disabled, or no `max-auto-indexes`), when the candidate out-scores its
+/// boundary, or when there is **no reclaimable index to displace** at `over`
+/// (`over` beyond the eligible set — fewer eligible indexes than the overflow).
+/// That last case grows toward the hard cap and lets the eviction pass reclaim
+/// later, rather than stall creation behind indexes that are not yet droppable —
+/// the cap is the real ceiling. Only a DB error, or losing the comparison
+/// against a real boundary index, defers creation.
+async fn value_guard_allows(
+    store: &Store,
+    config: &QueryTrackerConfig,
+    current: i64,
+    identity: &IndexIdentity,
+    score: f64,
+) -> bool {
+    // The guard only applies when eviction can reclaim the buffer and a cap
+    // defines the target; otherwise fall back to cap-only creation.
+    let Some(max) = config.max_auto_indexes else {
+        return true;
+    };
+    if !config.index_eviction_enabled {
+        return true;
+    }
+    let target = (config.eviction_fill_threshold * max as f64).floor() as i64;
+    let over = current - target;
+    if over < 0 {
+        return true; // below the operating size — build freely
+    }
+
+    let boundary = match store
+        .eviction_boundary_score(
+            config.priority_mode,
+            config.without_index_compensation_factor,
+            config.index_min_idle.as_secs() as i64,
+            config.index_min_age_grace.as_secs() as i64,
+            over,
+        )
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            error!(
+                target: "query_tracker_creation",
+                "value guard: boundary lookup failed: {e:?}; deferring creation"
+            );
+            return false;
+        }
+    };
+
+    let bias = config.value_guard_creation_bias;
+    let biased = score * bias;
+    match boundary {
+        Some(b) if biased > b => {
+            info!(
+                target: "query_tracker_creation",
+                "value guard: building '{}' (score {score:.3}×{bias:.2}={biased:.3}) beats displaced \
+                 index (score {b:.3}) at over={over}",
+                identity.human_name()
+            );
+            true
+        }
+        Some(b) => {
+            info!(
+                target: "query_tracker_creation",
+                "value guard: deferring '{}' (score {score:.3}×{bias:.2}={biased:.3}) — does not beat \
+                 displaced index (score {b:.3}) at over={over}",
+                identity.human_name()
+            );
+            false
+        }
+        None => {
+            // Above the target but nothing reclaimable to compare against
+            // (fewer eligible indexes than the overflow). Build anyway — the
+            // hard cap still bounds growth, and the eviction pass reclaims
+            // whatever becomes eligible later. Deferring here would stall
+            // creation behind indexes that are not (yet) droppable.
+            info!(
+                target: "query_tracker_creation",
+                "value guard: building '{}' at over={over} — no reclaimable index to displace; \
+                 growing toward the cap, eviction reclaims once indexes go idle",
+                identity.human_name()
+            );
+            true
+        }
     }
 }
 

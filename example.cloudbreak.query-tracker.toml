@@ -56,9 +56,17 @@ index-eviction-enabled = false
 index-eviction-interval = "1h"
 index-min-age-grace = "1h"
 index-min-idle = "24h"
-# Only start dropping once the capped table is this fraction full (needs
-# max-auto-indexes). Below it, creation just slows instead of evicting.
+# Fill target as a fraction of max-auto-indexes (needs max-auto-indexes). Below
+# the target, creation builds freely; in the buffer band above it, a
+# creation-time value guard only builds an index that out-values the one it would
+# displace (or builds anyway up to the hard cap when nothing is reclaimable to
+# displace); eviction then trims the buffer back down to the target.
 eviction-fill-threshold = 0.9
+# Multiplier on a creation candidate's score in the value guard, tuning
+# stickiness toward existing indexes (they carry gain/idx_scan signal new
+# candidates lack). >1.0 = less sticky (build new indexes more readily),
+# <1.0 = stickier (favor incumbents), 1.0 = compare scores as-is.
+value-guard-creation-bias = 1.0
 drop-lock-timeout = "5s"
 drop-retries = 1
 

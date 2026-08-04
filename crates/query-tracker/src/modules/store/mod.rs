@@ -37,6 +37,21 @@ const PATTERN_COLUMNS: &str = "pattern_id, program, human_name, offsets_lengths,
      variety_estimate, status, last_idx_scan, index_bytes, discrepancy_state, discrepancy_ratio, \
      explain_state, EXTRACT(EPOCH FROM created_at)::float8 AS created_at_epoch";
 
+/// Shared `WHERE` fragment defining an **eviction-eligible** created index:
+/// past `index-min-age-grace` (`$1`) and idle by **both** supply and demand for
+/// `index-min-idle` (`$2`). Used by both [`Store::eviction_candidates`] and
+/// [`Store::eviction_boundary_score`] so the eviction trim and the creation-time
+/// value guard share one definition of "droppable" and can never drift apart.
+fn eviction_gate() -> String {
+    format!(
+        "status = '{created}' \
+         AND EXTRACT(EPOCH FROM (now() - COALESCE(created_at, first_seen_at))) > $1 \
+         AND EXTRACT(EPOCH FROM (now() - COALESCE(last_seen_used, created_at, first_seen_at))) > $2 \
+         AND EXTRACT(EPOCH FROM (now() - COALESCE(last_demand_at, first_seen_at))) > $2",
+        created = status::CREATED,
+    )
+}
+
 /// Aggregate counts for metrics. `created`/`candidate`/`evicted`/`rejected`
 /// partition the table by lifecycle status (their sum is the total);
 /// `discrepant` is a sub-count of `created` and orthogonal to status.
@@ -157,28 +172,12 @@ impl Store {
 
     // ---- creation ---------------------------------------------------------
 
-    /// Highest-priority creation candidates, ranked per [`PriorityMode`].
-    /// Numeric parameters are embedded as literals (they are never
-    /// user-controlled), which keeps the dynamic ORDER BY / cost gate simple.
-    pub async fn top_candidates(
-        &self,
-        mode: PriorityMode,
-        compensation: f64,
-        threshold: u32,
-        cost_eligibility_us: Option<u64>,
-        limit: u64,
-    ) -> Result<Vec<PatternRow>, DbErr> {
-        Ok(self
-            .top_candidates_scored(mode, compensation, threshold, cost_eligibility_us, limit)
-            .await?
-            .into_iter()
-            .map(|(row, _)| row)
-            .collect())
-    }
-
-    /// Like [`Store::top_candidates`] but also returns each pattern's numeric
-    /// score — the exact SQL ranking value — so the debug endpoint can show
-    /// operators the number driving the order without re-deriving it in Rust.
+    /// Highest-priority creation candidates, ranked per [`PriorityMode`], each
+    /// with its numeric score — the exact SQL ranking value — so callers can
+    /// show operators (or feed the value guard) the number driving the order
+    /// without re-deriving it in Rust. Numeric parameters are embedded as
+    /// literals (they are never user-controlled), which keeps the dynamic
+    /// ORDER BY / cost gate simple.
     pub async fn top_candidates_scored(
         &self,
         mode: PriorityMode,
@@ -306,12 +305,13 @@ impl Store {
     /// Rows come back in **drop-priority order — least useful first** — each
     /// paired with its numeric score: the same [`prioritization::score_expr`]
     /// the creation loop ranks by, but ascending, so eviction drops exactly what
-    /// creation would build last. The caller drops from the top until the table
-    /// is back under its fill target. Ordering lives here, next to the
+    /// creation would build last. The eviction pass drops from the top until the
+    /// table is back at its fill target. Ordering lives here, next to the
     /// eligibility filter, so the whole "what may be dropped, and in what order"
     /// decision is one SQL statement. `pattern_id` breaks ties deterministically
-    /// (idle rows share the same low score). The score is returned so the caller
-    /// can weigh each drop against the pending creation it would make room for.
+    /// (idle rows share the same low score). The score is also what the
+    /// creation-time value guard compares a new candidate against (via
+    /// [`Store::eviction_boundary_score`]).
     pub async fn eviction_candidates(
         &self,
         mode: PriorityMode,
@@ -322,12 +322,9 @@ impl Store {
         let score = prioritization::score_expr(mode, compensation);
         let sql = format!(
             "SELECT {PATTERN_COLUMNS}, ({score})::float8 AS score FROM index_patterns \
-             WHERE status = '{created}' \
-               AND EXTRACT(EPOCH FROM (now() - COALESCE(created_at, first_seen_at))) > $1 \
-               AND EXTRACT(EPOCH FROM (now() - COALESCE(last_seen_used, created_at, first_seen_at))) > $2 \
-               AND EXTRACT(EPOCH FROM (now() - COALESCE(last_demand_at, first_seen_at))) > $2 \
+             WHERE {gate} \
              ORDER BY score ASC, pattern_id ASC",
-            created = status::CREATED,
+            gate = eviction_gate(),
         );
         let rows = self
             .db
@@ -340,6 +337,44 @@ impl Store {
         rows.iter()
             .map(|r| Ok((row_to_pattern(r)?, r.try_get::<f64>("", "score")?)))
             .collect()
+    }
+
+    /// Score of the eviction candidate at position `offset` in drop-priority
+    /// order (least useful first) — the index that a newly created index would
+    /// displace when the table is already `offset` indexes above the fill
+    /// target. This is the boundary the creation-time value guard compares a new
+    /// candidate against: a candidate is only built when it out-scores this.
+    ///
+    /// Same eligibility gate and scoring as [`Store::eviction_candidates`], so
+    /// the two sides of the guard are strictly comparable. Returns `None` when
+    /// there is no eligible index at `offset` (fewer reclaimable indexes than the
+    /// overflow), which the guard treats as "nothing to displace → build anyway
+    /// up to the hard cap and let eviction reclaim later".
+    pub async fn eviction_boundary_score(
+        &self,
+        mode: PriorityMode,
+        compensation: f64,
+        min_idle_secs: i64,
+        min_age_secs: i64,
+        offset: i64,
+    ) -> Result<Option<f64>, DbErr> {
+        let score = prioritization::score_expr(mode, compensation);
+        let sql = format!(
+            "SELECT ({score})::float8 AS score FROM index_patterns \
+             WHERE {gate} \
+             ORDER BY score ASC, pattern_id ASC \
+             OFFSET $3 LIMIT 1",
+            gate = eviction_gate(),
+        );
+        self.db
+            .query_one(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                sql,
+                [min_age_secs.into(), min_idle_secs.into(), offset.into()],
+            ))
+            .await?
+            .map(|row| row.try_get::<f64>("", "score"))
+            .transpose()
     }
 
     /// Mark a pattern as evicted after its index pair has been dropped.

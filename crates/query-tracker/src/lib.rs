@@ -42,7 +42,12 @@
 //!    store for the top candidates ranked by `PriorityMode`
 //!    ([`modules::store::prioritization`]), and — if the program is allowed —
 //!    issues the `CREATE INDEX` **pair** on `accounts` + `snapshot_accounts`,
-//!    marking the pattern `created`.
+//!    marking the pattern `created`. Below the fill target the top candidate is
+//!    built freely; in the buffer band above it a **creation-time value guard**
+//!    only builds a candidate that out-scores the index it would displace (or
+//!    when nothing is reclaimable to displace, builds anyway up to the cap and
+//!    lets eviction reclaim later), so the table climbs toward `max-auto-indexes`
+//!    only for genuinely valuable indexes.
 //! 5. **Eviction & stats** — the [`modules::eviction`] loop later refreshes
 //!    supply (`idx_scan`) from Postgres, records the demand-vs-supply verdict
 //!    ([`stats::discrepancy`]), updates per-index [`stats::metrics`], and may
@@ -64,8 +69,10 @@
 //!      dropped, and avoids the drop→slow→rebuild churn loop);
 //!    - the indexer is not under backpressure ([`modules::indexer_backpressure`]).
 //!
-//!    When over the fill line(`eviction-fill-threshold`), the least-useful eligible pairs (fewest scans,
-//!    then least demand) are dropped just until the table is back at the target.
+//!    When above the fill target (`eviction-fill-threshold`), the least-valuable
+//!    eligible pairs (ascending `PriorityMode` score) are dropped just until the
+//!    table is back at the target — unconditionally, since entry into the buffer
+//!    band was already value-gated at creation.
 
 pub mod error;
 pub mod modules;

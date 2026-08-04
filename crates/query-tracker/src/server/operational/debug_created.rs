@@ -35,9 +35,10 @@
 //! (`order=score`, ascending).
 //!
 //! This is the **eligible queue, not a guarantee**: the actual drop additionally
-//! depends on the fill threshold (`eviction-fill-threshold`) and the value guard
-//! evaluated at runtime, so an index listed here may still be kept. Omit the
-//! filter for the full created set.
+//! depends on the table being above the fill target (`eviction-fill-threshold`)
+//! at runtime — eviction only trims the buffer band back down to the target — so
+//! an index listed here may still be kept. Omit the filter for the full created
+//! set.
 //!
 //! Examples:
 //! - `GET /debug/created?filter=eviction_candidates` (the eviction queue)

@@ -108,7 +108,11 @@ impl IndexIdentity {
     /// Reconstruct an identity from its stored parts (e.g. a database row).
     /// `offsets_lengths` is assumed already canonical (sorted/deduped), as it is
     /// when produced by [`IndexIdentity::parse`] before storage.
-    pub fn from_parts(program: Pubkey, offsets_lengths: Vec<(u64, u64)>, datasize: Option<u64>) -> Self {
+    pub fn from_parts(
+        program: Pubkey,
+        offsets_lengths: Vec<(u64, u64)>,
+        datasize: Option<u64>,
+    ) -> Self {
         Self {
             program,
             filter: ParsedIndexFilter {
@@ -177,7 +181,10 @@ impl IndexIdentity {
             .collect();
         columns.push("slot".to_string());
 
-        let mut where_clause = format!("owner = '\\x{}'::bytea", hex::encode(self.program.to_bytes()));
+        let mut where_clause = format!(
+            "owner = '\\x{}'::bytea",
+            hex::encode(self.program.to_bytes())
+        );
         if let Some(size) = self.filter.datasize {
             where_clause.push_str(&format!(" AND length(data) = {size}"));
         }

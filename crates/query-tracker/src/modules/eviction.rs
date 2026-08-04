@@ -23,35 +23,19 @@
 //!    starved-but-demanded index is safe simply because step 3 requires *both*
 //!    demand and scans to be idle, so a still-demanded index is never a drop
 //!    candidate.
-//! 3. **Drops** — only when the capped table is past `eviction-fill-threshold`
-//!    — the idlest pairs (no demand *and* no scans for `index-min-idle`, older
-//!    than `index-min-age-grace`). Below the fill line nothing is dropped. Once
-//!    the count reaches `max-auto-indexes`, index creation is paused until
-//!    eviction makes room again; all candidates are kept queued in
-//!    `index_patterns` with no loss of data, trading a little index budget for
-//!    stability.
+//! 3. **Drops (unconditional trim to target)** — when the capped table is above
+//!    the fill target (`floor(eviction-fill-threshold × max-auto-indexes)`), the
+//!    idlest eligible pairs (no demand *and* no scans for `index-min-idle`, older
+//!    than `index-min-age-grace`) are dropped in ascending-score order until the
+//!    table is back at the target. At or below the target nothing is dropped.
 //!
-//! ## Value guard — never trade down
-//!
-//! An eviction only pays off if the slot it frees gets refilled with something
-//! *more valuable*. So each drop is checked against the pending creation it
-//! would make room for, both scored by the same [`prioritization::score_expr`]:
-//! the least-useful eviction candidate is paired with the top creation
-//! candidate, the 2nd-least with the 2nd, and so on. A pair is only dropped when
-//! `evict_score < create_score`.
-//!
-//! Because eviction candidates ascend in score and creation candidates descend,
-//! the gap `evict − create` only widens with rank — so the *first* pair that
-//! fails the check means no later pair can pass, and we stop the pass entirely.
-//! Running out of creation candidates stops it too: with nothing more valuable
-//! waiting, freeing another slot would only shed value. A consequence is that
-//! the table may sit above the fill target when there is nothing worth swapping
-//! in — deliberately, since evicting for its own sake destroys value.
-//!
-//! The comparison inherits the priority mode's notion of "value": lifetime-total
-//! modes weigh an idle index by its *all-time* worth (so a once-hot index
-//! resists eviction), while [`Weighted`](cloudbreak_core::PriorityMode::Weighted)
-//! weighs **recent windowed** activity, so decisions track current throughput.
+//! Only eligible pairs are ever dropped — idle by **both** signals and past the
+//! age grace — so a still-demanded or freshly built index is never trimmed; if
+//! too few are eligible, the table simply stays above target until more go idle.
+//! The trim inherits the priority mode's notion of "value": lifetime-total modes
+//! weigh an idle index by its *all-time* worth, while
+//! [`Weighted`](cloudbreak_core::PriorityMode::Weighted) weighs **recent
+//! windowed** activity, so decisions track current throughput.
 //!
 //! Drops are gated on indexer backpressure and run with a bounded `lock_timeout`
 //! plus a configurable retry; a drop that cannot take its lock is logged and
@@ -59,7 +43,7 @@
 
 use crate::modules::store::patterns::status;
 use crate::modules::store::{Store, prioritization};
-use crate::modules::{CAP_TABLE, INDEX_TABLES, creation, indexer_backpressure};
+use crate::modules::{CAP_TABLE, INDEX_TABLES, indexer_backpressure};
 use crate::stats::discrepancy::{self, DiscrepancyState};
 use crate::stats::metrics;
 use cloudbreak_core::modules::index_identity::IndexIdentity;
@@ -105,21 +89,23 @@ async fn run_pass(store: &Store, config: &QueryTrackerConfig) -> Result<(), DbEr
     refresh_supply_and_discrepancy(store, config, &supply).await?;
     refresh_aggregate_metrics(store).await;
 
-    // Dropping requires a cap to define "full"; without one we never evict.
+    // Dropping requires a cap to define the target; without one we never evict.
     let Some(max) = config.max_auto_indexes else {
         return Ok(());
     };
     let current = store.count_table_indexes(CAP_TABLE).await?;
     metrics::SNAPSHOT_ACCOUNTS_INDEXES.set(current);
-    let fill = current as f64 / max as f64;
-    if fill < config.eviction_fill_threshold {
+    // The operating size we trim back to. The band (target, max] is a buffer the
+    // creation-time value guard only lets valuable indexes enter; here we simply
+    // reclaim back down to `target`.
+    let target = (config.eviction_fill_threshold * max as f64).floor() as i64;
+    if current <= target {
         return Ok(());
     }
 
     let min_idle = config.index_min_idle.as_secs() as i64;
     let min_age = config.index_min_age_grace.as_secs() as i64;
-    // Least-useful-first, each with its score (the inverse of the creation
-    // ranking), so we drop straight from the top until back at target.
+    // Eligible drops, least-useful first (idle by both signals, past age grace).
     let candidates = store
         .eviction_candidates(
             config.priority_mode,
@@ -132,43 +118,15 @@ async fn run_pass(store: &Store, config: &QueryTrackerConfig) -> Result<(), DbEr
         return Ok(());
     }
 
-    // Value guard: the score each freed slot would be refilled with, highest
-    // first. Paired rank-for-rank against `candidates` below; we never drop an
-    // index worth as much as the best pending creation it would displace.
-    let creation_scores = pending_creation_scores(store, config, candidates.len() as u64).await?;
-
-    let target = (config.eviction_fill_threshold * max as f64).floor() as i64;
     let mut count = current;
     let mut evicted = 0usize;
     let mut reclaimed: i64 = 0;
 
-    for (rank, (row, evict_score)) in candidates.iter().enumerate() {
+    // Unconditional trim: drop the least-valuable eligible pairs until back at
+    // the target (entry into the buffer was already value-gated at creation).
+    for (row, _evict_score) in &candidates {
         if count <= target {
             break;
-        }
-        // Only drop when a strictly more valuable creation is waiting for the
-        // slot. Scores ascend here and descend in `creation_scores`, so the
-        // first failing (or missing) counterpart means every later one fails
-        // too — stop the whole pass rather than trade value away.
-        match creation_scores.get(rank) {
-            Some(create_score) if *evict_score < *create_score => {}
-            Some(create_score) => {
-                info!(
-                    target: "query_tracker_eviction",
-                    "stopping eviction at '{}': its score {evict_score:.3} is not below the best \
-                     pending creation for this slot ({create_score:.3}); remaining candidates rank higher",
-                    row.human_name
-                );
-                break;
-            }
-            None => {
-                info!(
-                    target: "query_tracker_eviction",
-                    "stopping eviction at '{}': no pending creation left to justify freeing another slot",
-                    row.human_name
-                );
-                break;
-            }
         }
         if indexer_backpressure::is_under_pressure(
             &config.indexer_metrics,
@@ -209,7 +167,8 @@ async fn run_pass(store: &Store, config: &QueryTrackerConfig) -> Result<(), DbEr
     if evicted > 0 {
         info!(
             target: "query_tracker_eviction",
-            "evicted {evicted} idle index pair(s), reclaiming ~{reclaimed} bytes"
+            "evicted {evicted} idle index pair(s) to return to fill target ({target}/{max}), \
+             reclaiming ~{reclaimed} bytes"
         );
     }
     Ok(())
@@ -297,41 +256,6 @@ async fn run_regression_guard(store: &Store, config: &QueryTrackerConfig) -> Res
 /// Average microseconds per request for a `(sum_us, count)` bucket.
 fn avg_us(sum_us: i64, count: i64) -> f64 {
     sum_us as f64 / count.max(1) as f64
-}
-
-/// Scores of the patterns creation would build next, highest first — the value
-/// each freed slot would be refilled with. Mirrors the creation loop's own
-/// gates (demand threshold, cost eligibility, program allow/deny) so the guard
-/// compares against what would *actually* be created, not merely what exists.
-async fn pending_creation_scores(
-    store: &Store,
-    config: &QueryTrackerConfig,
-    limit: u64,
-) -> Result<Vec<f64>, DbErr> {
-    let scored = store
-        .top_candidates_scored(
-            config.priority_mode,
-            config.without_index_compensation_factor,
-            config.index_generation_threshold,
-            config.cost_eligibility_threshold_us,
-            limit,
-        )
-        .await?;
-    let mut scores = Vec::with_capacity(scored.len());
-    for (row, score) in scored {
-        match row.identity() {
-            Ok(identity) if creation::program_allowed(identity.program, config) => {
-                scores.push(score);
-            }
-            // Not program-allowed: would never be built, so it is not value we
-            // could gain — skip without consuming a pairing slot.
-            Ok(_) => {}
-            Err(e) => {
-                error!(target: "query_tracker_eviction", "skipping creation candidate in value guard: {e}");
-            }
-        }
-    }
-    Ok(scores)
 }
 
 /// Aggregate the raw `(index_name, idx_scan, bytes)` rows into per-`pattern_id`

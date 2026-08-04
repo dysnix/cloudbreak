@@ -926,6 +926,23 @@ pub struct QueryTrackerConfig {
         default = "QueryTrackerConfig::default_eviction_fill_threshold"
     )]
     pub eviction_fill_threshold: f64,
+    /// Multiplier applied to a **creation candidate's** score in the creation-time
+    /// value guard, when it is compared against the index it would displace. It
+    /// tunes *stickiness* toward existing indexes.
+    ///
+    /// Both sides are scored by the same `priority-mode`, but a `created` index
+    /// carries realized signal a fresh candidate cannot have yet — its
+    /// with-index latency `gain` and its `idx_scan` supply — which structurally
+    /// biases the comparison toward incumbents. This factor compensates for that:
+    /// `> 1.0` favors building new indexes (less sticky, more churn), `< 1.0`
+    /// favors keeping incumbents (stickier), and `1.0` (default) compares the two
+    /// scores as-is. Only consulted while the table is in the buffer band
+    /// (at/above the fill target); below the target, creation is unguarded.
+    #[serde(
+        rename = "value-guard-creation-bias",
+        default = "QueryTrackerConfig::default_value_guard_creation_bias"
+    )]
+    pub value_guard_creation_bias: f64,
     /// `lock_timeout` applied to each DROP INDEX. If the lock cannot be taken in
     /// this window the drop is skipped (with a warning) and retried next pass.
     #[serde(
@@ -1055,6 +1072,10 @@ impl QueryTrackerConfig {
         0.9
     }
 
+    const fn default_value_guard_creation_bias() -> f64 {
+        1.0
+    }
+
     fn default_drop_lock_timeout() -> Duration {
         Duration::from_secs(5)
     }
@@ -1143,6 +1164,7 @@ impl Default for QueryTrackerConfig {
             index_min_age_grace: Self::default_index_min_age_grace(),
             index_min_idle: Self::default_index_min_idle(),
             eviction_fill_threshold: Self::default_eviction_fill_threshold(),
+            value_guard_creation_bias: Self::default_value_guard_creation_bias(),
             drop_lock_timeout: Self::default_drop_lock_timeout(),
             drop_retries: Self::default_drop_retries(),
             index_regression_guard: IndexRegressionGuard::default(),
@@ -1419,5 +1441,7 @@ mod tests {
         assert_eq!(c.index_min_idle, Duration::from_secs(86400));
         assert_eq!(c.index_min_age_grace, Duration::from_secs(3600));
         assert_eq!(c.index_eviction_interval, Duration::from_secs(3600));
+        // Neutral value guard by default: candidate and incumbent scores compared as-is.
+        assert_eq!(c.value_guard_creation_bias, 1.0);
     }
 }
