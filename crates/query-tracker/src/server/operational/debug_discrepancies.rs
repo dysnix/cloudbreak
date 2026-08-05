@@ -31,12 +31,14 @@
 //! - `GET /debug/discrepancies?min_ratio=1&dir=desc` (over-scanned only, worst first)
 //! - `GET /debug/discrepancies?max_ratio=0.5&limit=10` (worst starvation only)
 
-use super::{DebugQuery, Dir, bad_request, created_view, db_error, envelope, order_and_limit};
+use super::{
+    DebugQuery, Dir, bad_request, created_view, db_error, envelope, order_and_limit, score_k,
+};
 use crate::server::{AppState, json};
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Response, StatusCode};
-use serde_json::Value;
+use serde_json::{Value, json as jval};
 use std::sync::Arc;
 
 pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full<Bytes>> {
@@ -52,7 +54,12 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
         ));
     }
 
-    let rows = match state.store.list_created().await {
+    let cfg = &state.config;
+    let rows = match state
+        .store
+        .list_created_scored(cfg.priority_mode, cfg.without_index_compensation_factor)
+        .await
+    {
         Ok(rows) => rows,
         Err(e) => return db_error("discrepancies", e),
     };
@@ -61,8 +68,8 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
     // ratio bounds.
     let filtered: Vec<_> = rows
         .into_iter()
-        .filter(|r| r.discrepancy_state.is_some())
-        .filter(|r| {
+        .filter(|(r, _)| r.discrepancy_state.is_some())
+        .filter(|(r, _)| {
             let ratio = r.discrepancy_ratio.unwrap_or(0.0);
             q.min_ratio.is_none_or(|min| ratio >= min) && q.max_ratio.is_none_or(|max| ratio <= max)
         })
@@ -71,11 +78,20 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
     let dir = q.dir.unwrap_or(Dir::Asc);
     let (total, rows) = order_and_limit(
         filtered,
-        |r| r.discrepancy_ratio.unwrap_or(0.0),
+        |(r, _)| r.discrepancy_ratio.unwrap_or(0.0),
         dir,
         q.limit,
     );
-    let items: Vec<Value> = rows.iter().map(|r| created_view(r, &q)).collect();
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|(r, score)| {
+            let mut view = created_view(r, &q);
+            view.as_object_mut()
+                .expect("created_view built an object")
+                .insert("score".into(), jval!(score_k(*score)));
+            view
+        })
+        .collect();
 
     json(
         StatusCode::OK,

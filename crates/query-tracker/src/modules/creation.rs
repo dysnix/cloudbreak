@@ -74,6 +74,11 @@ pub async fn run(store: Store, config: QueryTrackerConfig) {
         config.max_auto_indexes
     );
 
+    // Edge-triggered so the cap-reached warning logs once per "reach", not every
+    // tick while pinned at the cap. Reset whenever the count drops back below it
+    // (eviction made room), so the next reach logs once more.
+    let mut cap_reached_logged = false;
+
     loop {
         tokio::time::sleep(config.index_creation_delay).await;
 
@@ -129,12 +134,18 @@ pub async fn run(store: Store, config: QueryTrackerConfig) {
         if let Some(max) = config.max_auto_indexes
             && current as usize >= max
         {
-            warn!(
-                target: "query_tracker_creation",
-                "auto-index cap reached ({current}/{max}); deferring creation"
-            );
+            // Only warn on the transition into the at-cap state, not every tick.
+            if !cap_reached_logged {
+                warn!(
+                    target: "query_tracker_creation",
+                    "auto-index cap reached ({current}/{max}); deferring creation until eviction makes room"
+                );
+                cap_reached_logged = true;
+            }
             continue;
         }
+        // Below the cap again — re-arm the warning for the next time it fills up.
+        cap_reached_logged = false;
 
         let candidates = match store
             .top_candidates_scored(

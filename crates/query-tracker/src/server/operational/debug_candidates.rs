@@ -12,10 +12,11 @@
 //!
 //! Alongside the `score` and its raw inputs (`demand_count`, `failed_count`,
 //! `variety_estimate`) it surfaces `avg_cost_ms` (total cost ÷ demand) and
-//! `avg_cost_without_index_ms` plus the measured `latency_gain`
+//! `avg_cost_without_index_ms` plus the measured `with_without_idx_ratio`
 //! (without-index ÷ with-index) — the otherwise-opaque inputs to the score's
 //! `gain` term. Usually a candidate has never had an index, so `avg_cost_ms`
-//! and `avg_cost_without_index_ms` coincide and `latency_gain` is `null`; for a
+//! and `avg_cost_without_index_ms` coincide and `with_without_idx_ratio` is
+//! `null`; for a
 //! pattern that was previously created (then evicted/recovered) they diverge and
 //! carry real signal.
 //!
@@ -32,7 +33,8 @@
 //! - `GET /debug/candidates?order=avg_cost_ms&dir=desc&example=true&pattern_id=true`
 
 use super::{
-    DebugQuery, Dir, avg_ms, bad_request, db_error, latency_gain, order_and_limit, round2,
+    DebugQuery, Dir, avg_ms, bad_request, db_error, docs, order_and_limit, score_k,
+    with_without_idx_ratio,
 };
 use crate::modules::store::patterns::PatternRow;
 use crate::server::{AppState, json};
@@ -95,6 +97,7 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
             "total": total,
             "count": items.len(),
             "limit": q.limit,
+            "docs": docs(),
             "candidates": items,
         }),
     )
@@ -103,13 +106,13 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
 fn candidate_view(r: &PatternRow, score: f64, q: &DebugQuery) -> Value {
     let mut obj = jval!({
         "index": r.human_name,
-        "score": round2(score),
+        "score": score_k(score),
         "demand_count": r.demand_count,
         "failed_count": r.failed_count,
         "variety_estimate": r.variety_estimate,
         "avg_cost_ms": avg_ms(r.total_cost_us, r.demand_count),
         "avg_cost_without_index_ms": avg_ms(r.cost_without_index_us, r.cost_without_index_count),
-        "latency_gain": latency_gain(r),
+        "with_without_idx_ratio": with_without_idx_ratio(r),
     });
     let map = obj.as_object_mut().expect("jval! built an object");
     if q.show_pattern_id {

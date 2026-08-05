@@ -34,5 +34,6 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 hex = { workspace = true }
+chrono = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 hyperloglogplus = "0.4.1"

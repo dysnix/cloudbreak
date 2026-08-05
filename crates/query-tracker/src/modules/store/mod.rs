@@ -250,6 +250,30 @@ impl Store {
         rows.iter().map(row_to_pattern).collect()
     }
 
+    /// All `created` patterns, each with its [`PriorityMode`] score — the same
+    /// ranking value the creation queue (`top_candidates_scored`) and eviction
+    /// order use, so the `/debug/created` view can show operators exactly where a
+    /// live index sits in that one shared ordering.
+    pub async fn list_created_scored(
+        &self,
+        mode: PriorityMode,
+        compensation: f64,
+    ) -> Result<Vec<(PatternRow, f64)>, DbErr> {
+        let score = prioritization::score_expr(mode, compensation);
+        let sql = format!(
+            "SELECT {PATTERN_COLUMNS}, ({score})::float8 AS score FROM index_patterns \
+             WHERE status = '{}'",
+            status::CREATED
+        );
+        let rows = self
+            .db
+            .query_all(Statement::from_string(self.db.get_database_backend(), sql))
+            .await?;
+        rows.iter()
+            .map(|r| Ok((row_to_pattern(r)?, r.try_get::<f64>("", "score")?)))
+            .collect()
+    }
+
     /// Update a pattern's supply columns; bump `last_seen_used` only when the
     /// scan counter actually moved (a change is the only reliable "was used"
     /// signal, and it survives stat resets — a reset just restarts the clock).

@@ -7,17 +7,25 @@
 //!
 //! Read-only JSON view of every `created` pattern with its demand (API) vs.
 //! supply (`compensated_idx_scan`) figures, on-disk size (`index_mb`), latency
-//! with/without the index and their `latency_gain`, and the latest
-//! `explain_state` verdict — so operators can see what is built and how it is
-//! being used.
+//! with/without the index and their `with_without_idx_ratio`, the latest `explain_state`
+//! verdict, a human-readable `created_at`, and its `score` — the same
+//! [`PriorityMode`](cloudbreak_core::PriorityMode) ranking value the
+//! `/debug/candidates` queue shows (creation builds highest, eviction drops
+//! lowest) — so operators can see what is built and how it is being used.
 //!
 //! ## Query parameters
 //!
 //! - `order` — `created_at` (default, newest first), `index_mb`, `demand_count`,
-//!   `idx_scan` (compensated), `avg_cost_with_index_ms`, `latency_gain`,
-//!   `variety_estimate`, and `score` (only with `filter=eviction_candidates`,
-//!   the default there, ascending = least useful first).
+//!   `idx_scan` (compensated), `avg_cost_with_index_ms`, `with_without_idx_ratio`,
+//!   `variety_estimate`, `score` (the shared `PriorityMode` ranking, present on
+//!   every row; under `filter=eviction_candidates` it is the default and sorts
+//!   ascending = least useful first, otherwise descending = most valuable first).
 //! - `dir` — `asc` | `desc` (default `desc`, except `score` defaults to `asc`).
+//! - `min_ratio`, `max_ratio` — keep only rows whose `with_without_idx_ratio`
+//!   (without-index ÷ with-index latency) is in the range (inclusive). Rows
+//!   without both latency buckets have no ratio and are dropped when either bound
+//!   is set. Since `> 1` means the index helps, `max_ratio=1` surfaces indexes
+//!   that are **not** helping (candidates for the regression guard).
 //! - `limit` — max rows (default: all).
 //! - `example`, `pattern_id`, `verbose` — include the heavier fields.
 //!
@@ -25,14 +33,14 @@
 //! - `GET /debug/created`
 //! - `GET /debug/created?order=index_mb&limit=10`
 //! - `GET /debug/created?order=variety_estimate&dir=desc`
+//! - `GET /debug/created?max_ratio=1&order=with_without_idx_ratio` (index not helping)
 //!
 //! ## Eviction candidates (`filter=eviction_candidates`)
 //!
 //! Restricts the view to the created indexes the eviction pass would
 //! *consider*: those past the idle + age-grace gates (`index-min-idle` /
-//! `index-min-age-grace`), each annotated with its `eviction_score` (the inverse
-//! of the creation ranking) and ordered least-useful-first by default
-//! (`order=score`, ascending).
+//! `index-min-age-grace`), ordered least-useful-first by default (`order=score`,
+//! ascending — the same `score` shown on every row, just sorted the drop way).
 //!
 //! This is the **eligible queue, not a guarantee**: the actual drop additionally
 //! depends on the table being above the fill target (`eviction-fill-threshold`)
@@ -63,7 +71,7 @@
 
 use super::{
     DebugQuery, Dir, avg_ms, bad_request, bytes_to_mib, compensated_idx_scan, created_view,
-    db_error, envelope, latency_gain, order_and_limit, round2,
+    db_error, envelope, order_and_limit, score_k, with_without_idx_ratio,
 };
 use crate::modules::store::patterns::{PatternRow, explain_state};
 use crate::server::{AppState, json};
@@ -73,15 +81,16 @@ use hyper::{Response, StatusCode};
 use serde_json::{Value, json as jval};
 use std::sync::Arc;
 
-/// A created row plus its eviction `score` when the eviction-candidates filter
-/// is active (`None` for the full listing).
-type Row = (PatternRow, Option<f64>);
+/// A created row plus its [`PriorityMode`](cloudbreak_core::PriorityMode) score —
+/// the single shared ranking value (creation builds highest, eviction drops
+/// lowest). Always present now, so `order=score` works for every filter.
+type Row = (PatternRow, f64);
 
 /// The `?filter=` row-subset selector for `/debug/created`.
 enum CreatedFilter {
     /// Every `created` pattern (no filter).
     All,
-    /// Only eviction-eligible rows, each carrying its `eviction_score`.
+    /// Only eviction-eligible rows (still scored by the shared `score`).
     Eviction,
     /// EXPLAIN verdict `none` — planner would use the index on neither table.
     ExplainNone,
@@ -148,12 +157,16 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
             )
             .await
         {
-            Ok(v) => v.into_iter().map(|(r, s)| (r, Some(s))).collect(),
+            Ok(v) => v,
             Err(e) => return db_error("created", e),
         }
     } else {
-        match state.store.list_created().await {
-            Ok(v) => v.into_iter().map(|r| (r, None)).collect(),
+        match state
+            .store
+            .list_created_scored(cfg.priority_mode, cfg.without_index_compensation_factor)
+            .await
+        {
+            Ok(v) => v,
             Err(e) => return db_error("created", e),
         }
     };
@@ -162,6 +175,18 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
     // last probe found them not fully used — the detailed per-index source of
     // truth behind the `query_tracker_explain_state` gauge / summary log.
     filter.retain_explain(&mut rows);
+
+    // Optional bounds on the with/without-index latency ratio. A row without both
+    // latency buckets has no ratio, so any set bound excludes it.
+    if q.min_ratio.is_some() || q.max_ratio.is_some() {
+        rows.retain(|(r, _)| match with_without_idx_ratio(r) {
+            Some(ratio) => {
+                q.min_ratio.is_none_or(|min| ratio >= min)
+                    && q.max_ratio.is_none_or(|max| ratio <= max)
+            }
+            None => false,
+        });
+    }
 
     let order = q
         .order
@@ -175,19 +200,19 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
         "avg_cost_with_index_ms" => {
             |x| avg_ms(x.0.cost_with_index_us, x.0.cost_with_index_count).unwrap_or(0.0)
         }
-        "latency_gain" => |x| latency_gain(&x.0).unwrap_or(0.0),
+        "with_without_idx_ratio" => |x| with_without_idx_ratio(&x.0).unwrap_or(0.0),
         "variety_estimate" => |x| x.0.variety_estimate as f64,
-        "score" if eviction => |x| x.1.unwrap_or(0.0),
+        "score" => |x| x.1,
         other => {
             return bad_request(format!(
                 "invalid order '{other}' (created: created_at, index_mb, demand_count, idx_scan, \
-                 avg_cost_with_index_ms, latency_gain, variety_estimate; score with \
-                 filter=eviction_candidates)"
+                 avg_cost_with_index_ms, with_without_idx_ratio, variety_estimate, score)"
             ));
         }
     };
-    // Eviction score ascends (least useful first); everything else descends.
-    let dir = q.dir.unwrap_or(if order == "score" {
+    // Under the eviction filter, `score` defaults ascending (least useful first,
+    // matching the drop order); everywhere else the default is descending.
+    let dir = q.dir.unwrap_or(if order == "score" && eviction {
         Dir::Asc
     } else {
         Dir::Desc
@@ -198,11 +223,9 @@ pub async fn handle(state: &Arc<AppState>, query: Option<&str>) -> Response<Full
         .iter()
         .map(|(r, score)| {
             let mut view = created_view(r, &q);
-            if let Some(s) = score {
-                view.as_object_mut()
-                    .expect("created_view built an object")
-                    .insert("eviction_score".into(), jval!(round2(*s)));
-            }
+            view.as_object_mut()
+                .expect("created_view built an object")
+                .insert("score".into(), jval!(score_k(*score)));
             view
         })
         .collect();

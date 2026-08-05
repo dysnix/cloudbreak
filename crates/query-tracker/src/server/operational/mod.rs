@@ -25,9 +25,16 @@
 //! - `pattern_id` and `example_request` are **omitted unless explicitly
 //!   requested** via `?pattern_id=true` / `?example=true` (or `?verbose=true`
 //!   for both), keeping the default view compact.
+//! - `score` (the shared `priority-mode` ranking) is rendered in **thousands,
+//!   1 decimal** (e.g. `"37.2K"`): the raw score derives from microsecond costs,
+//!   so ÷ 1000 makes it proportional to the `*_ms` figures. The `*_ms` averages
+//!   and `with_without_idx_ratio` are the *raw* measured values (the compensation
+//!   factor is not applied to them). Each response spells this out in a top-level
+//!   `docs` object ([`docs`]).
 //! - Every response is `{ "total": <matching rows>, "count": <rows returned>,
-//!   "limit": <n|null>, "<items>": [...] }`. `?limit=N` caps the returned rows
-//!   (default: all); `?order=<key>` and `?dir=asc|desc` sort them.
+//!   "limit": <n|null>, "docs": <reading notes>, "<items>": [...] }`. `?limit=N`
+//!   caps the returned rows (default: all); `?order=<key>` and `?dir=asc|desc`
+//!   sort them.
 //! - Unknown query keys or malformed values are rejected with `400`.
 
 pub mod debug_candidates;
@@ -66,9 +73,11 @@ pub struct DebugQuery {
     pub show_example: bool,
     /// Include `pattern_id` in each row.
     pub show_pattern_id: bool,
-    /// Lower bound filter on `discrepancy_ratio` (`/discrepancies` only).
+    /// Lower bound on the endpoint's ratio: `discrepancy_ratio` on
+    /// `/discrepancies`, `with_without_idx_ratio` on `/created`.
     pub min_ratio: Option<f64>,
-    /// Upper bound filter on `discrepancy_ratio` (`/discrepancies` only).
+    /// Upper bound on the endpoint's ratio: `discrepancy_ratio` on
+    /// `/discrepancies`, `with_without_idx_ratio` on `/created`.
     pub max_ratio: Option<f64>,
     /// Row subset selector (endpoint-specific; e.g. `/created` accepts
     /// `eviction_candidates`). `None` = the endpoint's full set.
@@ -140,6 +149,26 @@ pub fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
 
+/// The `docs` object attached to every debug endpoint: field-by-field notes on
+/// how to read the rendered values (units, and where the compensation factor
+/// does / does not apply) so operators don't have to consult the source.
+pub fn docs() -> Value {
+    jval!({
+        "score": "shown in thousands (raw score ÷ 1000, e.g. \"37.2K\"); the raw score derives \
+             from per-request costs in microseconds, so dividing by 1000 makes it proportional to \
+             the millisecond (ms) figures shown alongside",
+        "latency": "avg_cost_*_ms and with_without_idx_ratio are the raw measured values; \
+             without-index-compensation-factor is applied only inside the weighted score's gain \
+             term and the latency regression guard, never to these displayed numbers",
+    })
+}
+
+/// Render a raw score in **thousands**, one decimal, e.g. `37234.0` → `"37.2K"`.
+/// See [`docs`] for why the score is shown ÷ 1000.
+pub fn score_k(score: f64) -> String {
+    format!("{:.1}K", score / 1000.0)
+}
+
 /// Average cost per request in **milliseconds** (2 dp), or `None` when the
 /// bucket has no requests.
 pub fn avg_ms(sum_us: i64, count: i64) -> Option<f64> {
@@ -151,19 +180,28 @@ pub fn bytes_to_mib(bytes: i64) -> f64 {
     round2(bytes as f64 / (1024.0 * 1024.0))
 }
 
+/// A Unix-epoch-seconds timestamp (as stored in `created_at_epoch`) rendered as a
+/// human-readable UTC string (`YYYY-MM-DDTHH:MM:SSZ`); empty on an out-of-range
+/// value. Ordering still uses the raw epoch, so this is display-only.
+pub fn epoch_to_iso(epoch: f64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(epoch as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_default()
+}
+
 /// Supply compensated for the fact that a served GPA scans both tables of the
 /// pair (raw `idx_scan` ≈ 2× requests). This is the only form ever surfaced.
 pub fn compensated_idx_scan(last_idx_scan: i64) -> i64 {
     last_idx_scan / SCANS_PER_REQUEST
 }
 
-/// Raw measured latency gain from the index: without-index avg ÷ with-index avg
+/// Raw measured latency ratio for the index: without-index avg ÷ with-index avg
 /// (`> 1` means the index helps). `None` until the pattern has served requests
 /// both with and without the index. This is the *uncompensated* ratio — the two
 /// averages exactly as measured — so it demystifies the `gain` term the
 /// `weighted` score derives from it (which additionally applies
 /// `without-index-compensation-factor`).
-pub fn latency_gain(r: &PatternRow) -> Option<f64> {
+pub fn with_without_idx_ratio(r: &PatternRow) -> Option<f64> {
     (r.cost_with_index_count > 0 && r.cost_without_index_count > 0).then(|| {
         let with = (r.cost_with_index_us as f64 / r.cost_with_index_count as f64).max(1.0);
         let without = (r.cost_without_index_us as f64 / r.cost_without_index_count as f64).max(1.0);
@@ -194,12 +232,14 @@ pub fn order_and_limit<T>(
     (total, items)
 }
 
-/// Wrap rendered `items` in the shared envelope.
+/// Wrap rendered `items` in the shared envelope, including the [`docs`] object
+/// (field-by-field reading notes).
 pub fn envelope(items_key: &str, total: usize, limit: Option<usize>, items: Vec<Value>) -> Value {
     jval!({
         "total": total,
         "count": items.len(),
         "limit": limit,
+        "docs": docs(),
         items_key: items,
     })
 }
@@ -211,7 +251,7 @@ pub fn created_view(r: &PatternRow, q: &DebugQuery) -> Value {
     let mut obj = jval!({
         "index": r.human_name,
         "explain_state": r.explain_state,
-        "created_at": r.created_at_epoch.map(|e| e as i64),
+        "created_at": r.created_at_epoch.map(epoch_to_iso),
         "demand_count": r.demand_count,
         "demand_since_create": (r.demand_count - r.demand_at_create).max(0),
         "compensated_idx_scan": compensated_idx_scan(r.last_idx_scan),
@@ -219,7 +259,7 @@ pub fn created_view(r: &PatternRow, q: &DebugQuery) -> Value {
         "variety_estimate": r.variety_estimate,
         "avg_cost_with_index_ms": avg_ms(r.cost_with_index_us, r.cost_with_index_count),
         "avg_cost_without_index_ms": avg_ms(r.cost_without_index_us, r.cost_without_index_count),
-        "latency_gain": latency_gain(r),
+        "with_without_idx_ratio": with_without_idx_ratio(r),
         "discrepancy_state": r.discrepancy_state,
         "discrepancy_ratio": r.discrepancy_ratio.map(round2),
     });

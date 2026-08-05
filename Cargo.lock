@@ -1751,6 +1751,7 @@ name = "cloudbreak-query-tracker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "cloudbreak-core",
  "cloudbreak-entity",
  "hex",
