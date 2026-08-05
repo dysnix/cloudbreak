@@ -37,7 +37,6 @@ struct Entry {
     amount: u64,
     slot: u64,
     write_version: u64,
-    seed: bool,
 }
 
 #[derive(Default)]
@@ -62,9 +61,6 @@ impl MintTop {
     }
 
     fn compute_top(&self) -> ComputedTop {
-        if self.stale {
-            return ComputedTop::Unsound;
-        }
         let mut rows: Vec<(Pubkey, u64)> = self
             .entries
             .iter()
@@ -98,6 +94,7 @@ struct TrackerState {
     mints: HashMap<Pubkey, MintTop>,
     member_index: HashMap<Pubkey, Pubkey>,
     tombstones: HashMap<Pubkey, (u64, u64)>,
+    seed_reservoir: HashMap<Pubkey, Vec<SeedAccount>>,
 }
 
 impl TrackerState {
@@ -141,7 +138,6 @@ impl TrackerState {
         write_version: u64,
         bootstrapping: bool,
         old_block: bool,
-        seed: bool,
         k: usize,
         touched: &mut HashSet<Pubkey>,
     ) {
@@ -160,7 +156,6 @@ impl TrackerState {
                     amount,
                     slot,
                     write_version,
-                    seed,
                 };
                 touched.insert(mint);
             }
@@ -173,7 +168,6 @@ impl TrackerState {
                     amount,
                     slot,
                     write_version,
-                    seed,
                 },
             );
             if mint != SOL_SENTINEL_MINT {
@@ -210,7 +204,6 @@ impl TrackerState {
                 amount,
                 slot,
                 write_version,
-                seed,
             },
         );
         if mint != SOL_SENTINEL_MINT {
@@ -219,27 +212,30 @@ impl TrackerState {
         touched.insert(mint);
     }
 
-    fn trim(&mut self, mint: Pubkey, k: usize, seed_only: bool) {
-        loop {
-            let Some(top) = self.mints.get_mut(&mint) else {
-                return;
-            };
-            if top.entries.len() <= k {
-                return;
-            }
-            let victim = top
-                .entries
-                .iter()
-                .filter(|(_, entry)| !seed_only || entry.seed)
-                .min_by_key(|(pubkey, entry)| (entry.amount, **pubkey))
-                .map(|(pubkey, entry)| (*pubkey, entry.amount));
-            let Some((pubkey, amount)) = victim else {
-                return;
-            };
+    fn trim(&mut self, mint: Pubkey, k: usize) {
+        let Self {
+            mints,
+            member_index,
+            ..
+        } = self;
+        let Some(top) = mints.get_mut(&mint) else {
+            return;
+        };
+        if top.entries.len() <= k {
+            return;
+        }
+        let mut victims: Vec<(Pubkey, u64)> = top
+            .entries
+            .iter()
+            .map(|(pubkey, entry)| (*pubkey, entry.amount))
+            .collect();
+        victims.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
+        victims.truncate(top.entries.len() - k);
+        for (pubkey, amount) in victims {
             top.entries.remove(&pubkey);
             top.dropped_floor = top.dropped_floor.max(amount);
             if mint != SOL_SENTINEL_MINT {
-                self.member_index.remove(&pubkey);
+                member_index.remove(&pubkey);
             }
         }
     }
@@ -252,16 +248,19 @@ impl TrackerState {
             ComputedTop::Unsound => {
                 if !top.stale {
                     top.stale = true;
+                    top.last_snapshot = Vec::new();
                     outcome.newly_stale.push(mint);
                 }
             }
             ComputedTop::Sound(rows) if rows.is_empty() => {
+                top.stale = false;
                 if !top.last_snapshot.is_empty() {
                     top.last_snapshot = Vec::new();
                     outcome.cleared.push(mint);
                 }
             }
             ComputedTop::Sound(rows) => {
+                top.stale = false;
                 if rows != top.last_snapshot {
                     top.last_snapshot = rows.clone();
                     outcome.snapshots.push(MintSnapshot { mint, slot, rows });
@@ -382,22 +381,12 @@ impl LargestAccountsTracker {
         }
         for (mint, mut entries) in seed.mints {
             LargestAccountsSeed::shrink(&mut entries, inner.k_per_mint);
-            for account in entries {
+            for account in &entries {
                 state.max_applied_slot = state.max_applied_slot.max(account.slot);
-                state.apply_update(
-                    mint,
-                    account.pubkey,
-                    account.amount,
-                    account.slot,
-                    account.write_version,
-                    true,
-                    false,
-                    true,
-                    inner.k_per_mint,
-                    &mut touched,
-                );
             }
-            state.trim(mint, inner.k_per_mint, true);
+            let reservoir = state.seed_reservoir.entry(mint).or_default();
+            reservoir.extend(entries);
+            LargestAccountsSeed::shrink(reservoir, inner.k_per_mint);
         }
     }
 
@@ -443,7 +432,6 @@ impl LargestAccountsTracker {
                     update.write_version,
                     bootstrapping,
                     old_block,
-                    false,
                     inner.k_per_mint,
                     &mut touched,
                 );
@@ -456,7 +444,6 @@ impl LargestAccountsTracker {
                 update.write_version,
                 bootstrapping,
                 old_block,
-                false,
                 inner.k_per_mint,
                 &mut touched,
             );
@@ -480,13 +467,30 @@ impl LargestAccountsTracker {
         if state.status != Status::Bootstrapping {
             return BlockOutcome::default();
         }
+        let mut touched = HashSet::new();
+        let reservoir = std::mem::take(&mut state.seed_reservoir);
+        for (mint, accounts) in reservoir {
+            for account in accounts {
+                state.apply_update(
+                    mint,
+                    account.pubkey,
+                    account.amount,
+                    account.slot,
+                    account.write_version,
+                    true,
+                    false,
+                    inner.k_per_mint,
+                    &mut touched,
+                );
+            }
+        }
         state.tombstones = HashMap::new();
         state.status = Status::Live;
         let mints: Vec<Pubkey> = state.mints.keys().copied().collect();
         let effective_slot = state.max_applied_slot;
         let mut outcome = BlockOutcome::default();
         for mint in mints {
-            state.trim(mint, inner.k_per_mint, false);
+            state.trim(mint, inner.k_per_mint);
             state.emit(mint, effective_slot, &mut outcome);
         }
         outcome
@@ -504,6 +508,7 @@ impl LargestAccountsTracker {
             return false;
         }
         top.stale = true;
+        top.last_snapshot = Vec::new();
         true
     }
 

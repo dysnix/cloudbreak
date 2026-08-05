@@ -216,9 +216,6 @@ pub fn subscribe_grpc_with_reconnection(
                 }
             };
 
-            // Connected and subscribed: reset the give-up window.
-            reconnect_failed_since = None;
-
             let buffer_channel_rx_len_clone = buffer_channel_rx_len.clone();
             let mut grpc_current_errors = 0;
 
@@ -232,6 +229,7 @@ pub fn subscribe_grpc_with_reconnection(
                 let mut stream = std::pin::pin!(stream);
 
                 let mut last_block_received_at = Instant::now();
+                let mut received_block = false;
 
                 let mut buffer_channel_size =
                     buffer_channel_tx_clone.max_capacity() - buffer_channel_tx_clone.capacity();
@@ -255,7 +253,7 @@ pub fn subscribe_grpc_with_reconnection(
                 {
                     if cancel_clone.load(Ordering::SeqCst) {
                         tracing::info!("GRPC subscription cancelled mid-stream");
-                        return;
+                        return received_block;
                     }
 
                     metrics::GRPC_TOTAL_UPDATES_RECEIVED.inc();
@@ -281,6 +279,7 @@ pub fn subscribe_grpc_with_reconnection(
                         Ok(update) => {
                             if let Some(UpdateOneof::Block(block)) = &update.update_oneof {
                                 last_block_received_at = Instant::now();
+                                received_block = true;
 
                                 if log_first_message {
                                     tracing::info!(
@@ -326,14 +325,22 @@ pub fn subscribe_grpc_with_reconnection(
                         .expect("Failed to lock buffer_channel_rx_len"),
                     buffer_channel_size,
                 );
+
+                received_block
             });
 
             match handle.await {
-                Ok(_) => {
+                Ok(received_block) => {
                     tracing::debug!("GRPC subscription handle finished");
+                    if received_block {
+                        reconnect_failed_since = Some(Instant::now());
+                    } else {
+                        reconnect_failed_since.get_or_insert_with(Instant::now);
+                    }
                 }
                 Err(e) => {
                     tracing::error!("GRPC subscription handle panicked: {:?}", e);
+                    reconnect_failed_since.get_or_insert_with(Instant::now);
                 }
             }
 
