@@ -51,11 +51,59 @@ use cloudbreak_core::modules::index_identity::IndexIdentity;
 use cloudbreak_core::{IndexRegressionGuard, QueryTrackerConfig};
 use sea_orm::{ConnectionTrait, DbErr, Statement, TransactionTrait};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 /// Max indexes named in a per-pass summary log before it collapses the rest into
 /// a `[+N more]` suffix — keeps the discrepancy/EXPLAIN summaries to one line.
 const LOG_LIST_LIMIT: usize = 10;
+
+/// How often the trim re-checks indexer load while paused on backpressure.
+const BACKPRESSURE_POLL: Duration = Duration::from_secs(10);
+/// Upper bound on how long a single eviction pass will wait out backpressure
+/// before giving up and finishing the remainder on the next pass. Bounds the
+/// pause so a permanently-overloaded indexer cannot make a pass hang forever.
+const BACKPRESSURE_MAX_WAIT: Duration = Duration::from_secs(600);
+
+/// Block until the indexer is no longer under pressure, or until
+/// [`BACKPRESSURE_MAX_WAIT`] elapses. DDL (`DROP INDEX`) takes heavy locks, so
+/// the trim pauses rather than hammering a busy indexer — but it *resumes* the
+/// same pass once load recovers instead of abandoning the remaining drops until
+/// the next hourly pass. Returns `true` when it is safe to proceed, `false` if
+/// the wait timed out (caller should stop this pass and retry next time).
+async fn wait_out_backpressure(config: &QueryTrackerConfig) -> bool {
+    if !indexer_backpressure::is_under_pressure(
+        &config.indexer_metrics,
+        config.indexer_metrics_threshold,
+    )
+    .await
+    {
+        return true;
+    }
+    let start = Instant::now();
+    info!(
+        target: "query_tracker_eviction",
+        "indexer under pressure; pausing eviction and waiting up to {}s for it to recover",
+        BACKPRESSURE_MAX_WAIT.as_secs()
+    );
+    while start.elapsed() < BACKPRESSURE_MAX_WAIT {
+        tokio::time::sleep(BACKPRESSURE_POLL).await;
+        if !indexer_backpressure::is_under_pressure(
+            &config.indexer_metrics,
+            config.indexer_metrics_threshold,
+        )
+        .await
+        {
+            info!(
+                target: "query_tracker_eviction",
+                "indexer recovered after ~{:.0}s; resuming eviction",
+                start.elapsed().as_secs_f64()
+            );
+            return true;
+        }
+    }
+    false
+}
 
 #[tracing::instrument(name = "query_tracker_eviction", skip_all)]
 pub async fn run(store: Store, config: QueryTrackerConfig) {
@@ -133,13 +181,16 @@ async fn run_pass(store: &Store, config: &QueryTrackerConfig) -> Result<(), DbEr
         if count <= target {
             break;
         }
-        if indexer_backpressure::is_under_pressure(
-            &config.indexer_metrics,
-            config.indexer_metrics_threshold,
-        )
-        .await
-        {
-            info!(target: "query_tracker_eviction", "indexer under pressure; pausing evictions");
+        // Pause (not abort) while the indexer is busy: DROP INDEX takes heavy
+        // locks, so we wait for load to recover and resume this same pass. Only
+        // give up if it never clears within the bounded wait.
+        if !wait_out_backpressure(config).await {
+            warn!(
+                target: "query_tracker_eviction",
+                "indexer still under pressure after {}s; stopping trim early ({evicted} evicted), \
+                 will finish next pass",
+                BACKPRESSURE_MAX_WAIT.as_secs()
+            );
             break;
         }
         let identity = match row.identity() {
@@ -215,13 +266,15 @@ async fn run_regression_guard(store: &Store, config: &QueryTrackerConfig) -> Res
                 );
             }
             IndexRegressionGuard::Evict => {
-                if indexer_backpressure::is_under_pressure(
-                    &config.indexer_metrics,
-                    config.indexer_metrics_threshold,
-                )
-                .await
-                {
-                    info!(target: "query_tracker_regression", "indexer under pressure; deferring regression drops");
+                // Same pause-and-resume as the idle trim: wait out indexer load
+                // rather than abandoning the remaining regression drops.
+                if !wait_out_backpressure(config).await {
+                    warn!(
+                        target: "query_tracker_regression",
+                        "indexer still under pressure after {}s; deferring remaining regression drops \
+                         to next pass",
+                        BACKPRESSURE_MAX_WAIT.as_secs()
+                    );
                     break;
                 }
                 let identity = match row.identity() {
