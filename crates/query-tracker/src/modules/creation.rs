@@ -56,6 +56,39 @@ use tracing::{error, info, warn};
 /// allow/deny filter in Rust (keeps program scoping out of SQL).
 const CANDIDATE_FETCH_LIMIT: u64 = 16;
 
+/// Format a raw priority score in thousands with one decimal (e.g. `3194.9K`),
+/// matching the debug endpoints. The raw score is derived from per-request
+/// microseconds, so ÷1000 makes it proportional to the millisecond figures
+/// shown elsewhere.
+fn score_k(s: f64) -> String {
+    format!("{:.1}K", s / 1000.0)
+}
+
+/// Edge-trigger state for value-guard deferral logging: which candidate is
+/// currently blocked. Lets the loop log a deferral only when the blocked
+/// candidate changes, instead of every `index-creation-delay` tick — the top
+/// candidate is usually stable, so an unchanged block stays silent.
+#[derive(Default)]
+struct DeferLog {
+    last: Option<String>,
+}
+
+impl DeferLog {
+    /// Log the deferral of `name` iff it differs from the last blocked
+    /// candidate. Returns whether a line should be emitted, updating the state.
+    fn should_log(&mut self, name: &str) -> bool {
+        let changed = self.last.as_deref() != Some(name);
+        self.last = Some(name.to_string());
+        changed
+    }
+
+    /// Clear the blocked candidate after a successful build so the next deferral
+    /// (even of the same identity) logs immediately.
+    fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
 /// Whether `program` is allowed by the include/exclude lists.
 pub fn program_allowed(program: Pubkey, config: &QueryTrackerConfig) -> bool {
     if config.included_programs.is_empty() {
@@ -78,6 +111,8 @@ pub async fn run(store: Store, config: QueryTrackerConfig) {
     // tick while pinned at the cap. Reset whenever the count drops back below it
     // (eviction made room), so the next reach logs once more.
     let mut cap_reached_logged = false;
+    // Edge-triggered value-guard deferral logging (see `DeferLog`).
+    let mut defer_log = DeferLog::default();
 
     loop {
         tokio::time::sleep(config.index_creation_delay).await;
@@ -183,10 +218,11 @@ pub async fn run(store: Store, config: QueryTrackerConfig) {
 
         // Creation-time value guard (see module docs): in the buffer band, only
         // build an index that out-values the one it would displace.
-        if !value_guard_allows(&store, &config, current, &identity, score).await {
+        if !value_guard_allows(&store, &config, current, &identity, score, &mut defer_log).await {
             continue;
         }
 
+        defer_log.reset();
         create_pair(&store, &row, &identity).await;
     }
 }
@@ -230,6 +266,7 @@ async fn value_guard_allows(
     current: i64,
     identity: &IndexIdentity,
     score: f64,
+    defer_log: &mut DeferLog,
 ) -> bool {
     // The guard only applies when eviction can reclaim the buffer and a cap
     // defines the target; otherwise fall back to cap-only creation.
@@ -271,19 +308,26 @@ async fn value_guard_allows(
         Some(b) if biased > b => {
             info!(
                 target: "query_tracker_creation",
-                "value guard: building '{}' (score {score:.3}×{bias:.2}={biased:.3}) beats displaced \
-                 index (score {b:.3}) at over={over}",
-                identity.human_name()
+                "value guard: building '{}' (score {}×{bias:.2}={}) beats displaced \
+                 index (score {}) at over={over}",
+                identity.human_name(), score_k(score), score_k(biased), score_k(b)
             );
             true
         }
         Some(b) => {
-            info!(
-                target: "query_tracker_creation",
-                "value guard: deferring '{}' (score {score:.3}×{bias:.2}={biased:.3}) — does not beat \
-                 displaced index (score {b:.3}) at over={over}",
-                identity.human_name()
-            );
+            // Edge-triggered: the top candidate is usually stable, so log the
+            // deferral only when the blocked candidate changes — otherwise this
+            // fires every creation tick.
+            let name = identity.human_name();
+            if defer_log.should_log(&name) {
+                info!(
+                    target: "query_tracker_creation",
+                    "value guard: deferring '{name}' (score {}×{bias:.2}={}) — does not beat \
+                     displaced index (score {}) at over={over}; logged once — silent until the \
+                     blocked candidate changes or it gets built",
+                    score_k(score), score_k(biased), score_k(b)
+                );
+            }
             false
         }
         None => {
@@ -292,7 +336,7 @@ async fn value_guard_allows(
             // hard cap still bounds growth, and the eviction pass reclaims
             // whatever becomes eligible later. Deferring here would stall
             // creation behind indexes that are not (yet) droppable.
-            info!(
+            tracing::debug!(
                 target: "query_tracker_creation",
                 "value guard: building '{}' at over={over} — no reclaimable index to displace; \
                  growing toward the cap, eviction reclaims once indexes go idle",
