@@ -39,42 +39,67 @@ pub struct SnapshotPair {
 
 impl SnapshotPair {
     pub fn parse(json_value: &serde_json::Value) -> Result<Self> {
-        let slot = json_value
-            .get("slot")
-            .ok_or(anyhow::anyhow!("slot not found"))?
-            .as_u64()
-            .ok_or(anyhow::anyhow!("slot not found"))?;
-
-        let base_slot = json_value
-            .get("base_slot")
-            .ok_or(anyhow::anyhow!("base_slot not found"))?
-            .as_u64()
-            .ok_or(anyhow::anyhow!("base_slot not found"))?;
+        // Cloudbreak has historically consumed a flat response. solana-cluster-manager's
+        // `/v1/snapshots` endpoint wraps metadata in `info` while keeping `target` on the outer
+        // item, so accept both shapes.
+        let snapshot_info = match json_value.get("info") {
+            Some(info) if info.is_object() => info,
+            Some(_) => return Err(anyhow::anyhow!("snapshot info is not an object")),
+            None => json_value,
+        };
 
         let sidecar_endpoint = json_value
             .get("target")
+            .or_else(|| snapshot_info.get("target"))
             .and_then(|value| value.as_str())
             .ok_or(anyhow::anyhow!("sidecar endpoint not found"))?;
 
-        // 0. Incremental snapshot (check filename contains incremental)
-        // 1. Full snapshot
-        let mut files = json_value.get("files").unwrap().as_array().unwrap().iter();
+        let files = snapshot_info
+            .get("files")
+            .and_then(|files| files.as_array())
+            .ok_or(anyhow::anyhow!("snapshot files not found"))?;
 
-        let first_file = Self::parse_file(files.next().unwrap())?;
+        let mut full_snapshot_file = None;
+        let mut incremental_snapshot_file = None;
 
-        // If 1st file is incremental, we need to get the full snapshot file
-        let (full_snapshot_file, incremental_snapshot_file) =
-            if first_file.snapshot_type == SnapshotType::Incremental {
-                let full_snapshot_file = Self::parse_file(files.next().unwrap())?;
-
-                if full_snapshot_file.snapshot_type != SnapshotType::Full {
-                    return Err(anyhow::anyhow!("full snapshot file is not a full snapshot"));
+        for file in files {
+            let snapshot_file = Self::parse_file(file)?;
+            match snapshot_file.snapshot_type {
+                SnapshotType::Full => {
+                    if full_snapshot_file.replace(snapshot_file).is_some() {
+                        return Err(anyhow::anyhow!(
+                            "more than one full snapshot file found in pair"
+                        ));
+                    }
                 }
+                SnapshotType::Incremental => {
+                    if incremental_snapshot_file.replace(snapshot_file).is_some() {
+                        return Err(anyhow::anyhow!(
+                            "more than one incremental snapshot file found in pair"
+                        ));
+                    }
+                }
+            }
+        }
 
-                (full_snapshot_file, Some(first_file))
-            } else {
-                (first_file, None)
-            };
+        let full_snapshot_file =
+            full_snapshot_file.ok_or(anyhow::anyhow!("full snapshot file not found in pair"))?;
+
+        // The current tracker omits pair-level `base_slot`. Derive it from the incremental file,
+        // or from the full snapshot itself when the pair contains only a full snapshot.
+        let slot = optional_u64(snapshot_info, "slot")?.unwrap_or_else(|| {
+            incremental_snapshot_file
+                .as_ref()
+                .map(|snapshot| snapshot.slot)
+                .unwrap_or(full_snapshot_file.slot)
+        });
+        let base_slot = optional_u64(snapshot_info, "base_slot")?
+            .or_else(|| {
+                incremental_snapshot_file
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.base_slot)
+            })
+            .unwrap_or(full_snapshot_file.slot);
 
         // Check that files slots are correct
         let snapshot_pair = SnapshotPair {
@@ -171,6 +196,151 @@ impl SnapshotPair {
     }
 }
 
+fn optional_u64(json_value: &serde_json::Value, key: &str) -> Result<Option<u64>> {
+    match json_value.get(key) {
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("{key} is not an unsigned integer")),
+        None => Ok(None),
+    }
+}
+
+fn resolve_sidecar_endpoint(sidecar_endpoint: &str, tracker_endpoint: &str) -> Result<String> {
+    if sidecar_endpoint.contains("://") {
+        reqwest::Url::parse(sidecar_endpoint)?;
+        return Ok(sidecar_endpoint.to_string());
+    }
+
+    let tracker_url = reqwest::Url::parse(tracker_endpoint)?;
+    let sidecar_endpoint = sidecar_endpoint.trim_start_matches("//");
+    let resolved_endpoint = format!("{}://{}", tracker_url.scheme(), sidecar_endpoint);
+
+    // Validate the result here so a bad tracker target is reported before snapshot downloading.
+    reqwest::Url::parse(&resolved_endpoint)?;
+
+    Ok(resolved_endpoint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_current_nested_tracker_response() {
+        let value = json!({
+            "target": "mainnet-snapshot-cluster-sidecar-0:13080",
+            "inverse_slot": 18446744073271936604u64,
+            "info": {
+                "slot": 437615011,
+                "hash": "incremental-hash",
+                "files": [
+                    {
+                        "file_name": "incremental-snapshot-437595677-437615011-incremental-hash.tar.zst",
+                        "slot": 437615011,
+                        "base_slot": 437595677
+                    },
+                    {
+                        "file_name": "snapshot-437595677-full-hash.tar.zst",
+                        "slot": 437595677
+                    }
+                ]
+            }
+        });
+
+        let pair = SnapshotPair::parse(&value).expect("current tracker response should parse");
+
+        assert_eq!(
+            pair.downloading_endpoint,
+            "mainnet-snapshot-cluster-sidecar-0:13080"
+        );
+        assert_eq!(pair.full_snapshot.slot, 437595677);
+        let incremental = pair
+            .incremental_snapshot
+            .expect("incremental snapshot should be present");
+        assert_eq!(incremental.slot, 437615011);
+        assert_eq!(incremental.base_slot, Some(437595677));
+    }
+
+    #[test]
+    fn parses_legacy_flat_tracker_response() {
+        let value = json!({
+            "slot": 200,
+            "base_slot": 100,
+            "target": "http://snapshot-sidecar:13080",
+            "files": [
+                {
+                    "file_name": "incremental-snapshot-100-200-hash.tar.zst",
+                    "slot": 200,
+                    "base_slot": 100
+                },
+                {
+                    "file_name": "snapshot-100-hash.tar.zst",
+                    "slot": 100
+                }
+            ]
+        });
+
+        let pair = SnapshotPair::parse(&value).expect("legacy tracker response should parse");
+
+        assert_eq!(pair.downloading_endpoint, "http://snapshot-sidecar:13080");
+        assert_eq!(pair.full_snapshot.slot, 100);
+        assert_eq!(pair.incremental_snapshot.unwrap().slot, 200);
+    }
+
+    #[test]
+    fn derives_slot_and_base_slot_for_full_only_pair() {
+        let value = json!({
+            "target": "snapshot-sidecar:13080",
+            "info": {
+                "files": [{
+                    "file_name": "snapshot-300-hash.tar.zst",
+                    "slot": 300
+                }]
+            }
+        });
+
+        let pair = SnapshotPair::parse(&value).expect("full-only pair should parse");
+
+        assert_eq!(pair.full_snapshot.slot, 300);
+        assert!(pair.incremental_snapshot.is_none());
+        assert!(pair.check_target_slot(300).unwrap());
+        assert!(!pair.check_target_slot(301).unwrap());
+    }
+
+    #[test]
+    fn rejects_missing_files_without_panicking() {
+        let error = SnapshotPair::parse(&json!({
+            "target": "snapshot-sidecar:13080",
+            "info": { "slot": 300 }
+        }))
+        .expect_err("missing files should be rejected");
+
+        assert!(error.to_string().contains("snapshot files not found"));
+    }
+
+    #[test]
+    fn resolves_scheme_less_sidecar_endpoint_from_tracker_scheme() {
+        assert_eq!(
+            resolve_sidecar_endpoint(
+                "mainnet-snapshot-cluster-sidecar-0:13080",
+                "http://mainnet-cloudbreak-snapshot-tracker:8458"
+            )
+            .unwrap(),
+            "http://mainnet-snapshot-cluster-sidecar-0:13080"
+        );
+        assert_eq!(
+            resolve_sidecar_endpoint(
+                "https://snapshot.example.com",
+                "http://mainnet-cloudbreak-snapshot-tracker:8458"
+            )
+            .unwrap(),
+            "https://snapshot.example.com"
+        );
+    }
+}
+
 const RETRY_WAIT_SECS: Duration = Duration::from_secs(10);
 
 /// Minimum interval between "no covering snapshot" warnings while polling the tracker.
@@ -211,7 +381,8 @@ pub async fn get_snapshot_data(
         let response = client
             .get(format!("{}/v1/snapshots", tracker_endpoint))
             .send()
-            .await?;
+            .await?
+            .error_for_status()?;
 
         let json_value: serde_json::Value = response.json().await?;
 
@@ -238,8 +409,38 @@ pub async fn get_snapshot_data(
         // the target slot.
         let mut highest_available_slot: Option<u64> = None;
 
-        for snapshot in json_value.as_array().unwrap() {
-            let snapshot_pair = SnapshotPair::parse(snapshot)?;
+        let snapshots = json_value
+            .as_array()
+            .ok_or(anyhow::anyhow!("snapshot tracker response is not an array"))?;
+
+        for snapshot in snapshots {
+            let mut snapshot_pair = match SnapshotPair::parse(snapshot) {
+                Ok(snapshot_pair) => snapshot_pair,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "get_snapshot_data",
+                        ?error,
+                        "Skipping malformed snapshot tracker entry"
+                    );
+                    continue;
+                }
+            };
+
+            snapshot_pair.downloading_endpoint = match resolve_sidecar_endpoint(
+                &snapshot_pair.downloading_endpoint,
+                tracker_endpoint,
+            ) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "get_snapshot_data",
+                        ?error,
+                        endpoint = %snapshot_pair.downloading_endpoint,
+                        "Skipping snapshot tracker entry with an invalid sidecar endpoint"
+                    );
+                    continue;
+                }
+            };
 
             let pair_covered_slot = snapshot_pair
                 .incremental_snapshot
@@ -247,7 +448,8 @@ pub async fn get_snapshot_data(
                 .map(|incremental| incremental.slot)
                 .unwrap_or(snapshot_pair.full_snapshot.slot);
             highest_available_slot = Some(
-                highest_available_slot.map_or(pair_covered_slot, |slot| slot.max(pair_covered_slot)),
+                highest_available_slot
+                    .map_or(pair_covered_slot, |slot| slot.max(pair_covered_slot)),
             );
 
             let is_covered = if let Some(target_slot) = target_slot {
@@ -268,8 +470,8 @@ pub async fn get_snapshot_data(
             }
         }
 
-        let should_log = last_no_coverage_log
-            .is_none_or(|last| last.elapsed() >= NO_COVERAGE_LOG_INTERVAL);
+        let should_log =
+            last_no_coverage_log.is_none_or(|last| last.elapsed() >= NO_COVERAGE_LOG_INTERVAL);
         if should_log {
             tracing::warn!(
                 target: "get_snapshot_data",
