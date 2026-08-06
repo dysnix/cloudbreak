@@ -1,7 +1,13 @@
 # syntax=docker/dockerfile:1.7
 
-FROM lukemathwalker/cargo-chef:0.1.77-rust-1.95.0-bookworm AS chef
+ARG RUST_VERSION=1.97.1
+
+FROM lukemathwalker/cargo-chef:0.1.77-rust-${RUST_VERSION}-bookworm AS chef
 WORKDIR /app
+# Make the repository's pinned toolchain active before `cargo chef cook`.
+# Otherwise it is first discovered by the final `COPY . .`, and Cargo discards
+# every dependency artifact if that compiler differs from the image default.
+COPY rust-toolchain.toml rust-toolchain.toml
 
 FROM chef AS planner
 COPY . .
