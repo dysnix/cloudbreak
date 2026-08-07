@@ -94,6 +94,7 @@ impl SnapshotPair {
                 .unwrap_or(full_snapshot_file.slot)
         });
         let base_slot = optional_u64(snapshot_info, "base_slot")?
+            .filter(|base_slot| *base_slot != 0)
             .or_else(|| {
                 incremental_snapshot_file
                     .as_ref()
@@ -287,6 +288,33 @@ mod tests {
         assert_eq!(pair.downloading_endpoint, "http://snapshot-sidecar:13080");
         assert_eq!(pair.full_snapshot.slot, 100);
         assert_eq!(pair.incremental_snapshot.unwrap().slot, 200);
+    }
+
+    #[test]
+    fn derives_base_slot_when_flat_tracker_uses_zero_sentinel() {
+        let value = json!({
+            "slot": 437769435,
+            "base_slot": 0,
+            "target": "http://mainnet-snapshot-cluster-sidecar-0:13080",
+            "files": [
+                {
+                    "file_name": "incremental-snapshot-437745774-437769435-incremental-hash.tar.zst",
+                    "slot": 437769435,
+                    "base_slot": 437745774
+                },
+                {
+                    "file_name": "snapshot-437745774-full-hash.tar.zst",
+                    "slot": 437745774
+                }
+            ]
+        });
+
+        let pair = SnapshotPair::parse(&value).expect("zero pair base slot should be derived");
+
+        assert_eq!(pair.full_snapshot.slot, 437745774);
+        let incremental = pair.incremental_snapshot.unwrap();
+        assert_eq!(incremental.slot, 437769435);
+        assert_eq!(incremental.base_slot, Some(437745774));
     }
 
     #[test]
