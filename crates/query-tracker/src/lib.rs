@@ -160,6 +160,7 @@ pub async fn run(config_path: &str) -> cloudbreak_core::Result<()> {
     info!("Query Tracker service is starting...");
 
     let server_handle = server.start(rpc.into_rpc());
+    metrics::set_ready(true);
 
     info!(
         "Query Tracker service is running at http://{}.",
@@ -170,6 +171,7 @@ pub async fn run(config_path: &str) -> cloudbreak_core::Result<()> {
 
     info!(%signal, "Shutdown signal received. Stopping Query Tracker service...");
 
+    metrics::set_ready(false);
     server_handle.stop()?;
     server_handle.stopped().await;
 

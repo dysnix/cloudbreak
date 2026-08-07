@@ -156,6 +156,7 @@ async fn handle_request(
 
     let handler_response = match (req.method(), req.uri().path()) {
         (&Method::POST, "/") => rpc::handle_rpc_request(req, state, &subscription_id).await,
+        (&Method::GET, "/health") => operational_endpoints::health_handler(&state).await?,
         (&Method::GET, "/metrics") => metrics::metrics_handler(&state.database)?,
         (&Method::GET, "/debug/log_filter") => operational_endpoints::log_filter_handler(&req)?,
         (&Method::GET, "/debug/modules/gpa_cache") => {

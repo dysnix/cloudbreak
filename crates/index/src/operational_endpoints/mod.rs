@@ -23,17 +23,22 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use crate::metrics::TokioTaskCounterGuard;
+use crate::{metrics::TokioTaskCounterGuard, modules::health::ServiceHealth};
 
 mod accounts_owner_map;
 pub mod finalizer;
+mod health;
 mod params;
 mod prometheus;
 pub mod self_healing;
 
 /// Routes an operational HTTP request to the matching endpoint handler.
-async fn route(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn route(
+    req: Request<Incoming>,
+    health: ServiceHealth,
+) -> Result<Response<Full<Bytes>>, Infallible> {
     match req.uri().path() {
+        "/health" => health::handle(&health),
         "/metrics" => prometheus::handle(),
         "/debug/modules/finalizer" => finalizer::handle(req.uri().query()).await,
         "/debug/modules/self_healing" => self_healing::handle(req.uri().query()).await,
@@ -44,7 +49,7 @@ async fn route(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallib
 
 /// Initializes metrics state, registers the Prometheus collectors, and spawns the operational
 /// HTTP server (Prometheus metrics + debug endpoints).
-pub fn serve(config: &IndexConfig) -> anyhow::Result<()> {
+pub fn serve(config: &IndexConfig, health: ServiceHealth) -> anyhow::Result<()> {
     crate::metrics::setup(config);
     crate::metrics::register_collectors();
 
@@ -75,7 +80,8 @@ pub fn serve(config: &IndexConfig) -> anyhow::Result<()> {
             };
 
             let io = TokioIo::new(stream);
-            let service = service_fn(route);
+            let health = health.clone();
+            let service = service_fn(move |req| route(req, health.clone()));
 
             tokio::spawn(async move {
                 let _guard = TokioTaskCounterGuard::new("metrics_server");

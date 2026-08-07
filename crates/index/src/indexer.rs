@@ -63,8 +63,6 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    operational_endpoints::serve(&config)?;
-
     let mut connect_options = ConnectOptions::from(config.database.clone());
     let server_side_timeout = config.database.server_side_timeout.to_string();
     connect_options.map_sqlx_postgres_opts(move |pg_opts| {
@@ -96,6 +94,8 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     // Service health is tracked as a set of reasons (Startup is set until the startup snapshot is
     // processed; GapFill is set while a gap fill is in progress).
     let health = ServiceHealth::new(db.clone());
+
+    operational_endpoints::serve(&config, health.clone())?;
 
     let updated_accounts_during_startup =
         UpdatedAccountsDuringStartup::new(snapshot_processing_state.clone(), health.clone());

@@ -12,9 +12,33 @@ use std::convert::Infallible;
 use std::str::FromStr;
 use tracing_subscriber::EnvFilter;
 
-use crate::http::CloudbreakRpcState;
+use crate::{db_query, http::CloudbreakRpcState};
 use crate::http::server::{HttpHandlerResponse, ResponseBody};
 use crate::modules::cache::GpaProcessor;
+
+/// Kubernetes-ready health endpoint backed by the same database flag as JSON-RPC `getHealth`.
+pub async fn health_handler(
+    state: &CloudbreakRpcState,
+) -> Result<HttpHandlerResponse, Infallible> {
+    Ok(health_response(
+        db_query::get_service_health(&state.database).await,
+    ))
+}
+
+fn health_response(healthy: bool) -> HttpHandlerResponse {
+    HttpHandlerResponse {
+        status: if healthy {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        body: ResponseBody::Buffered(if healthy {
+            b"ok".to_vec()
+        } else {
+            b"unhealthy".to_vec()
+        }),
+    }
+}
 
 /// Used to get or set the log filter at runtime
 pub fn log_filter_handler(req: &Request<Incoming>) -> Result<HttpHandlerResponse, Infallible> {
@@ -262,6 +286,22 @@ pub fn gpa_cache_handler(
         status: StatusCode::OK,
         body: ResponseBody::Buffered(body),
     })
+}
+
+#[cfg(test)]
+mod health_tests {
+    use hyper::StatusCode;
+
+    use super::health_response;
+
+    #[test]
+    fn health_response_is_ready_only_when_service_is_healthy() {
+        assert_eq!(health_response(true).status, StatusCode::OK);
+        assert_eq!(
+            health_response(false).status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }
 
 /// Parsed query parameters for the GPA cache debug endpoint.

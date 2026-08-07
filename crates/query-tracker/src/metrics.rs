@@ -3,7 +3,11 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use std::{convert::Infallible, net::SocketAddr};
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use http_body_util::Full;
 use hyper::{
@@ -15,6 +19,12 @@ use hyper_util::{rt::TokioIo, server::conn::auto};
 use prometheus::{IntGauge, Registry, TextEncoder};
 use tokio::net::TcpListener;
 use tracing::{error, info};
+
+static READY: AtomicBool = AtomicBool::new(false);
+
+pub fn set_ready(ready: bool) {
+    READY.store(ready, Ordering::Relaxed);
+}
 
 lazy_static::lazy_static! {
     static ref METRICS_REGISTRY: Registry = Registry::new();
@@ -47,19 +57,43 @@ fn metrics_handler() -> Result<Response<Full<Bytes>>, Infallible> {
         .unwrap())
 }
 
+fn health_handler(ready: bool) -> Result<Response<Full<Bytes>>, Infallible> {
+    Ok(Response::builder()
+        .status(if ready { 200 } else { 503 })
+        .body(Full::new(Bytes::from(if ready {
+            "OK"
+        } else {
+            "Not Ready"
+        })))
+        .unwrap())
+}
+
 async fn handle_metrics_request(
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     match req.uri().path() {
         "/metrics" => metrics_handler(),
-        "/health" => Ok(Response::builder()
-            .status(200)
-            .body(Full::new(Bytes::from("OK")))
-            .unwrap()),
+        "/health" => health_handler(READY.load(Ordering::Relaxed)),
         _ => Ok(Response::builder()
             .status(404)
             .body(Full::new(Bytes::from("Not Found")))
             .unwrap()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyper::StatusCode;
+
+    use super::health_handler;
+
+    #[test]
+    fn health_is_ready_only_after_rpc_server_starts() {
+        assert_eq!(health_handler(true).unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            health_handler(false).unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }
 
