@@ -3,7 +3,9 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use prometheus::{Counter, CounterVec, GaugeVec, Histogram, HistogramOpts, Opts};
+use prometheus::{
+    Counter, CounterVec, Error, GaugeVec, Histogram, HistogramOpts, Opts, Registry, core::Collector,
+};
 
 lazy_static::lazy_static! {
     pub static ref DB_SNAPSHOT_ERRORS: Counter = Counter::new(
@@ -55,24 +57,56 @@ pub fn record_snapshot_batch_insert_time(elapsed: f64) {
     SNAPSHOT_BATCH_INSERT_TIME.observe(elapsed);
 }
 
-pub fn register_metrics(
-    metrics_registry: Option<prometheus::Registry>,
-) -> Result<(), anyhow::Error> {
+pub fn register_metrics(metrics_registry: Option<Registry>) -> Result<(), anyhow::Error> {
     let metrics_registry = match metrics_registry {
         Some(metrics_registry) => metrics_registry,
         None => return Ok(()),
     };
 
-    metrics_registry.register(Box::new(DB_SNAPSHOT_ERRORS.clone()))?;
-    metrics_registry.register(Box::new(SNAPSHOT_BATCH_INSERT_TIME.clone()))?;
-    metrics_registry.register(Box::new(PROCESSED_SNAPSHOT_ITEMS.clone()))?;
-    metrics_registry.register(Box::new(
-        SNAPSHOT_CLEAN_UP_DUPLICATED_ACCOUNTS_BATCH_TIME.clone(),
-    ))?;
-    metrics_registry.register(Box::new(
-        SNAPSHOT_CLEAN_UP_DUPLICATED_ACCOUNTS_BATCH_ROWS_AFFECTED.clone(),
-    ))?;
-    metrics_registry.register(Box::new(SNAPSHOT_ACCOUNTS_BUFFER_SIZE.clone()))?;
+    register_collector(&metrics_registry, Box::new(DB_SNAPSHOT_ERRORS.clone()))?;
+    register_collector(
+        &metrics_registry,
+        Box::new(SNAPSHOT_BATCH_INSERT_TIME.clone()),
+    )?;
+    register_collector(
+        &metrics_registry,
+        Box::new(PROCESSED_SNAPSHOT_ITEMS.clone()),
+    )?;
+    register_collector(
+        &metrics_registry,
+        Box::new(SNAPSHOT_CLEAN_UP_DUPLICATED_ACCOUNTS_BATCH_TIME.clone()),
+    )?;
+    register_collector(
+        &metrics_registry,
+        Box::new(SNAPSHOT_CLEAN_UP_DUPLICATED_ACCOUNTS_BATCH_ROWS_AFFECTED.clone()),
+    )?;
+    register_collector(
+        &metrics_registry,
+        Box::new(SNAPSHOT_ACCOUNTS_BUFFER_SIZE.clone()),
+    )?;
 
     Ok(())
+}
+
+fn register_collector(
+    registry: &Registry,
+    collector: Box<dyn Collector>,
+) -> Result<(), anyhow::Error> {
+    match registry.register(collector) {
+        Ok(()) | Err(Error::AlreadyReg) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_metrics_registration_is_idempotent() {
+        let registry = Registry::new();
+
+        register_metrics(Some(registry.clone())).unwrap();
+        register_metrics(Some(registry)).unwrap();
+    }
 }
