@@ -216,9 +216,6 @@ pub fn subscribe_grpc_with_reconnection(
                 }
             };
 
-            // Connected and subscribed: reset the give-up window.
-            reconnect_failed_since = None;
-
             let buffer_channel_rx_len_clone = buffer_channel_rx_len.clone();
             let mut grpc_current_errors = 0;
 
@@ -228,6 +225,7 @@ pub fn subscribe_grpc_with_reconnection(
 
             let handle = tokio::spawn(async move {
                 let _guard = metrics::TokioTaskCounterGuard::new("grpc");
+                let mut received_update = false;
 
                 let mut stream = std::pin::pin!(stream);
 
@@ -255,7 +253,7 @@ pub fn subscribe_grpc_with_reconnection(
                 {
                     if cancel_clone.load(Ordering::SeqCst) {
                         tracing::info!("GRPC subscription cancelled mid-stream");
-                        return;
+                        return received_update;
                     }
 
                     metrics::GRPC_TOTAL_UPDATES_RECEIVED.inc();
@@ -279,6 +277,7 @@ pub fn subscribe_grpc_with_reconnection(
 
                     match update {
                         Ok(update) => {
+                            received_update = true;
                             if let Some(UpdateOneof::Block(block)) = &update.update_oneof {
                                 last_block_received_at = Instant::now();
 
@@ -326,13 +325,27 @@ pub fn subscribe_grpc_with_reconnection(
                         .expect("Failed to lock buffer_channel_rx_len"),
                     buffer_channel_size,
                 );
+
+                received_update
             });
 
             match handle.await {
-                Ok(_) => {
+                Ok(true) => {
+                    // A real stream update proves the reconnect succeeded, so a later
+                    // disconnect starts a fresh failure window.
+                    reconnect_failed_since = None;
                     tracing::debug!("GRPC subscription handle finished");
                 }
+                Ok(false) => {
+                    // Some Yellowstone errors (notably replay OutOfRange) arrive as
+                    // the first stream item after subscribe succeeds. Count those as
+                    // reconnect failures so backoff applies and `from_slot` is
+                    // eventually dropped instead of reconnecting in a tight loop.
+                    reconnect_failed_since.get_or_insert_with(Instant::now);
+                    tracing::debug!("GRPC subscription ended before receiving an update");
+                }
                 Err(e) => {
+                    reconnect_failed_since.get_or_insert_with(Instant::now);
                     tracing::error!("GRPC subscription handle panicked: {:?}", e);
                 }
             }
