@@ -86,79 +86,95 @@ pub async fn upsert_accounts_batched(
     Ok(())
 }
 
-/// We create the table indexes after the snapshot if processed (instead on migration) for performance reasons.
-/// Each index is gated by the corresponding flag in `[pg-indexes]` from the snapshot config.
-pub async fn create_database_indexes(
+pub async fn create_database_indexes_resumable(
     db: &DatabaseConnection,
     cfg: &SnapshotPgIndexesConfig,
+    run_id: i64,
 ) -> Result<(), anyhow::Error> {
-    let start_time = Instant::now();
-
-    tracing::info!(target: "create_database_indexes", ?cfg, "start creating database indexes");
-
+    let mut indexes = Vec::new();
     if cfg.idx_snapshot_accounts_pubkey {
-        db.execute_unprepared(
-            r#"
-                CREATE INDEX idx_snapshot_accounts_pubkey ON snapshot_accounts USING HASH (pubkey);
-            "#,
-        )
-        .await?;
-        tracing::info!(target: "create_database_indexes", "created idx_snapshot_accounts_pubkey (hash) in {} seconds (total accumulated)", start_time.elapsed().as_secs_f64());
+        indexes.push((
+            "idx_snapshot_accounts_pubkey",
+            "CREATE INDEX IF NOT EXISTS idx_snapshot_accounts_pubkey ON snapshot_accounts USING HASH (pubkey)",
+        ));
     }
-
     if cfg.idx_snapshot_accounts_token_mint {
-        db.execute_unprepared(
-            r#"
-                CREATE INDEX idx_snapshot_accounts_token_mint
-                ON snapshot_accounts (token_mint)
-                WHERE owner = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea
-                OR owner = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea;
-            "#
-        )
-        .await?;
-        tracing::info!(target: "create_database_indexes", "created idx_snapshot_accounts_token_mint in {} seconds (total accumulated)", start_time.elapsed().as_secs_f64());
+        indexes.push((
+            "idx_snapshot_accounts_token_mint",
+            r#"CREATE INDEX IF NOT EXISTS idx_snapshot_accounts_token_mint
+               ON snapshot_accounts (token_mint)
+               WHERE owner = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea
+               OR owner = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea"#,
+        ));
     }
-
     if cfg.idx_snapshot_accounts_token_owner {
-        db.execute_unprepared(
-            r#"
-                CREATE INDEX idx_snapshot_accounts_token_owner
-                ON snapshot_accounts (token_owner)
-                WHERE owner = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea
-                OR owner = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea;
-            "#
-        )
-        .await?;
-        tracing::info!(target: "create_database_indexes", "created idx_snapshot_accounts_token_owner in {} seconds (total accumulated)", start_time.elapsed().as_secs_f64());
+        indexes.push((
+            "idx_snapshot_accounts_token_owner",
+            r#"CREATE INDEX IF NOT EXISTS idx_snapshot_accounts_token_owner
+               ON snapshot_accounts (token_owner)
+               WHERE owner = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea
+               OR owner = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea"#,
+        ));
     }
-
     if cfg.idx_snapshot_accounts_pubkey_slot {
-        // Used for the insertClosedAccount query (for looking for the latest version of the account)
-        db.execute_unprepared(
-            r#"
-                CREATE INDEX idx_snapshot_accounts_pubkey_slot ON snapshot_accounts (pubkey, slot DESC);
-            "#,
-        )
-        .await?;
-        tracing::info!(target: "create_database_indexes", "created idx_snapshot_accounts_pubkey_slot in {} seconds (total accumulated)", start_time.elapsed().as_secs_f64());
+        indexes.push((
+            "idx_snapshot_accounts_pubkey_slot",
+            "CREATE INDEX IF NOT EXISTS idx_snapshot_accounts_pubkey_slot ON snapshot_accounts (pubkey, slot DESC)",
+        ));
     }
-
     if cfg.idx_snapshot_accounts_token_delegate {
-        db.execute_unprepared(
-            r#"
-                CREATE INDEX idx_snapshot_accounts_token_delegate
-                ON snapshot_accounts (SUBSTRING(data FROM 77 FOR 32))
-                WHERE (owner = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea
-                    OR owner = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea)
-                AND SUBSTRING(data FROM 73 FOR 1) = '\x01'::bytea;
-            "#
-        )
-        .await?;
-        tracing::info!(target: "create_database_indexes", "created idx_snapshot_accounts_token_delegate in {} seconds (total accumulated)", start_time.elapsed().as_secs_f64());
+        indexes.push((
+            "idx_snapshot_accounts_token_delegate",
+            r#"CREATE INDEX IF NOT EXISTS idx_snapshot_accounts_token_delegate
+               ON snapshot_accounts (SUBSTRING(data FROM 77 FOR 32))
+               WHERE (owner = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea
+                   OR owner = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea)
+               AND SUBSTRING(data FROM 73 FOR 1) = '\x01'::bytea"#,
+        ));
     }
 
-    tracing::info!(target: "create_database_indexes", "finished creating database indexes in {} seconds", start_time.elapsed().as_secs_f64());
-
+    metrics::BOOTSTRAP_POSTPROCESS_ITEMS
+        .with_label_values(&[crate::bootstrap::PHASE_INDEX_CREATION, "total"])
+        .set(indexes.len() as f64);
+    let mut completed = 0;
+    for (name, sql) in indexes {
+        let valid: bool = db
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid WHERE c.relname = '{}' AND i.indisvalid) AS valid",
+                    name
+                ),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("index catalog query returned no row"))?
+            .try_get("", "valid")?;
+        let checkpointed = crate::bootstrap::step_complete(
+            db,
+            run_id,
+            crate::bootstrap::PHASE_INDEX_CREATION,
+            name,
+        )
+        .await?;
+        if !checkpointed || !valid {
+            if !valid {
+                db.execute_unprepared(&format!("DROP INDEX IF EXISTS {name}"))
+                    .await?;
+            }
+            db.execute_unprepared(sql).await?;
+            crate::bootstrap::mark_step_complete(
+                db,
+                run_id,
+                crate::bootstrap::PHASE_INDEX_CREATION,
+                name,
+            )
+            .await?;
+        }
+        completed += 1;
+        metrics::BOOTSTRAP_POSTPROCESS_ITEMS
+            .with_label_values(&[crate::bootstrap::PHASE_INDEX_CREATION, "completed"])
+            .set(completed as f64);
+    }
     Ok(())
 }
 
@@ -175,52 +191,15 @@ pub async fn clean_up_closed_accounts(database: &DatabaseConnection) -> Result<(
     Ok(())
 }
 
-pub async fn create_temp_snapshot_account_versions_table(
-    database: &DatabaseConnection,
-) -> Result<(), anyhow::Error> {
-    tracing::info!(target: "create_temp_snapshot_account_versions_table", "resetting snapshot ingestion work tables");
-
-    // These are restart-local scratch tables. A previous process can leave either
-    // table populated (and the versions table can already have its final PK), which
-    // makes a retried snapshot fail later. Recreate them before every ingestion.
-    let sql = r#"
-        DROP TABLE IF EXISTS accounts_to_delete;
-        DROP TABLE IF EXISTS temp_snapshot_account_versions;
-        CREATE UNLOGGED TABLE temp_snapshot_account_versions (
-            pubkey BYTEA NOT NULL,
-            slot BIGINT NOT NULL,
-            owner BYTEA NOT NULL
-        );
-    "#;
-
-    let result = database.execute_unprepared(sql).await;
-
-    match result {
-        Ok(result) => {
-            tracing::info!(target: "create_temp_snapshot_account_versions_table", "create_temp_snapshot_account_versions_table: {}", result.rows_affected());
-        }
-        Err(e) => {
-            tracing::error!("failed to create temp closed accounts table: {}", e);
-            metrics::increment_db_snapshot_errors();
-            return Err(anyhow::anyhow!(
-                "failed to create temp snapshot account versions table: {}",
-                e
-            ));
-        }
-    }
-
-    Ok(())
-}
-
 pub struct SnapshotAccountVersion {
     pub pubkey: Vec<u8>,
     pub slot: u64,
     pub owner: Vec<u8>,
 }
 
-pub async fn insert_into_temp_snapshot_account_versions(
-    database: &DatabaseConnection,
-    snapshot_account_versions: Vec<SnapshotAccountVersion>,
+pub async fn insert_into_temp_snapshot_account_versions_connection<C: ConnectionTrait>(
+    database: &C,
+    snapshot_account_versions: &[SnapshotAccountVersion],
 ) -> Result<(), anyhow::Error> {
     let sql = include_str!("db/insert_into_snapshot_account_versions.sql");
     let start_time = Instant::now();
@@ -292,40 +271,95 @@ pub async fn insert_into_temp_snapshot_account_versions(
     Ok(())
 }
 
-pub async fn clean_up_duplicated_accounts(
+pub async fn prepare_deduplication_resumable(
     database: &DatabaseConnection,
+    run_id: i64,
 ) -> Result<(), anyhow::Error> {
-    add_primary_key_to_temp_snapshot_account_versions_table(database).await?;
-    create_accounts_to_delete_table(database).await?;
+    const PHASE: &str = crate::bootstrap::PHASE_DEDUP_PREPARATION;
+    metrics::BOOTSTRAP_POSTPROCESS_ITEMS
+        .with_label_values(&[PHASE, "total"])
+        .set(2.0);
 
-    let rows_affected = execute_cleanup_duplicated_accounts_tx(database)
-        .await
-        .inspect_err(|_| {
-            metrics::increment_db_snapshot_errors();
-        })?;
+    if !crate::bootstrap::step_complete(database, run_id, PHASE, "versions_primary_key").await? {
+        database
+            .execute_unprepared(
+                r#"
+                DO $$ BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conrelid = 'temp_snapshot_account_versions'::regclass
+                          AND contype = 'p'
+                    ) THEN
+                        ALTER TABLE temp_snapshot_account_versions ADD PRIMARY KEY (pubkey, slot);
+                    END IF;
+                END $$;
+                "#,
+            )
+            .await?;
+        crate::bootstrap::mark_step_complete(database, run_id, PHASE, "versions_primary_key")
+            .await?;
+    }
+    metrics::BOOTSTRAP_POSTPROCESS_ITEMS
+        .with_label_values(&[PHASE, "completed"])
+        .set(1.0);
 
-    tracing::info!(target: "clean_up_duplicated_accounts", "cleaned up {} duplicated accounts", rows_affected);
-
+    if !crate::bootstrap::step_complete(database, run_id, PHASE, "accounts_to_delete").await? {
+        database
+            .execute_unprepared(
+                r#"
+                CREATE UNLOGGED TABLE IF NOT EXISTS accounts_to_delete AS
+                SELECT owner, pubkey, slot
+                FROM temp_snapshot_account_versions AS t1
+                WHERE EXISTS (
+                    SELECT 1 FROM temp_snapshot_account_versions AS t2
+                    WHERE t2.pubkey = t1.pubkey AND t2.slot > t1.slot
+                );
+                "#,
+            )
+            .await?;
+        crate::bootstrap::mark_step_complete(database, run_id, PHASE, "accounts_to_delete").await?;
+    }
+    metrics::BOOTSTRAP_POSTPROCESS_ITEMS
+        .with_label_values(&[PHASE, "completed"])
+        .set(2.0);
     Ok(())
 }
 
-pub async fn add_primary_key_to_temp_snapshot_account_versions_table(
+pub async fn cleanup_duplicates_resumable(
     database: &DatabaseConnection,
+    run_id: i64,
 ) -> Result<(), anyhow::Error> {
-    tracing::info!(target: "add_primary_key_to_temp_snapshot_account_versions_table", "start adding primary key to temp snapshot account versions table");
-    let start_time = Instant::now();
+    let phase = crate::bootstrap::PHASE_DUPLICATE_CLEANUP;
+    metrics::BOOTSTRAP_POSTPROCESS_ITEMS
+        .with_label_values(&[phase, "total"])
+        .set(1.0);
+    if !crate::bootstrap::step_complete(database, run_id, phase, "delete_older_versions").await? {
+        execute_cleanup_duplicated_accounts_tx(database).await?;
+        crate::bootstrap::mark_step_complete(database, run_id, phase, "delete_older_versions")
+            .await?;
+    }
+    metrics::BOOTSTRAP_POSTPROCESS_ITEMS
+        .with_label_values(&[phase, "completed"])
+        .set(1.0);
+    Ok(())
+}
 
-    database
-        .execute_unprepared(
-            "ALTER TABLE temp_snapshot_account_versions ADD PRIMARY KEY (pubkey, slot);",
-        )
-        .await
-        .inspect_err(|_| {
-            metrics::increment_db_snapshot_errors();
-        })?;
-
-    tracing::info!(target: "clean_up_duplicated_accounts", "added primary key to temp snapshot account versions table in {} seconds", start_time.elapsed().as_secs_f64());
-
+pub async fn cleanup_closed_resumable(
+    database: &DatabaseConnection,
+    run_id: i64,
+) -> Result<(), anyhow::Error> {
+    let phase = crate::bootstrap::PHASE_CLOSED_CLEANUP;
+    metrics::BOOTSTRAP_POSTPROCESS_ITEMS
+        .with_label_values(&[phase, "total"])
+        .set(1.0);
+    if !crate::bootstrap::step_complete(database, run_id, phase, "delete_zero_lamports").await? {
+        clean_up_closed_accounts(database).await?;
+        crate::bootstrap::mark_step_complete(database, run_id, phase, "delete_zero_lamports")
+            .await?;
+    }
+    metrics::BOOTSTRAP_POSTPROCESS_ITEMS
+        .with_label_values(&[phase, "completed"])
+        .set(1.0);
     Ok(())
 }
 
@@ -358,78 +392,68 @@ pub async fn execute_cleanup_duplicated_accounts_tx(
     Ok(result.rows_affected())
 }
 
-pub async fn create_accounts_to_delete_table(
-    database: &DatabaseConnection,
-) -> Result<(), anyhow::Error> {
-    tracing::info!(target: "create_accounts_to_delete_table", "start creating accounts to delete table");
-
-    let sql = include_str!("db/create_accounts_to_delete_table.sql");
-    let start_time = Instant::now();
-
-    let rows = database.execute_unprepared(sql).await.inspect_err(|_| {
-        metrics::increment_db_snapshot_errors();
-    })?;
-
-    tracing::info!(target: "create_accounts_to_delete_table", "created accounts to delete table in {} seconds - rows affected: {}", start_time.elapsed().as_secs_f64(), rows.rows_affected());
-
-    Ok(())
-}
-
 /// Clusters the snapshot accounts hash partitions (`snapshot_accounts_pN`) discovered from the
 /// database. Waits if there are elements in the buffer to avoid overloading the DB. Partitions
 /// larger than the threshold are skipped.
 ///
 /// Only hash sub-partitions (named `snapshot_accounts_pN`) are clustered here — LIST partitions
 /// for individual programs are not, by design.
-pub async fn cluster_snapshot_accounts_table(
+pub async fn cluster_snapshot_accounts_table_resumable(
     database: &DatabaseConnection,
     buffer_size: Arc<Mutex<usize>>,
     partition_clustering_threshold: Option<u64>,
+    run_id: i64,
 ) -> Result<(), anyhow::Error> {
-    tracing::info!(target: "cluster_snapshot_accounts_table", "start clustering snapshot accounts table");
-
     let partition_sizes = get_snapshot_accounts_partition_sizes(database).await?;
-
-    // Filter for hash-partition naming pattern `snapshot_accounts_p<digits>` so we only cluster
-    // those (and not the LIST partitions which use base58 program names).
     let mut hash_partitions: Vec<(&String, &u64)> = partition_sizes
         .iter()
         .filter(|(name, _)| is_hash_partition_name(name))
         .collect();
     hash_partitions.sort_by_key(|(name, _)| (*name).clone());
+    let total = hash_partitions
+        .iter()
+        .filter(|(_, size)| {
+            partition_clustering_threshold.is_none_or(|threshold| **size <= threshold)
+        })
+        .count();
+    metrics::BOOTSTRAP_POSTPROCESS_ITEMS
+        .with_label_values(&[crate::bootstrap::PHASE_CLUSTERING, "total"])
+        .set(total as f64);
 
-    tracing::info!(target: "cluster_snapshot_accounts_table", "discovered {} hash partitions to consider for clustering", hash_partitions.len());
-
-    let start_time = Instant::now();
-    let mut last_print_time = Instant::now();
-
-    for (idx, (partition_name, partition_size)) in hash_partitions.iter().enumerate() {
-        if let Some(partition_clustering_threshold) = partition_clustering_threshold
-            && **partition_size > partition_clustering_threshold
-        {
-            tracing::info!(target: "cluster_snapshot_accounts_table", "skipping clustering for partition {partition_name} because it's too large ({} bytes)", partition_size);
+    let mut completed = 0;
+    for (partition_name, partition_size) in hash_partitions {
+        if partition_clustering_threshold.is_some_and(|threshold| *partition_size > threshold) {
             continue;
         }
-
-        let sql = format!("CLUSTER {partition_name} USING {partition_name}_pkey;");
-
-        // wait if there are elements in the buffer to avoid overloading the DB
-        // todo: make this configurable
-        while *buffer_size.lock().expect("Failed to lock buffer_size") > 5 {
-            tokio::time::sleep(Duration::from_secs(10)).await;
+        if !crate::bootstrap::step_complete(
+            database,
+            run_id,
+            crate::bootstrap::PHASE_CLUSTERING,
+            partition_name,
+        )
+        .await?
+        {
+            while *buffer_size.lock().expect("Failed to lock buffer_size") > 5 {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            database
+                .execute_unprepared(&format!(
+                    "CLUSTER {partition_name} USING {partition_name}_pkey"
+                ))
+                .await?;
+            crate::bootstrap::mark_step_complete(
+                database,
+                run_id,
+                crate::bootstrap::PHASE_CLUSTERING,
+                partition_name,
+            )
+            .await?;
         }
-
-        database.execute_unprepared(&sql).await.inspect_err(|e| {
-            tracing::error!("failed to cluster snapshot accounts table: {}", e);
-            metrics::increment_db_snapshot_errors();
-        })?;
-
-        if last_print_time.elapsed().as_secs() > 60 {
-            tracing::info!(target: "cluster_snapshot_accounts_table", "executed cluster snapshot accounts table - partition {} ({}) in {} seconds (total accumulated)", idx, partition_name, start_time.elapsed().as_secs_f64());
-            last_print_time = Instant::now();
-        }
+        completed += 1;
+        metrics::BOOTSTRAP_POSTPROCESS_ITEMS
+            .with_label_values(&[crate::bootstrap::PHASE_CLUSTERING, "completed"])
+            .set(completed as f64);
     }
-
     Ok(())
 }
 

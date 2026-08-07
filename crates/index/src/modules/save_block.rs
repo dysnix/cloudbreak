@@ -51,6 +51,7 @@ pub async fn save_block(
         &updated_accounts_during_startup,
         finalize_slot_buffer_size.clone(),
         accounts_owner_map.clone(),
+        db.clone(),
     )
     .await;
 

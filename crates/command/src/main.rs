@@ -56,16 +56,15 @@ async fn main() -> Result<()> {
     match args.command {
         Commands::Api => run_api(&args.config).await,
         Commands::Index => run_index(&args.config).await,
-        Commands::Snapshot => {
-            run_snapshot(
-                SnapshotConfig::try_load(&args.config).expect("Failed to load config"),
-                None,
-                None,
-                None,
-                AccountOwnerMap::default(),
-            )
-            .await
-        }
+        Commands::Snapshot => run_snapshot(
+            SnapshotConfig::try_load(&args.config).expect("Failed to load config"),
+            None,
+            None,
+            None,
+            AccountOwnerMap::default(),
+        )
+        .await
+        .map(|_| ()),
         Commands::QueryTracker => run_query_tracker(&args.config).await,
         Commands::SnapshotDiff(diff_args) => hash_check::run_diff(&diff_args).await,
     }

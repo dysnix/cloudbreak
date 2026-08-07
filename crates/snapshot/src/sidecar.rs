@@ -530,6 +530,46 @@ pub async fn download_snapshot_file(
     snapshot_type: SnapshotType,
     base_dir: &Path,
 ) -> Result<()> {
+    download_snapshot_file_resumable(
+        sidecar_endpoint,
+        snapshot_data,
+        snapshot_type,
+        base_dir,
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotDownloadError {
+    #[error("exact snapshot archive is unavailable: HTTP {0}")]
+    Unavailable(reqwest::StatusCode),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+impl SnapshotDownloadError {
+    pub fn is_unrecoverable(&self) -> bool {
+        matches!(
+            self,
+            Self::Unavailable(status)
+                if *status == reqwest::StatusCode::NOT_FOUND
+                    || *status == reqwest::StatusCode::GONE
+        )
+    }
+}
+
+/// Downloads an immutable snapshot archive through a partial file and atomically renames it.
+/// A complete local archive is reused without contacting the source when its recorded size is
+/// available and matches.
+pub async fn download_snapshot_file_resumable(
+    sidecar_endpoint: &str,
+    snapshot_data: SnapshotData,
+    snapshot_type: SnapshotType,
+    base_dir: &Path,
+    recorded_size: Option<u64>,
+) -> std::result::Result<u64, SnapshotDownloadError> {
     let url = if let Some(download_url) = snapshot_data.download_url {
         download_url
     } else {
@@ -539,15 +579,38 @@ pub async fn download_snapshot_file(
         )
     };
 
+    let file_path = base_dir.join(&snapshot_data.file_name);
+    if let Some(size) = recorded_size
+        && tokio::fs::metadata(&file_path)
+            .await
+            .map(|metadata| metadata.len() == size)
+            .unwrap_or(false)
+    {
+        tracing::info!(
+            target: "download_snapshot_file",
+            file = %snapshot_data.file_name,
+            size,
+            "Reusing complete local snapshot archive"
+        );
+        return Ok(size);
+    }
+
     let client = reqwest::Client::new();
     let start_time = tokio::time::Instant::now();
-    let response = client.get(url).send().await?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| SnapshotDownloadError::Other(error.into()))?;
 
     if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to download file: HTTP {}",
-            response.status()
-        ));
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+            return Err(SnapshotDownloadError::Unavailable(status));
+        }
+        return Err(SnapshotDownloadError::Other(anyhow::anyhow!(
+            "Failed to download file: HTTP {status}"
+        )));
     }
 
     let total_size = response.content_length().unwrap_or(0);
@@ -560,21 +623,47 @@ pub async fn download_snapshot_file(
         sidecar_endpoint,
     );
 
-    let file_path = base_dir.join(&snapshot_data.file_name);
-
     // Create the directory if it doesn't exist
     if let Some(parent) = file_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| SnapshotDownloadError::Other(error.into()))?;
     }
 
-    let mut file = File::create(&file_path).await?;
+    if total_size > 0
+        && tokio::fs::metadata(&file_path)
+            .await
+            .map(|metadata| metadata.len() == total_size)
+            .unwrap_or(false)
+    {
+        tracing::info!(
+            target: "download_snapshot_file",
+            file = %snapshot_data.file_name,
+            size = total_size,
+            "Reusing complete local snapshot archive"
+        );
+        return Ok(total_size);
+    }
+
+    let partial_path = file_path.with_extension(format!(
+        "{}.part",
+        file_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("archive")
+    ));
+    let mut file = File::create(&partial_path)
+        .await
+        .map_err(|error| SnapshotDownloadError::Other(error.into()))?;
     let mut stream = response.bytes_stream();
     let mut downloaded = 0u64;
     let mut last_log_time = tokio::time::Instant::now();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        file.write_all(&chunk).await?;
+        let chunk = chunk.map_err(|error| SnapshotDownloadError::Other(error.into()))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| SnapshotDownloadError::Other(error.into()))?;
         downloaded += chunk.len() as u64;
 
         if total_size > 0 && last_log_time.elapsed().as_secs() > 10 {
@@ -592,7 +681,21 @@ pub async fn download_snapshot_file(
         }
     }
 
-    file.flush().await?;
+    file.flush()
+        .await
+        .map_err(|error| SnapshotDownloadError::Other(error.into()))?;
+    file.sync_all()
+        .await
+        .map_err(|error| SnapshotDownloadError::Other(error.into()))?;
+    drop(file);
+    if total_size > 0 && downloaded != total_size {
+        return Err(SnapshotDownloadError::Other(anyhow::anyhow!(
+            "snapshot archive size mismatch: downloaded {downloaded}, expected {total_size}"
+        )));
+    }
+    tokio::fs::rename(&partial_path, &file_path)
+        .await
+        .map_err(|error| SnapshotDownloadError::Other(error.into()))?;
     tracing::info!(
         target: "download_snapshot_file",
         "File {} downloaded successfully in {} secs ({:?})",
@@ -601,7 +704,7 @@ pub async fn download_snapshot_file(
         snapshot_type
     );
 
-    Ok(())
+    Ok(downloaded)
 }
 
 pub struct UnpackedSnapshot {

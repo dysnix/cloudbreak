@@ -97,6 +97,35 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
 
     operational_endpoints::serve(&config, health.clone())?;
 
+    cloudbreak_snapshot::metrics::register_metrics(Some(metrics::METRICS_REGISTRY.clone()))?;
+    let mut replay_slot = 0;
+    if let Some(snapshot_config) = &config.snapshot {
+        match cloudbreak_snapshot::bootstrap::inspect_or_adopt_ready_database(
+            &db,
+            &snapshot_config.pg_indexes,
+        )
+        .await?
+        {
+            cloudbreak_snapshot::bootstrap::StartupBootstrapState::Ready {
+                replay_slot: persisted_slot,
+            } => {
+                replay_slot = persisted_slot;
+                *snapshot_processing_state
+                    .lock()
+                    .expect("Failed to lock snapshot_processing_state") =
+                    SnapshotProcessingState::FinishedAndCleanedUp;
+                health
+                    .remove_reason(crate::modules::health::HealthReason::Startup)
+                    .await;
+            }
+            cloudbreak_snapshot::bootstrap::StartupBootstrapState::NeedsBootstrap {
+                replay_slot: persisted_slot,
+            } => {
+                replay_slot = persisted_slot.unwrap_or(0);
+            }
+        }
+    }
+
     let updated_accounts_during_startup =
         UpdatedAccountsDuringStartup::new(snapshot_processing_state.clone(), health.clone());
 
@@ -110,7 +139,7 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     let indexer_state = IndexerState {
         buffer_channel_rx_len: Arc::new(Mutex::new(buffer_channel_rx.len())),
         snapshot_processing_state: snapshot_processing_state.clone(),
-        self_healing_state: SelfHealingState::new(&config, slot_finalizer.clone()),
+        self_healing_state: SelfHealingState::new(&config, slot_finalizer.clone(), replay_slot),
         slot_finalizer,
         updated_accounts_during_startup,
         finalize_slot_buffer_size: finalize_slot_buffer_size.clone(),

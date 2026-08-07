@@ -76,7 +76,6 @@ pub fn subscribe_grpc_with_reconnection(
         let _guard = metrics::TokioTaskCounterGuard::new("grpc");
         let mut log_first_message = true;
         let mut reconnect_failed_since: Option<Instant> = None;
-        let mut is_reconnect = false;
         let mut replay_unavailable = false;
 
         let give_up = config.grpc.reconnect_give_up;
@@ -155,14 +154,10 @@ pub fn subscribe_grpc_with_reconnection(
             // have that slot buffered.
             let keep_from_slot =
                 reconnect_failed_since.is_none_or(|started| started.elapsed() < from_slot_retain);
-            let from_slot = if is_reconnect && keep_from_slot && !replay_unavailable {
-                let last = *last_slot_received
-                    .lock()
-                    .expect("Failed to lock last_slot_received");
-                (last != 0).then_some(last + 1)
-            } else {
-                None
-            };
+            let last = *last_slot_received
+                .lock()
+                .expect("Failed to lock last_slot_received");
+            let from_slot = replay_from_slot(last, keep_from_slot, replay_unavailable);
 
             let blocks_subscribe_request: SubscribeRequest = SubscribeRequest {
                 accounts: HashMap::new(),
@@ -355,8 +350,27 @@ pub fn subscribe_grpc_with_reconnection(
                     tracing::error!("GRPC subscription handle panicked: {:?}", e);
                 }
             }
-
-            is_reconnect = true;
         }
     })
+}
+
+fn replay_from_slot(
+    last_slot: u64,
+    retain_window_open: bool,
+    replay_unavailable: bool,
+) -> Option<u64> {
+    (last_slot != 0 && retain_window_open && !replay_unavailable).then_some(last_slot + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replay_from_slot;
+
+    #[test]
+    fn initial_subscription_replays_after_persisted_tip() {
+        assert_eq!(replay_from_slot(123, true, false), Some(124));
+        assert_eq!(replay_from_slot(0, true, false), None);
+        assert_eq!(replay_from_slot(123, false, false), None);
+        assert_eq!(replay_from_slot(123, true, true), None);
+    }
 }

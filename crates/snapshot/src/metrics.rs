@@ -4,7 +4,8 @@
  */
 
 use prometheus::{
-    Counter, CounterVec, Error, GaugeVec, Histogram, HistogramOpts, Opts, Registry, core::Collector,
+    Counter, CounterVec, Error, Gauge, GaugeVec, Histogram, HistogramOpts, Opts, Registry,
+    core::Collector,
 };
 
 lazy_static::lazy_static! {
@@ -47,6 +48,44 @@ lazy_static::lazy_static! {
         &["type"]
     )
     .expect("Failed to create snapshot clean up duplicated accounts batch rows affected counter");
+
+    pub static ref BOOTSTRAP_PHASE: GaugeVec = GaugeVec::new(
+        Opts::new("cloudbreak_bootstrap_phase", "Current durable bootstrap phase (one active series has value 1)"),
+        &["run_id", "phase", "source"]
+    ).expect("Failed to create bootstrap phase gauge");
+
+    pub static ref BOOTSTRAP_FILES_TOTAL: GaugeVec = GaugeVec::new(
+        Opts::new("cloudbreak_bootstrap_account_files_total", "Account files in the durable bootstrap manifest"),
+        &["archive_type"]
+    ).expect("Failed to create bootstrap file total gauge");
+
+    pub static ref BOOTSTRAP_FILES_COMPLETED: GaugeVec = GaugeVec::new(
+        Opts::new("cloudbreak_bootstrap_account_files_completed", "Account files committed to PostgreSQL"),
+        &["archive_type"]
+    ).expect("Failed to create bootstrap completed file gauge");
+
+    pub static ref BOOTSTRAP_FILES_SKIPPED: GaugeVec = GaugeVec::new(
+        Opts::new("cloudbreak_bootstrap_account_files_skipped", "Completed account files skipped by the current resumed run"),
+        &["archive_type"]
+    ).expect("Failed to create bootstrap skipped file gauge");
+
+    pub static ref BOOTSTRAP_RESUMED_RUNS_TOTAL: Counter = Counter::new(
+        "cloudbreak_bootstrap_resumed_runs_total", "Number of bootstrap process starts that resumed a durable run"
+    ).expect("Failed to create bootstrap resumed run counter");
+
+    pub static ref BOOTSTRAP_DISCARDED_RUNS_TOTAL: CounterVec = CounterVec::new(
+        Opts::new("cloudbreak_bootstrap_discarded_runs_total", "Durable bootstrap runs discarded as unrecoverable"),
+        &["reason"]
+    ).expect("Failed to create bootstrap discarded run counter");
+
+    pub static ref BOOTSTRAP_PENDING_LIVE_UPDATES: Gauge = Gauge::new(
+        "cloudbreak_bootstrap_pending_live_update_reconciliations", "Live-updated pubkeys still pending snapshot-table reconciliation"
+    ).expect("Failed to create pending live update gauge");
+
+    pub static ref BOOTSTRAP_POSTPROCESS_ITEMS: GaugeVec = GaugeVec::new(
+        Opts::new("cloudbreak_bootstrap_postprocessing_items", "Durable post-processing item totals and completions"),
+        &["phase", "state"]
+    ).expect("Failed to create bootstrap postprocessing gauge");
 }
 
 pub fn increment_db_snapshot_errors() {
@@ -84,8 +123,39 @@ pub fn register_metrics(metrics_registry: Option<Registry>) -> Result<(), anyhow
         &metrics_registry,
         Box::new(SNAPSHOT_ACCOUNTS_BUFFER_SIZE.clone()),
     )?;
+    register_collector(&metrics_registry, Box::new(BOOTSTRAP_PHASE.clone()))?;
+    register_collector(&metrics_registry, Box::new(BOOTSTRAP_FILES_TOTAL.clone()))?;
+    register_collector(
+        &metrics_registry,
+        Box::new(BOOTSTRAP_FILES_COMPLETED.clone()),
+    )?;
+    register_collector(&metrics_registry, Box::new(BOOTSTRAP_FILES_SKIPPED.clone()))?;
+    register_collector(
+        &metrics_registry,
+        Box::new(BOOTSTRAP_RESUMED_RUNS_TOTAL.clone()),
+    )?;
+    register_collector(
+        &metrics_registry,
+        Box::new(BOOTSTRAP_DISCARDED_RUNS_TOTAL.clone()),
+    )?;
+    register_collector(
+        &metrics_registry,
+        Box::new(BOOTSTRAP_PENDING_LIVE_UPDATES.clone()),
+    )?;
+    register_collector(
+        &metrics_registry,
+        Box::new(BOOTSTRAP_POSTPROCESS_ITEMS.clone()),
+    )?;
 
     Ok(())
+}
+
+pub fn set_bootstrap_phase(run_id: i64, phase: &str, source: &str) {
+    BOOTSTRAP_PHASE.reset();
+    let run_id = run_id.to_string();
+    BOOTSTRAP_PHASE
+        .with_label_values(&[run_id.as_str(), phase, source])
+        .set(1.0);
 }
 
 fn register_collector(

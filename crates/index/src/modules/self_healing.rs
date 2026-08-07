@@ -41,9 +41,9 @@ pub struct SelfHealingState {
 }
 
 impl SelfHealingState {
-    pub fn new(_config: &IndexConfig, finalizer: SlotFinalizer) -> Self {
+    pub fn new(_config: &IndexConfig, finalizer: SlotFinalizer, initial_slot: u64) -> Self {
         Self {
-            last_slot_received: Arc::new(Mutex::new(0)),
+            last_slot_received: Arc::new(Mutex::new(initial_slot)),
             gaps_list: Arc::new(Mutex::new(Vec::new())),
             gap_boundaries: Arc::new(Mutex::new(BTreeSet::new())),
             finalizer,

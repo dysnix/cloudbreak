@@ -7,21 +7,22 @@ use cloudbreak_core::{Result, SnapshotConfig, modules::account_owner_map::Accoun
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use solana_accounts_db::accounts_file::AccountsFile;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+use tokio::time::Instant;
 use tokio::{sync::mpsc::Sender, task::JoinSet};
-use tokio::{task::JoinHandle, time::Instant};
 use yellowstone_grpc_proto::geyser::{
     SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
 };
 
 use crate::{
     db_queries::SnapshotAccountVersion,
-    sidecar::{AccountFileData, SnapshotData, SnapshotType, download_snapshot_file},
+    sidecar::{AccountFileData, SnapshotData, SnapshotType},
 };
 
 pub mod accountsdb_helpers;
+pub mod bootstrap;
 mod db_queries;
 pub mod lt_hash;
 pub mod metrics;
@@ -43,133 +44,401 @@ pub async fn run(
     metrics_registry: Option<prometheus::Registry>,
     buffer_size: Option<Arc<Mutex<usize>>>,
     accounts_owner_map: AccountOwnerMap,
-) -> Result<()> {
+) -> Result<bootstrap::BootstrapRun> {
+    run_with_prepared(
+        config,
+        received_slot,
+        metrics_registry,
+        buffer_size,
+        accounts_owner_map,
+        None,
+    )
+    .await
+}
+
+pub async fn run_with_prepared(
+    config: SnapshotConfig,
+    received_slot: Option<u64>,
+    metrics_registry: Option<prometheus::Registry>,
+    buffer_size: Option<Arc<Mutex<usize>>>,
+    accounts_owner_map: AccountOwnerMap,
+    prepared_run: Option<bootstrap::BootstrapRun>,
+) -> Result<bootstrap::BootstrapRun> {
     let start_time = Instant::now();
 
     let database = Database::connect(ConnectOptions::from(config.database.clone())).await?;
 
     metrics::register_metrics(metrics_registry)?;
 
-    db_queries::create_temp_snapshot_account_versions_table(&database).await?;
-
-    let snapshot_pair = sidecar::get_snapshot_data(
-        &config.tracker_endpoint.endpoint,
-        received_slot,
-        true,
-        false,
-    )
-    .await?;
-
-    tracing::info!("Snapshot data: {:?}", snapshot_pair);
-
-    // Download and process the snapshots
-    let full_snapshot_handle = download_and_process_snapshot(
-        snapshot_pair.downloading_endpoint.clone(),
-        snapshot_pair.full_snapshot.clone(),
-        SnapshotType::Full,
-        &database,
-        config.clone(),
-        accounts_owner_map.clone(),
-    );
-
-    // Process the full and incremental snapshots concurrently, but always join both
-    // workers before returning. Dropping a still-running JoinHandle detaches it,
-    // which would let a retry reset scratch tables while the previous attempt is
-    // still writing to them.
-    if let Some(incremental_snapshot_data) = snapshot_pair.incremental_snapshot {
-        let incremental_snapshot_handle = download_and_process_snapshot(
-            snapshot_pair.downloading_endpoint.clone(),
-            incremental_snapshot_data,
-            SnapshotType::Incremental,
+    let target_slot = received_slot.unwrap_or(0);
+    let mut prepared_run = prepared_run;
+    loop {
+        let run = match prepared_run.take() {
+            Some(run) => run,
+            None => bootstrap::prepare_run(&database, target_slot).await?,
+        };
+        let result = run_prepared_bootstrap(
             &database,
-            config.clone(),
+            &config,
+            received_slot,
+            buffer_size.clone(),
             accounts_owner_map.clone(),
-        );
-
-        let (full_result, incremental_result) =
-            tokio::join!(full_snapshot_handle, incremental_snapshot_handle);
-
-        incremental_result??;
-
-        tracing::info!(target: "incremental_snapshot_completed", "Incremental snapshot completed successfully in {} secs", start_time.elapsed().as_secs_f64());
-
-        full_result??;
-    } else {
-        full_snapshot_handle.await??;
+            run.clone(),
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                tracing::info!(
+                    run_id = run.id,
+                    "Snapshot bootstrap reached live reconciliation in {} secs",
+                    start_time.elapsed().as_secs_f64()
+                );
+                return Ok(run);
+            }
+            Err(error) => {
+                let unavailable = error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<sidecar::SnapshotDownloadError>()
+                        .is_some_and(sidecar::SnapshotDownloadError::is_unrecoverable)
+                        || cause
+                            .downcast_ref::<bootstrap::SnapshotArtifactUnrecoverable>()
+                            .is_some()
+                });
+                if unavailable {
+                    tracing::warn!(
+                        run_id = run.id,
+                        ?error,
+                        "Exact snapshot artifacts are unavailable; abandoning durable run"
+                    );
+                    bootstrap::abandon_run(&database, run.id, "exact_archive_unavailable").await?;
+                    continue;
+                }
+                return Err(error);
+            }
+        }
     }
+}
 
-    tracing::info!(target: "full_snapshot_completed", "Full snapshot completed successfully in {} secs", start_time.elapsed().as_secs_f64());
+async fn run_prepared_bootstrap(
+    database: &DatabaseConnection,
+    config: &SnapshotConfig,
+    received_slot: Option<u64>,
+    buffer_size: Option<Arc<Mutex<usize>>>,
+    accounts_owner_map: AccountOwnerMap,
+    run: bootstrap::BootstrapRun,
+) -> Result<()> {
+    let (snapshot_pair, full_size, incremental_size) =
+        if let Some(pair) = bootstrap::load_pair(database, run.id).await? {
+            pair
+        } else {
+            let pair = sidecar::get_snapshot_data(
+                &config.tracker_endpoint.endpoint,
+                received_slot,
+                true,
+                false,
+            )
+            .await?;
+            bootstrap::persist_pair(database, run.id, &pair).await?;
+            (pair, None, None)
+        };
+
+    tracing::info!(run_id = run.id, "Snapshot data: {:?}", snapshot_pair);
+    bootstrap::set_phase(database, run.id, bootstrap::PHASE_DOWNLOAD).await?;
+
+    let full_complete =
+        bootstrap::archive_ingestion_complete(database, run.id, SnapshotType::Full).await?;
+    let full_database = database.clone();
+    let full_endpoint = snapshot_pair.downloading_endpoint.clone();
+    let full_snapshot = snapshot_pair.full_snapshot.clone();
+    let full_config = config.clone();
+    let full_owner_map = accounts_owner_map.clone();
+    let full = async move {
+        if full_complete {
+            bootstrap::mark_archive_files_skipped(&full_database, run.id, SnapshotType::Full)
+                .await?;
+            tracing::info!(
+                run_id = run.id,
+                "Full snapshot ingestion is already checkpointed"
+            );
+            Ok(())
+        } else {
+            process_snapshot_archive(SnapshotArchiveJob {
+                database: full_database,
+                run_id: run.id,
+                sidecar_endpoint: full_endpoint,
+                snapshot_data: full_snapshot,
+                snapshot_type: SnapshotType::Full,
+                recorded_size: full_size,
+                config: full_config,
+                accounts_owner_map: full_owner_map,
+            })
+            .await
+        }
+    };
+    if let Some(incremental) = snapshot_pair.incremental_snapshot.clone() {
+        let incremental_complete =
+            bootstrap::archive_ingestion_complete(database, run.id, SnapshotType::Incremental)
+                .await?;
+        let incremental_database = database.clone();
+        let incremental_endpoint = snapshot_pair.downloading_endpoint.clone();
+        let incremental_config = config.clone();
+        let incremental_owner_map = accounts_owner_map;
+        let incremental = async move {
+            if incremental_complete {
+                bootstrap::mark_archive_files_skipped(
+                    &incremental_database,
+                    run.id,
+                    SnapshotType::Incremental,
+                )
+                .await?;
+                tracing::info!(
+                    run_id = run.id,
+                    "Incremental snapshot ingestion is already checkpointed"
+                );
+                Ok(())
+            } else {
+                process_snapshot_archive(SnapshotArchiveJob {
+                    database: incremental_database,
+                    run_id: run.id,
+                    sidecar_endpoint: incremental_endpoint,
+                    snapshot_data: incremental,
+                    snapshot_type: SnapshotType::Incremental,
+                    recorded_size: incremental_size,
+                    config: incremental_config,
+                    accounts_owner_map: incremental_owner_map,
+                })
+                .await
+            }
+        };
+        let (full_result, incremental_result) = tokio::join!(full, incremental);
+        full_result?;
+        incremental_result?;
+    } else {
+        full.await?;
+    }
+    bootstrap::update_metrics(database, &run).await?;
 
     if let Some(buffer_size) = buffer_size {
-        db_queries::cluster_snapshot_accounts_table(
-            &database,
+        bootstrap::set_phase(database, run.id, bootstrap::PHASE_CLUSTERING).await?;
+        db_queries::cluster_snapshot_accounts_table_resumable(
+            database,
             buffer_size,
             config.database.partition_clustering_threshold,
+            run.id,
         )
         .await?;
     }
-
-    db_queries::clean_up_duplicated_accounts(&database).await?;
-    db_queries::clean_up_closed_accounts(&database).await?;
-    db_queries::create_database_indexes(&database, &config.pg_indexes).await?;
-
-    tracing::info!(
-        "Total snapshot processing time after cleanup: {} secs",
-        start_time.elapsed().as_secs_f64()
-    );
-
+    bootstrap::set_phase(database, run.id, bootstrap::PHASE_DEDUP_PREPARATION).await?;
+    db_queries::prepare_deduplication_resumable(database, run.id).await?;
+    bootstrap::set_phase(database, run.id, bootstrap::PHASE_DUPLICATE_CLEANUP).await?;
+    db_queries::cleanup_duplicates_resumable(database, run.id).await?;
+    bootstrap::set_phase(database, run.id, bootstrap::PHASE_CLOSED_CLEANUP).await?;
+    db_queries::cleanup_closed_resumable(database, run.id).await?;
+    bootstrap::set_phase(database, run.id, bootstrap::PHASE_INDEX_CREATION).await?;
+    db_queries::create_database_indexes_resumable(database, &config.pg_indexes, run.id).await?;
+    bootstrap::set_phase(database, run.id, bootstrap::PHASE_LIVE_RECONCILIATION).await?;
     Ok(())
 }
 
-fn download_and_process_snapshot(
+struct SnapshotArchiveJob {
+    database: DatabaseConnection,
+    run_id: i64,
     sidecar_endpoint: String,
     snapshot_data: SnapshotData,
     snapshot_type: SnapshotType,
-    database: &DatabaseConnection,
+    recorded_size: Option<u64>,
     config: SnapshotConfig,
     accounts_owner_map: AccountOwnerMap,
-) -> JoinHandle<Result<()>> {
-    let db_clone = database.clone();
-
-    tokio::spawn(async move {
-        let base_dir = sidecar::snapshot_base_dir(snapshot_data.slot);
-        download_snapshot_file(
-            &sidecar_endpoint,
-            snapshot_data.clone(),
-            snapshot_type,
-            &base_dir,
-        )
-        .await
-        .inspect_err(|e| {
-            tracing::error!("Failed to download snapshot: {:?} ({:?})", e, snapshot_type);
-        })?;
-
-        process_downloaded_snapshot(&db_clone, snapshot_data, config, accounts_owner_map).await?;
-
-        Ok(())
-    })
 }
 
-/// Note: this function uses `jobs` as a concurrency limit for spawning new tasks
-async fn process_downloaded_snapshot(
+async fn process_snapshot_archive(job: SnapshotArchiveJob) -> Result<()> {
+    let SnapshotArchiveJob {
+        database,
+        run_id,
+        sidecar_endpoint,
+        snapshot_data,
+        snapshot_type,
+        recorded_size,
+        config,
+        accounts_owner_map,
+    } = job;
+    let base_dir = sidecar::snapshot_base_dir(snapshot_data.slot);
+    let archive_size = sidecar::download_snapshot_file_resumable(
+        &sidecar_endpoint,
+        snapshot_data.clone(),
+        snapshot_type,
+        &base_dir,
+        recorded_size,
+    )
+    .await?;
+    bootstrap::record_archive_download(&database, run_id, snapshot_type, archive_size).await?;
+    bootstrap::set_phase(&database, run_id, bootstrap::PHASE_EXTRACTION).await?;
+
+    let account_files =
+        prepare_extracted_snapshot(&database, run_id, snapshot_type, &snapshot_data, &base_dir)
+            .await?;
+    bootstrap::set_phase(&database, run_id, bootstrap::PHASE_INGESTION).await?;
+    process_account_files(
+        &database,
+        run_id,
+        snapshot_type,
+        account_files,
+        config,
+        accounts_owner_map,
+    )
+    .await
+}
+
+async fn prepare_extracted_snapshot(
     database: &DatabaseConnection,
-    snapshot_data: SnapshotData,
+    run_id: i64,
+    snapshot_type: SnapshotType,
+    snapshot_data: &SnapshotData,
+    base_dir: &Path,
+) -> Result<Vec<AccountFileData>> {
+    let checkpoints = bootstrap::account_file_checkpoints(database, run_id, snapshot_type).await?;
+    let accounts_dir = base_dir.join("uncompressed_snapshot/accounts");
+    if !checkpoints.is_empty() && bootstrap::validate_extracted_files(&accounts_dir, &checkpoints) {
+        let mut files = Vec::new();
+        for checkpoint in checkpoints {
+            let path = accounts_dir.join(&checkpoint.file_name);
+            if checkpoint.completed {
+                bootstrap::mark_account_file_skipped(
+                    database,
+                    run_id,
+                    snapshot_type,
+                    checkpoint.account_slot,
+                    checkpoint.write_version,
+                )
+                .await?;
+                if path.exists() {
+                    std::fs::remove_file(path)?;
+                }
+                continue;
+            }
+            files.push(AccountFileData {
+                path,
+                size: checkpoint.current_len as usize,
+                slot: checkpoint.account_slot as u64,
+                write_version: checkpoint.write_version as u64,
+            });
+        }
+        tracing::info!(
+            run_id,
+            archive_type = bootstrap::archive_type(snapshot_type),
+            pending = files.len(),
+            "Reusing validated extracted snapshot files"
+        );
+        return Ok(files);
+    }
+
+    let staging_dir = base_dir.join(format!(
+        "extracting-{run_id}-{}",
+        bootstrap::archive_type(snapshot_type)
+    ));
+    if staging_dir.exists() {
+        std::fs::remove_dir_all(&staging_dir)?;
+    }
+    std::fs::create_dir_all(&staging_dir)?;
+    let archive_path = base_dir.join(&snapshot_data.file_name);
+    let unpacked = match sidecar::unpack_compressed_snapshot(
+        archive_path.clone(),
+        &staging_dir,
+        snapshot_data.slot,
+    ) {
+        Ok(unpacked) => unpacked,
+        Err(error) => {
+            tracing::warn!(
+                run_id,
+                archive = %archive_path.display(),
+                ?error,
+                "Snapshot archive could not be extracted; removing the local copy so the exact archive is downloaded again"
+            );
+            let _ = std::fs::remove_file(&archive_path);
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            let failures =
+                bootstrap::record_archive_validation_failure(database, run_id, snapshot_type)
+                    .await?;
+            if failures >= 2 {
+                return Err(bootstrap::SnapshotArtifactUnrecoverable.into());
+            }
+            return Err(error);
+        }
+    };
+    db_queries::persist_epoch_stakes(database, &unpacked.stake_data).await?;
+
+    let replacement = staging_dir.join("uncompressed_snapshot");
+    let destination = base_dir.join("uncompressed_snapshot");
+    let backup = base_dir.join(format!(
+        "uncompressed_snapshot.replaced-{run_id}-{}",
+        bootstrap::archive_type(snapshot_type)
+    ));
+    if backup.exists() {
+        std::fs::remove_dir_all(&backup)?;
+    }
+    if destination.exists() {
+        std::fs::rename(&destination, &backup)?;
+    }
+    if let Err(error) = std::fs::rename(&replacement, &destination) {
+        if backup.exists() && !destination.exists() {
+            let _ = std::fs::rename(&backup, &destination);
+        }
+        return Err(error.into());
+    }
+    if backup.exists() {
+        std::fs::remove_dir_all(&backup)?;
+    }
+    std::fs::remove_dir_all(&staging_dir)?;
+
+    let files = unpacked
+        .account_files
+        .into_iter()
+        .map(|file| AccountFileData {
+            path: destination.join(
+                file.path
+                    .file_name()
+                    .expect("account file must have a name"),
+            ),
+            ..file
+        })
+        .collect::<Vec<_>>();
+    bootstrap::persist_manifest(database, run_id, snapshot_type, &files).await?;
+    let checkpoints = bootstrap::account_file_checkpoints(database, run_id, snapshot_type).await?;
+    let completed = checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.completed)
+        .map(|checkpoint| checkpoint.file_name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for checkpoint in &checkpoints {
+        if checkpoint.completed {
+            let path = accounts_dir.join(&checkpoint.file_name);
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+        }
+    }
+    Ok(files
+        .into_iter()
+        .filter(|file| {
+            file.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| !completed.contains(name))
+        })
+        .collect())
+}
+
+/// Processes one account file atomically with its durable completion checkpoint.
+async fn process_account_files(
+    database: &DatabaseConnection,
+    run_id: i64,
+    snapshot_type: SnapshotType,
+    solana_snapshot: Vec<AccountFileData>,
     config: SnapshotConfig,
     accounts_owner_map: AccountOwnerMap,
 ) -> Result<()> {
     let start_time = Instant::now();
     let total_accounts_files_opening_time_micros = Arc::new(Mutex::new(0));
-
-    let base_dir = sidecar::snapshot_base_dir(snapshot_data.slot);
-    let path = base_dir.join(&snapshot_data.file_name);
-    let sidecar::UnpackedSnapshot {
-        account_files: solana_snapshot,
-        stake_data,
-    } = sidecar::unpack_compressed_snapshot(path, &base_dir, snapshot_data.slot)?;
-
-    if let Err(e) = db_queries::persist_epoch_stakes(database, &stake_data).await {
-        tracing::error!("Failed to persist epoch stakes from snapshot: {:?}", e);
-    }
 
     let mut account_file_workers: JoinSet<Result<()>> = JoinSet::new();
     let accounts_file_concurency = config.accounts_file_concurency.unwrap_or(32);
@@ -191,11 +460,6 @@ async fn process_downloaded_snapshot(
     let mut last_log_time = Instant::now();
 
     let accounts_count = Arc::new(Mutex::new(0));
-
-    let (
-        insert_into_temp_snapshot_account_versions_tx,
-        insert_into_temp_snapshot_account_versions_join_handle,
-    ) = insert_into_temp_snapshot_account_versions_handler(database.clone());
 
     for AccountFileData {
         path,
@@ -232,15 +496,22 @@ async fn process_downloaded_snapshot(
         let total_accounts_files_opening_time_micros =
             total_accounts_files_opening_time_micros.clone();
 
-        let insert_into_temp_snapshot_account_versions_tx =
-            insert_into_temp_snapshot_account_versions_tx.clone();
-
         let accounts_owner_map = accounts_owner_map.clone();
 
         account_file_workers.spawn(async move {
+            let working_path = path.with_file_name(format!(
+                ".{}.cloudbreak-working-{run_id}",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("appendvec")
+            ));
+            if working_path.exists() {
+                std::fs::remove_file(&working_path)?;
+            }
+            std::fs::hard_link(&path, &working_path)?;
             let start_time = Instant::now();
             let accounts = AccountsFile::new_for_startup(
-                path,
+                working_path,
                 current_len,
                 solana_accounts_db::accounts_file::StorageAccess::default(),
             )?;
@@ -328,10 +599,17 @@ async fn process_downloaded_snapshot(
                 db_queries::upsert_accounts_batched(&database, chunk).await?;
             }
 
-            // Send the closed accounts to the insert_into_temp_snapshot_account_versions_tx channel
-            insert_into_temp_snapshot_account_versions_tx
-                .send(snapshot_account_versions)
-                .await?;
+            drop(accounts);
+            bootstrap::commit_account_file(
+                &database,
+                run_id,
+                snapshot_type,
+                account_file_slot,
+                write_version,
+                snapshot_account_versions,
+            )
+            .await?;
+            std::fs::remove_file(&path)?;
 
             Ok(())
         });
@@ -348,83 +626,20 @@ async fn process_downloaded_snapshot(
         res??;
     }
 
-    drop(insert_into_temp_snapshot_account_versions_tx);
-
-    insert_into_temp_snapshot_account_versions_join_handle.await??;
-
     let elapsed = start_time.elapsed().as_secs_f64();
     tracing::info!(target: "total_snapshot_accounts", "Snapshot processed! - Accounts count: {} in {} seconds", accounts_count.lock().unwrap(), elapsed);
     tracing::info!(target: "total_snapshot_accounts", "Total accounts files opening time: {} seconds", *total_accounts_files_opening_time_micros.lock().unwrap() / 1_000_000);
 
+    let run = bootstrap::BootstrapRun {
+        id: run_id,
+        target_slot: 0,
+        covered_slot: None,
+        phase: bootstrap::PHASE_INGESTION.to_string(),
+        source: "snapshot".to_string(),
+        resumed_count: 0,
+    };
+    bootstrap::update_metrics(database, &run).await?;
     Ok(())
-}
-
-fn insert_into_temp_snapshot_account_versions_handler(
-    database: DatabaseConnection,
-) -> (Sender<Vec<SnapshotAccountVersion>>, JoinHandle<Result<()>>) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<SnapshotAccountVersion>>(10_000);
-    let handle = tokio::spawn(async move {
-        let mut snapshot_account_versions = Vec::new();
-        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
-
-        while let Some(snapshot_account_versions_chunk) = rx.recv().await {
-            metrics::SNAPSHOT_ACCOUNTS_BUFFER_SIZE
-                .with_label_values(&["cleanup_duplicated"])
-                .set(rx.len() as f64);
-
-            snapshot_account_versions.extend(snapshot_account_versions_chunk);
-            if snapshot_account_versions.len()
-                >= db_queries::INSERT_SNAPSHOT_ACCOUNT_VERSIONS_TEMP_TABLE_BATCH_SIZE
-            {
-                let database = database.clone();
-
-                // todo: make this configurable
-                if join_set.len() >= 10 {
-                    join_set.join_next().await;
-                }
-
-                join_set.spawn(async move {
-                    db_queries::insert_into_temp_snapshot_account_versions(
-                        &database,
-                        snapshot_account_versions,
-                    )
-                    .await?;
-
-                    Ok(())
-                });
-                snapshot_account_versions = Vec::new();
-            }
-        }
-
-        while let Some(res) = join_set.join_next().await {
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::error!("Failed to insert snapshot account versions chunk: {:?}", e);
-                    return Err(e);
-                }
-                Err(join_err) => {
-                    tracing::error!(
-                        "Join error while inserting snapshot account versions: {:?}",
-                        join_err
-                    );
-                    return Err(join_err.into());
-                }
-            }
-        }
-
-        if !snapshot_account_versions.is_empty() {
-            db_queries::insert_into_temp_snapshot_account_versions(
-                &database,
-                snapshot_account_versions,
-            )
-            .await?;
-        }
-
-        Ok(())
-    });
-
-    (tx, handle)
 }
 
 /// Version of the `process_downloaded_snapshot` function that only processes the slots that are in the gaps list
@@ -583,4 +798,29 @@ pub async fn process_downloaded_snapshot_with_gap_filling(
     tracing::info!(target: "total_snapshot_accounts", "Snapshot processed! - Accounts count: {} in {} seconds", accounts_count.lock().unwrap(), elapsed);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+
+    #[test]
+    fn appendvec_drop_removes_only_the_working_hard_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("1.1");
+        let working = dir.path().join(".1.1.cloudbreak-working-1");
+        std::fs::write(&source, [0_u8; 1024]).unwrap();
+        std::fs::hard_link(&source, &working).unwrap();
+
+        let accounts = AccountsFile::new_for_startup(
+            &working,
+            0,
+            solana_accounts_db::accounts_file::StorageAccess::File,
+        )
+        .unwrap();
+        drop(accounts);
+
+        assert!(source.exists());
+        assert!(!working.exists());
+    }
 }

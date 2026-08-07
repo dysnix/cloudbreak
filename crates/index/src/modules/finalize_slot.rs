@@ -410,6 +410,32 @@ async fn finalize_slot(
 ) {
     let start_time = Instant::now();
 
+    let startup_updates_persisted = if updated_accounts_during_startup.is_startup() {
+        let mut startup_pubkeys = updated_accounts.accounts.clone();
+        startup_pubkeys.extend(updated_accounts.closed_accounts.clone());
+        loop {
+            match cloudbreak_snapshot::bootstrap::persist_startup_updated_accounts(
+                &db,
+                slot,
+                &startup_pubkeys,
+            )
+            .await
+            {
+                Ok(persisted) => break persisted,
+                Err(error) => {
+                    tracing::error!(
+                        slot,
+                        ?error,
+                        "Failed to persist startup-updated pubkeys; retrying before advancing the chain tip"
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    } else {
+        false
+    };
+
     let db_clone = db.clone();
     let config_clone = config.clone();
 
@@ -436,13 +462,10 @@ async fn finalize_slot(
 
     let mut join_set = JoinSet::new();
 
-    updated_accounts_during_startup.cleanup_stored_accounts_once(&db, slot, config);
-
     for batch in batches {
         let db_clone = db.clone();
         let batch_clone = batch.clone();
         let new_accounts_in_slot_clone = new_accounts_in_slot.clone();
-        let updated_accounts_during_startup = updated_accounts_during_startup.clone();
         let config_clone = config.clone();
         join_set.spawn(async move {
             let _guard = metrics::TokioTaskCounterGuard::new("finalize_slot_internal");
@@ -460,8 +483,7 @@ async fn finalize_slot(
         });
 
         // If we are in startup, we just save the updated accounts to delete them after the snapshot is processed
-        if updated_accounts_during_startup.is_startup() {
-            updated_accounts_during_startup.add_batch_to_cache_during_startup(batch);
+        if startup_updates_persisted {
             continue;
         }
 
@@ -498,10 +520,7 @@ async fn finalize_slot(
     });
 
     // If we are in startup, we just save the closed accounts to delete them after the snapshot is processed
-    if updated_accounts_during_startup.is_startup() {
-        updated_accounts_during_startup
-            .add_batch_to_cache_during_startup(updated_accounts.closed_accounts);
-    } else {
+    if !startup_updates_persisted {
         let config_clone = config.clone();
         join_set.spawn(async move {
             // Closed accounts are not included in the updated accounts, so we need to cleanup them separately
@@ -529,10 +548,9 @@ async fn finalize_slot(
     );
 }
 
-///Used to store all accounts that are updated/closed while loading the snapshot, and delete them after the snapshot is processed
+/// Coordinates startup state while updated/closed pubkeys are durably reconciled by the snapshot crate.
 #[derive(Clone)]
 pub struct UpdatedAccountsDuringStartup {
-    pub accounts: Arc<Mutex<HashSet<Vec<u8>>>>,
     pub snapshot_processing_state: Arc<Mutex<SnapshotProcessingState>>,
     pub health: ServiceHealth,
 }
@@ -543,7 +561,6 @@ impl UpdatedAccountsDuringStartup {
         health: ServiceHealth,
     ) -> Self {
         Self {
-            accounts: Arc::new(Mutex::new(HashSet::new())),
             snapshot_processing_state,
             health,
         }
@@ -556,6 +573,7 @@ impl UpdatedAccountsDuringStartup {
             .expect("Failed to lock snapshot_processing_state");
         *snapshot_processing_state == SnapshotProcessingState::NotStarted
             || *snapshot_processing_state == SnapshotProcessingState::Started
+            || *snapshot_processing_state == SnapshotProcessingState::Finished
     }
 
     /// No-snapshot mode has no startup snapshot to load, so startup is "finished"
@@ -576,92 +594,5 @@ impl UpdatedAccountsDuringStartup {
         }
 
         self.health.remove_reason(HealthReason::Startup).await;
-    }
-
-    pub fn add_batch_to_cache_during_startup(&self, batch: Vec<Vec<u8>>) {
-        let mut accounts = self.accounts.lock().expect("Failed to lock accounts");
-        accounts.extend(batch);
-    }
-
-    /// Only cleans up the accounts if we are NOT in startup and if the accounts cache is not empty already
-    fn cleanup_stored_accounts_once(
-        &self,
-        db: &DatabaseConnection,
-        slot: u64,
-        config: &IndexConfig,
-    ) {
-        if self.is_startup()
-            || self
-                .accounts
-                .lock()
-                .expect("Failed to lock accounts")
-                .is_empty()
-        {
-            return;
-        }
-
-        let accounts = self
-            .accounts
-            .lock()
-            .expect("Failed to lock accounts")
-            .drain()
-            .collect::<Vec<_>>();
-
-        let db = db.clone();
-        let config = config.clone();
-        let snapshot_processing_state = self.snapshot_processing_state.clone();
-        let health = self.health.clone();
-
-        tokio::spawn(async move {
-            let _guard = metrics::TokioTaskCounterGuard::new("startup_snapshot_accounts_cleanup");
-
-            let start_time = Instant::now();
-
-            tracing::info!(target: "cleanup_stored_accounts", "Cleaning up stored accounts from snapshot_accounts - accounts: {}", accounts.len());
-
-            let batches = accounts
-                .chunks(SLOT_FINALIZE_BATCH_SIZE)
-                .map(|batch| batch.to_vec())
-                .collect::<Vec<_>>();
-
-            let mut join_set = JoinSet::new();
-            const MAX_CONCURRENT_CLEANUP_TASKS: usize = 10;
-
-            for batch in batches {
-                while join_set.len() >= MAX_CONCURRENT_CLEANUP_TASKS {
-                    join_set.join_next().await;
-                }
-
-                let db = db.clone();
-                let config_clone = config.clone();
-                join_set.spawn(async move {
-                    let _guard =
-                        metrics::TokioTaskCounterGuard::new("startup_snapshot_accounts_cleanup");
-
-                    db_queries::cleanup_accounts(
-                        &db,
-                        batch,
-                        slot,
-                        "snapshot_accounts",
-                        Arc::new(Mutex::new(0)),
-                        "cleanup_startup_snapshot_accounts_batch",
-                        &config_clone,
-                    )
-                    .await;
-                });
-            }
-
-            join_set.join_all().await;
-
-            let elapsed = start_time.elapsed().as_secs_f64();
-            tracing::info!(target: "cleanup_stored_accounts", "Cleaned up stored accounts from snapshot_accounts in {} seconds", elapsed);
-
-            // Startup snapshot processing is complete: clear the startup unhealthy reason.
-            *snapshot_processing_state
-                .lock()
-                .expect("Failed to lock snapshot_processing_state") =
-                SnapshotProcessingState::FinishedAndCleanedUp;
-            health.remove_reason(HealthReason::Startup).await;
-        });
     }
 }
