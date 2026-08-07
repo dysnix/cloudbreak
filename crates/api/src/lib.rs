@@ -154,8 +154,11 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
                 tracing::error!("Error running server: {:?}", e);
             }
         } }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Shutdown signal received. Stopping server...");
+        result = cloudbreak_core::shutdown::wait_for_shutdown() => {
+            match result {
+                Ok(signal) => info!(%signal, "Shutdown signal received. Stopping server..."),
+                Err(error) => tracing::error!(?error, "Failed to listen for shutdown signal. Stopping server..."),
+            }
         }
         result = &mut slot_syncronizer_handle => {
             tracing::error!("Slot synchronizer stopped unexpectedly: {:?}", result);

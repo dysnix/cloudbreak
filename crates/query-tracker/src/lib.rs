@@ -162,13 +162,13 @@ pub async fn run(config_path: &str) -> cloudbreak_core::Result<()> {
     let server_handle = server.start(rpc.into_rpc());
 
     info!(
-        "Query Tracker service is running at http://{}. Press Ctrl+C to stop.",
+        "Query Tracker service is running at http://{}.",
         server_addr
     );
 
-    tokio::signal::ctrl_c().await?;
+    let signal = cloudbreak_core::shutdown::wait_for_shutdown().await?;
 
-    info!("Shutdown signal received. Stopping Query Tracker service...");
+    info!(%signal, "Shutdown signal received. Stopping Query Tracker service...");
 
     server_handle.stop()?;
     server_handle.stopped().await;

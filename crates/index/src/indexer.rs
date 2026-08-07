@@ -9,7 +9,10 @@ use cloudbreak_core::{
 };
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use std::{
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::mpsc::Receiver;
@@ -194,6 +197,13 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
         }
         result = self_healing_fill_gaps_handle => {
             result??;
+        }
+        result = cloudbreak_core::shutdown::wait_for_shutdown() => {
+            grpc_cancel.store(true, Ordering::SeqCst);
+            match result {
+                Ok(signal) => tracing::info!(%signal, "Shutdown signal received. Stopping indexer..."),
+                Err(error) => tracing::error!(?error, "Failed to listen for shutdown signal. Stopping indexer..."),
+            }
         }
     }
 

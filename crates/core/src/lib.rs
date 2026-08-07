@@ -9,6 +9,7 @@ use anyhow::Result as AnyhowResult;
 
 mod config;
 pub mod modules;
+pub mod shutdown;
 
 pub use config::*;
 use tracing_subscriber::{EnvFilter, Registry};
