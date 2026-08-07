@@ -677,6 +677,27 @@ pub async fn commit_account_file(
     write_version: u64,
     versions: Vec<SnapshotAccountVersion>,
 ) -> Result<(), anyhow::Error> {
+    commit_account_file_transaction(
+        db,
+        run_id,
+        snapshot_type,
+        account_slot,
+        write_version,
+        versions,
+        true,
+    )
+    .await
+}
+
+async fn commit_account_file_transaction(
+    db: &DatabaseConnection,
+    run_id: i64,
+    snapshot_type: SnapshotType,
+    account_slot: u64,
+    write_version: u64,
+    versions: Vec<SnapshotAccountVersion>,
+    commit: bool,
+) -> Result<(), anyhow::Error> {
     let txn = db.begin().await?;
     for chunk in
         versions.chunks(crate::db_queries::INSERT_SNAPSHOT_ACCOUNT_VERSIONS_TEMP_TABLE_BATCH_SIZE)
@@ -705,7 +726,11 @@ pub async fn commit_account_file(
             archive_type(snapshot_type)
         ));
     }
-    txn.commit().await?;
+    if commit {
+        txn.commit().await?;
+    } else {
+        txn.rollback().await?;
+    }
     Ok(())
 }
 
@@ -1091,6 +1116,90 @@ mod tests {
         let pubkey = vec![1_u8; 32];
         let owner = vec![2_u8; 32];
         insert_snapshot_fixture(&db, &pubkey, &owner, 10).await;
+
+        let rolled_back_pubkey = vec![5_u8; 32];
+        let concurrent_pubkey = vec![6_u8; 32];
+        for (snapshot_type, slot, write_version, file_name) in [
+            (SnapshotType::Full, 11, 2, "11.2"),
+            (SnapshotType::Incremental, 12, 3, "12.3"),
+        ] {
+            let path = dir.path().join(file_name);
+            std::fs::write(&path, [0_u8; 8]).unwrap();
+            persist_manifest(
+                &db,
+                run.id,
+                snapshot_type,
+                &[AccountFileData {
+                    path,
+                    size: 8,
+                    slot,
+                    write_version,
+                }],
+            )
+            .await
+            .unwrap();
+        }
+        insert_snapshot_fixture(&db, &rolled_back_pubkey, &owner, 11).await;
+        insert_snapshot_fixture(&db, &concurrent_pubkey, &owner, 12).await;
+        commit_account_file_transaction(
+            &db,
+            run.id,
+            SnapshotType::Full,
+            11,
+            2,
+            vec![SnapshotAccountVersion {
+                pubkey: rolled_back_pubkey.clone(),
+                slot: 11,
+                owner: owner.clone(),
+            }],
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scalar_i64(
+                &db,
+                "SELECT COUNT(*) FROM snapshot_bootstrap_account_files \
+                 WHERE account_slot = 11 AND completed_at IS NOT NULL",
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            scalar_i64(
+                &db,
+                "SELECT COUNT(*) FROM temp_snapshot_account_versions WHERE pubkey = decode(repeat('05', 32), 'hex')",
+            )
+            .await,
+            0
+        );
+        tokio::try_join!(
+            commit_account_file(
+                &db,
+                run.id,
+                SnapshotType::Full,
+                11,
+                2,
+                vec![SnapshotAccountVersion {
+                    pubkey: rolled_back_pubkey.clone(),
+                    slot: 11,
+                    owner: owner.clone(),
+                }],
+            ),
+            commit_account_file(
+                &db,
+                run.id,
+                SnapshotType::Incremental,
+                12,
+                3,
+                vec![SnapshotAccountVersion {
+                    pubkey: concurrent_pubkey.clone(),
+                    slot: 12,
+                    owner: owner.clone(),
+                }],
+            )
+        )
+        .unwrap();
         commit_account_file(
             &db,
             run.id,
@@ -1176,9 +1285,13 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            persist_startup_updated_accounts(&db, 101, std::slice::from_ref(&pubkey))
-                .await
-                .unwrap()
+            persist_startup_updated_accounts(
+                &db,
+                101,
+                &[pubkey.clone(), rolled_back_pubkey, concurrent_pubkey],
+            )
+            .await
+            .unwrap()
         );
         reconcile_updated_accounts_and_mark_ready(&db, run.id)
             .await
