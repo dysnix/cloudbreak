@@ -7,10 +7,11 @@ use cloudbreak_entity::account_lookup;
 use rust_decimal::Decimal;
 use sea_orm::{
     ActiveValue::{NotSet, Set},
-    Condition, ConnectionTrait, EntityTrait,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect,
     prelude::Expr,
     sea_query::{Alias, OnConflict},
 };
+use std::collections::HashSet;
 
 pub const CONFIRMED_COMMITMENT: i32 = 1;
 pub const FINALIZED_COMMITMENT: i32 = 2;
@@ -81,6 +82,48 @@ pub async fn upsert<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Updates rows that are already tracked without expanding the lookup to every
+/// account seen by the indexer. API misses use [`upsert`] to opt a pubkey into
+/// the cache; live confirmed/finalized maintenance uses this function.
+pub async fn upsert_existing<C: ConnectionTrait>(
+    db: &C,
+    rows: Vec<account_lookup::ActiveModel>,
+) -> Result<(), sea_orm::DbErr> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let pubkeys = rows
+        .iter()
+        .map(|row| row.pubkey.as_ref().clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let commitments = rows
+        .iter()
+        .map(|row| *row.commitment.as_ref())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let existing = account_lookup::Entity::find()
+        .select_only()
+        .column(account_lookup::Column::Pubkey)
+        .column(account_lookup::Column::Commitment)
+        .filter(account_lookup::Column::Pubkey.is_in(pubkeys))
+        .filter(account_lookup::Column::Commitment.is_in(commitments))
+        .into_tuple::<(Vec<u8>, i32)>()
+        .all(db)
+        .await?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let rows = rows
+        .into_iter()
+        .filter(|row| existing.contains(&(row.pubkey.as_ref().clone(), *row.commitment.as_ref())))
+        .collect();
+
+    upsert(db, rows).await
+}
+
 pub fn tombstone(pubkey: Vec<u8>, commitment: i32, slot: i64) -> account_lookup::ActiveModel {
     account_lookup::ActiveModel {
         pubkey: Set(pubkey),
@@ -125,8 +168,11 @@ mod tests {
         };
         let db = Database::connect(database_url).await.unwrap();
         let pubkey = vec![0xa8; 32];
+        let untracked_pubkey = vec![0xb9; 32];
         account_lookup::Entity::delete_many()
-            .filter(account_lookup::Column::Pubkey.eq(pubkey.clone()))
+            .filter(
+                account_lookup::Column::Pubkey.is_in([pubkey.clone(), untracked_pubkey.clone()]),
+            )
             .exec(&db)
             .await
             .unwrap();
@@ -134,6 +180,12 @@ mod tests {
         upsert(
             &db,
             vec![tombstone(pubkey.clone(), FINALIZED_COMMITMENT, 10)],
+        )
+        .await
+        .unwrap();
+        upsert_existing(
+            &db,
+            vec![live_row(untracked_pubkey.clone(), FINALIZED_COMMITMENT, 12)],
         )
         .await
         .unwrap();
@@ -146,7 +198,7 @@ mod tests {
         )
         .await
         .unwrap();
-        upsert(
+        upsert_existing(
             &db,
             vec![live_row(pubkey.clone(), FINALIZED_COMMITMENT, 11)],
         )
@@ -159,6 +211,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
+        assert!(
+            account_lookup::Entity::find()
+                .filter(account_lookup::Column::Pubkey.eq(untracked_pubkey.clone()))
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             rows.iter()
                 .find(|row| row.commitment == CONFIRMED_COMMITMENT)
@@ -174,7 +234,7 @@ mod tests {
         assert_eq!(finalized.account_slot, 11);
 
         account_lookup::Entity::delete_many()
-            .filter(account_lookup::Column::Pubkey.eq(pubkey))
+            .filter(account_lookup::Column::Pubkey.is_in([pubkey, untracked_pubkey]))
             .exec(&db)
             .await
             .unwrap();

@@ -519,7 +519,7 @@ pub async fn insert_accounts_chunk(
         accounts::Entity::insert_many(chunk)
             .exec_without_returning(&txn)
             .await?;
-        lookup_helpers::upsert(&txn, lookup_chunk).await?;
+        lookup_helpers::upsert_existing(&txn, lookup_chunk).await?;
         txn.commit().await?;
         Ok::<(), sea_orm::DbErr>(())
     })
@@ -588,7 +588,7 @@ pub async fn advance_finalized_account_lookup_and_slot(
             upsert_finalized_account_lookup_connection(&txn, chunk, slot).await?;
         }
         for chunk in closed_pubkeys.chunks(1_000) {
-            lookup_helpers::upsert(
+            lookup_helpers::upsert_existing(
                 &txn,
                 chunk
                     .iter()
@@ -624,7 +624,7 @@ pub async fn upsert_lookup_tombstones<C: ConnectionTrait>(
     commitment: i32,
     slot: u64,
 ) -> Result<(), sea_orm::DbErr> {
-    lookup_helpers::upsert(
+    lookup_helpers::upsert_existing(
         db,
         pubkeys
             .into_iter()

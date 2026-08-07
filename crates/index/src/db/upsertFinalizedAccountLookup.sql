@@ -3,14 +3,19 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-WITH all_versions AS NOT MATERIALIZED (
+WITH tracked AS MATERIALIZED (
+    SELECT pubkey
+    FROM account_lookup
+    WHERE commitment = $3::integer AND pubkey = ANY($1::bytea[])
+),
+all_versions AS NOT MATERIALIZED (
     SELECT pubkey, owner, lamports, slot, executable, rent_epoch, data, write_version
     FROM accounts
-    WHERE pubkey = ANY($1::bytea[]) AND slot <= $2::bigint
+    WHERE pubkey IN (SELECT pubkey FROM tracked) AND slot <= $2::bigint
     UNION ALL
     SELECT pubkey, owner, lamports, slot, executable, rent_epoch, data, write_version
     FROM snapshot_accounts
-    WHERE pubkey = ANY($1::bytea[]) AND slot <= $2::bigint
+    WHERE pubkey IN (SELECT pubkey FROM tracked) AND slot <= $2::bigint
 ),
 latest AS (
     SELECT DISTINCT ON (pubkey)
