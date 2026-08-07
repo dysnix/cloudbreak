@@ -13,7 +13,7 @@ use cloudbreak_core::{
     account_lookup::{self as lookup_helpers, CONFIRMED_COMMITMENT, FINALIZED_COMMITMENT},
     modules::account_owner_map::AccountOwnerMap,
 };
-use cloudbreak_entity::{account_lookup, accounts, service_health, slots};
+use cloudbreak_entity::{accounts, service_health, slots};
 use sea_orm::{
     ActiveValue::{NotSet, Set},
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
@@ -505,7 +505,8 @@ pub async fn get_chain_tips(db: &DatabaseConnection) -> ChainTips {
 pub async fn insert_accounts_chunk(
     db: &DatabaseConnection,
     chunk: Vec<accounts::ActiveModel>,
-    lookup_chunk: Vec<account_lookup::ActiveModel>,
+    lookup_pubkeys: Vec<Vec<u8>>,
+    slot: u64,
     byte_size: usize,
     config: &IndexConfig,
 ) {
@@ -519,7 +520,13 @@ pub async fn insert_accounts_chunk(
         accounts::Entity::insert_many(chunk)
             .exec_without_returning(&txn)
             .await?;
-        lookup_helpers::upsert_existing(&txn, lookup_chunk).await?;
+        lookup_helpers::mark_dirty_existing(
+            &txn,
+            &lookup_pubkeys,
+            CONFIRMED_COMMITMENT,
+            slot as i64,
+        )
+        .await?;
         txn.commit().await?;
         Ok::<(), sea_orm::DbErr>(())
     })
@@ -545,34 +552,6 @@ pub async fn insert_accounts_chunk(
     metrics::record_chunk_processing(elapsed, "block");
 }
 
-async fn upsert_finalized_account_lookup_connection<C: ConnectionTrait>(
-    db: &C,
-    pubkeys: &[Vec<u8>],
-    slot: u64,
-) -> Result<(), sea_orm::DbErr> {
-    if pubkeys.is_empty() {
-        return Ok(());
-    }
-
-    let values = pubkeys
-        .iter()
-        .cloned()
-        .map(|pubkey| Value::Bytes(Some(Box::new(pubkey))))
-        .collect();
-    let sql = include_str!("db/upsertFinalizedAccountLookup.sql");
-    db.execute(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        sql,
-        vec![
-            Value::Array(sea_orm::sea_query::ArrayType::Bytes, Some(Box::new(values))),
-            Value::BigInt(Some(slot as i64)),
-            Value::Int(Some(FINALIZED_COMMITMENT)),
-        ],
-    ))
-    .await?;
-    Ok(())
-}
-
 pub async fn advance_finalized_account_lookup_and_slot(
     db: &DatabaseConnection,
     updated_pubkeys: &[Vec<u8>],
@@ -585,20 +564,12 @@ pub async fn advance_finalized_account_lookup_and_slot(
     let operation = async {
         let txn = db.begin().await?;
         for chunk in updated_pubkeys.chunks(1_000) {
-            upsert_finalized_account_lookup_connection(&txn, chunk, slot).await?;
+            lookup_helpers::mark_dirty_existing(&txn, chunk, FINALIZED_COMMITMENT, slot as i64)
+                .await?;
         }
         for chunk in closed_pubkeys.chunks(1_000) {
-            lookup_helpers::upsert_existing(
-                &txn,
-                chunk
-                    .iter()
-                    .cloned()
-                    .map(|pubkey| {
-                        lookup_helpers::tombstone(pubkey, FINALIZED_COMMITMENT, slot as i64)
-                    })
-                    .collect(),
-            )
-            .await?;
+            lookup_helpers::mark_dirty_existing(&txn, chunk, FINALIZED_COMMITMENT, slot as i64)
+                .await?;
         }
         insert_slot_connection(slot, block_time, CommitmentLevel::Finalized, healthy, &txn).await?;
         txn.commit().await?;
@@ -624,12 +595,5 @@ pub async fn upsert_lookup_tombstones<C: ConnectionTrait>(
     commitment: i32,
     slot: u64,
 ) -> Result<(), sea_orm::DbErr> {
-    lookup_helpers::upsert_existing(
-        db,
-        pubkeys
-            .into_iter()
-            .map(|pubkey| lookup_helpers::tombstone(pubkey, commitment, slot as i64))
-            .collect(),
-    )
-    .await
+    lookup_helpers::mark_dirty_existing(db, &pubkeys, commitment, slot as i64).await
 }

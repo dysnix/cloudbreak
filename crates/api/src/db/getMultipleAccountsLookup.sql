@@ -17,4 +17,5 @@ FROM account_lookup
 WHERE
     pubkey = ANY($1::bytea[])
     AND commitment = $2::integer
-    AND account_slot <= $3::bigint;
+    AND account_slot <= $3::bigint
+    AND write_version >= 0;

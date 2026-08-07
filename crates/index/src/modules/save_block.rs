@@ -3,8 +3,8 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use cloudbreak_core::{IndexConfig, account_lookup::CONFIRMED_COMMITMENT};
-use cloudbreak_entity::{account_lookup, accounts};
+use cloudbreak_core::IndexConfig;
+use cloudbreak_entity::accounts;
 use sea_orm::{
     ActiveValue::{NotSet, Set},
     DatabaseConnection,
@@ -58,7 +58,7 @@ pub async fn save_block(
     let mut block_bytes_data: usize = 0;
     let mut chunks = Vec::new();
     let mut current_chunk = Vec::new();
-    let mut current_lookup_chunk = Vec::new();
+    let mut current_lookup_pubkeys = Vec::new();
     let mut current_chunk_bytes = 0;
 
     let mut updated_accounts_for_slot = Vec::new();
@@ -146,25 +146,13 @@ pub async fn save_block(
             token_mint: NotSet,
             token_owner: NotSet,
         };
-        current_lookup_chunk.push(account_lookup::ActiveModel {
-            pubkey: Set(account.pubkey),
-            commitment: Set(CONFIRMED_COMMITMENT),
-            present: Set(true),
-            owner: Set(account.owner),
-            lamports: Set(account.lamports as i64),
-            account_slot: Set(slot as i64),
-            executable: Set(account.executable),
-            rent_epoch: Set(account.rent_epoch.into()),
-            data: Set(account.data),
-            write_version: Set(account.write_version as i64),
-            updated_on: NotSet,
-        });
+        current_lookup_pubkeys.push(account.pubkey);
         current_chunk.push(account_model);
 
         if current_chunk.len() >= chunk_size || current_chunk_bytes >= max_chunk_bytes_data {
-            chunks.push((current_chunk, current_lookup_chunk, current_chunk_bytes));
+            chunks.push((current_chunk, current_lookup_pubkeys, current_chunk_bytes));
             current_chunk = Vec::new();
-            current_lookup_chunk = Vec::new();
+            current_lookup_pubkeys = Vec::new();
 
             metrics::record_chunk_size(current_chunk_bytes);
 
@@ -174,7 +162,7 @@ pub async fn save_block(
 
     if !current_chunk.is_empty() {
         tracing::debug!(target: "last_chunk", "last_chunk len: {}", current_chunk.len());
-        chunks.push((current_chunk, current_lookup_chunk, current_chunk_bytes));
+        chunks.push((current_chunk, current_lookup_pubkeys, current_chunk_bytes));
     }
 
     let closed_account_for_slot_len = closed_accounts_for_slot.len();
@@ -225,15 +213,22 @@ pub async fn save_block(
 
     // Update the "accounts" table
     let mut tasks = JoinSet::new();
-    for (chunk, lookup_chunk, byte_size) in chunks {
+    for (chunk, lookup_pubkeys, byte_size) in chunks {
         let db = db.clone();
         let config_clone = config.clone();
         // TODO: Set concurrency limit
         tasks.spawn(async move {
             let _guard = metrics::TokioTaskCounterGuard::new("insert_accounts_chunk");
 
-            db_queries::insert_accounts_chunk(&db, chunk, lookup_chunk, byte_size, &config_clone)
-                .await;
+            db_queries::insert_accounts_chunk(
+                &db,
+                chunk,
+                lookup_pubkeys,
+                slot,
+                byte_size,
+                &config_clone,
+            )
+            .await;
         });
     }
 
