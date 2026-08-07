@@ -30,13 +30,15 @@ pub struct ServiceHealth {
 }
 
 impl ServiceHealth {
-    /// Starts in the `Startup` unhealthy state, matching the previous behaviour where
-    /// the service is only marked healthy once the startup snapshot is processed.
-    pub fn new(db: DatabaseConnection) -> Self {
-        Self {
+    /// Starts in the `Startup` unhealthy state and persists it immediately so API health reads
+    /// cannot retain a stale healthy value from the previous indexer process.
+    pub async fn new(db: DatabaseConnection) -> Self {
+        let health = Self {
             reasons: Arc::new(Mutex::new(HashSet::from([HealthReason::Startup]))),
             db,
-        }
+        };
+        db_queries::update_service_health(&health.db, false).await;
+        health
     }
 
     /// Returns `true` when there are no active unhealthy reasons, mirroring the

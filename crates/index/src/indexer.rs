@@ -93,7 +93,7 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
 
     // Service health is tracked as a set of reasons (Startup is set until the startup snapshot is
     // processed; GapFill is set while a gap fill is in progress).
-    let health = ServiceHealth::new(db.clone());
+    let health = ServiceHealth::new(db.clone()).await;
 
     operational_endpoints::serve(&config, health.clone())?;
 
