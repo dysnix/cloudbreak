@@ -5,12 +5,12 @@
 
 -- getMultipleAccounts (raw / non-jsonParsed variant).
 --
--- $1 = ARRAY['\x...'::bytea, ...] - input pubkeys (order doesn't matter)
--- $2 = bound on slot derived from the requested commitment (literal)
+-- $1 = bytea[] input pubkeys (order doesn't matter)
+-- $2 = bigint bound on slot derived from the requested commitment
 
 WITH input AS (
     SELECT DISTINCT pubkey
-    FROM unnest($1) AS t (pubkey)
+    FROM unnest($1::bytea[]) AS t (pubkey)
 ),
 
 latest_account AS (
@@ -43,7 +43,7 @@ latest_account AS (
                 FROM accounts
                 WHERE
                     accounts.pubkey = input.pubkey
-                    AND accounts.slot <= $2
+                    AND accounts.slot <= $2::bigint
                 ORDER BY accounts.slot DESC
                 LIMIT 1
             )
@@ -59,7 +59,7 @@ latest_account AS (
                 FROM snapshot_accounts
                 WHERE
                     snapshot_accounts.pubkey = input.pubkey
-                    AND snapshot_accounts.slot <= $2
+                    AND snapshot_accounts.slot <= $2::bigint
                 ORDER BY snapshot_accounts.slot DESC
                 LIMIT 1
             )

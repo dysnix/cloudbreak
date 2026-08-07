@@ -24,7 +24,7 @@ use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::token::{check_account_data_len_for_encoding, parse_additional_mint_data};
 use crate::methods::{is_token_program, resolve_commitment};
-use crate::{db_query, metrics};
+use crate::metrics;
 
 #[tracing::instrument(name = "gma_rpc", skip_all, fields(num_pubkeys = pubkeys.len()))]
 pub async fn get_multiple_accounts(
@@ -91,27 +91,25 @@ pub async fn get_multiple_accounts(
         include_str!("../db/getMultipleAccounts.sql")
     };
 
-    // Build the bytea[] array literal
-    let mut array_literal = String::with_capacity(parsed_pubkeys.len() * 95 + 32);
-    array_literal.push_str("ARRAY[");
-    for (i, pk) in parsed_pubkeys.iter().enumerate() {
-        if i > 0 {
-            array_literal.push_str(", ");
-        }
-        array_literal.push_str(&format!("'\\x{}'::bytea", hex::encode(pk.as_ref())));
-    }
-    array_literal.push(']');
+    let pubkey_bytes: Vec<Vec<u8>> = parsed_pubkeys
+        .iter()
+        .map(|pubkey| pubkey.to_bytes().to_vec())
+        .collect();
+    let db_slot = i64::try_from(latest_slot).map_err(|_| RpcError::InternalError)?;
 
-    let sql = sql_template.replace("$1", &array_literal);
-    let sql = sql.replace("$2", &latest_slot.to_string());
-    let sql = db_query::add_trace_traceparent_to_query(&sql);
-
-    tracing::debug!(target: "gma_sql", "## sql: {}", sql);
+    // Keep the query text stable so SQLx can reuse its per-connection prepared-statement cache.
+    // The tracing span still records query latency without injecting a unique traceparent comment.
+    tracing::debug!(target: "gma_sql", "## sql: {}", sql_template);
 
     let pool = state.database.get_postgres_connection_pool();
     let rows = timeout(state.queries_timeout, async {
         let span = tracing::info_span!("gma_db");
-        sqlx::raw_sql(&sql).fetch_all(pool).instrument(span).await
+        sqlx::query(sql_template)
+            .bind(&pubkey_bytes)
+            .bind(db_slot)
+            .fetch_all(pool)
+            .instrument(span)
+            .await
     })
     .await
     .map_err(|_elapsed| {
