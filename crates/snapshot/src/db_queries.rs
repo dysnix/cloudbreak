@@ -9,15 +9,15 @@ use std::{
     time::Duration,
 };
 
+use cloudbreak_core::SnapshotPgIndexesConfig;
+use cloudbreak_entity::snapshot_accounts::{self};
 use rust_decimal::Decimal;
 use sea_orm::{
     ActiveValue::Set, ConnectionTrait, DatabaseConnection, EntityTrait, Statement,
-    TransactionTrait, Value,
+    TransactionTrait, Value, sea_query::OnConflict,
 };
 use tokio::time::Instant;
 use yellowstone_grpc_proto::geyser::SubscribeUpdateAccount;
-use cloudbreak_core::SnapshotPgIndexesConfig;
-use cloudbreak_entity::snapshot_accounts::{self};
 
 use crate::metrics;
 use crate::stake_data::SnapshotStakeData;
@@ -60,6 +60,12 @@ pub async fn upsert_accounts_batched(
             })
             .collect::<Result<Vec<_>, anyhow::Error>>()?,
     )
+    // Snapshot ingestion may be interrupted by a pod restart after some batches have
+    // already committed. Replaying the same immutable (pubkey, slot) rows must be
+    // idempotent so the next process can finish the snapshot instead of crashing.
+    // Do not name conflict columns here: owner-partitioned installations include
+    // `owner` in their primary key while non-partitioned installations do not.
+    .on_conflict(OnConflict::new().do_nothing().to_owned())
     .exec_without_returning(db)
     .await;
 
@@ -172,9 +178,20 @@ pub async fn clean_up_closed_accounts(database: &DatabaseConnection) -> Result<(
 pub async fn create_temp_snapshot_account_versions_table(
     database: &DatabaseConnection,
 ) -> Result<(), anyhow::Error> {
-    tracing::info!(target: "create_temp_snapshot_account_versions_table", "start creating temp snapshot account versions table");
+    tracing::info!(target: "create_temp_snapshot_account_versions_table", "resetting snapshot ingestion work tables");
 
-    let sql = "CREATE UNLOGGED TABLE IF NOT EXISTS temp_snapshot_account_versions (pubkey BYTEA NOT NULL, slot BIGINT NOT NULL, owner BYTEA NOT NULL);";
+    // These are restart-local scratch tables. A previous process can leave either
+    // table populated (and the versions table can already have its final PK), which
+    // makes a retried snapshot fail later. Recreate them before every ingestion.
+    let sql = r#"
+        DROP TABLE IF EXISTS accounts_to_delete;
+        DROP TABLE IF EXISTS temp_snapshot_account_versions;
+        CREATE UNLOGGED TABLE temp_snapshot_account_versions (
+            pubkey BYTEA NOT NULL,
+            slot BIGINT NOT NULL,
+            owner BYTEA NOT NULL
+        );
+    "#;
 
     let result = database.execute_unprepared(sql).await;
 
@@ -553,4 +570,3 @@ pub async fn persist_epoch_stakes(
 
     Ok(())
 }
-
