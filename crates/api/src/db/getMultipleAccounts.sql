@@ -7,6 +7,8 @@
 --
 -- $1 = bytea[] input pubkeys (order doesn't matter)
 -- $2 = bigint bound on slot derived from the requested commitment
+-- $3 = optional bigint data-slice offset
+-- $4 = optional bigint data-slice length
 
 WITH all_account_versions AS NOT MATERIALIZED (
     SELECT
@@ -56,6 +58,15 @@ SELECT
     slot,
     executable,
     rent_epoch,
-    data
+    CASE
+        WHEN $3::bigint IS NULL THEN data
+        WHEN $3::bigint >= OCTET_LENGTH(data) THEN '\x'::bytea
+        ELSE SUBSTRING(
+            data
+            FROM ($3::bigint + 1)::integer
+            FOR LEAST($4::bigint, 2147483647)::integer
+        )
+    END AS data,
+    OCTET_LENGTH(data)::bigint AS data_len
 FROM latest_account
 WHERE lamports > 0;
