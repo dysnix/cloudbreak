@@ -3,17 +3,17 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use cloudbreak_core::ApiConfig;
 use hyper::StatusCode;
 use prometheus::{
     HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
+use sea_orm::DatabaseConnection;
 use std::{
     convert::Infallible,
     sync::{Arc, Mutex, Once},
 };
-use sea_orm::DatabaseConnection;
 use tracing::error;
-use cloudbreak_core::ApiConfig;
 
 use crate::http::server::HttpHandlerResponse;
 
@@ -111,6 +111,17 @@ lazy_static::lazy_static! {
     pub static ref CLOUDBREAK_API_DB_POOL_CONNECTIONS: IntGaugeVec = IntGaugeVec::new(
         Opts::new("cloudbreak_api_db_pool_connections", "Database connection pool state, labelled by origin (max/idle/total)"),
         &["origin"],
+    ).unwrap();
+
+    /// Pubkeys served from or absent from the point-lookup table. The miss
+    /// count includes cold keys that are subsequently populated from the
+    /// canonical version tables.
+    pub static ref CLOUDBREAK_ACCOUNT_LOOKUP_KEYS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_account_lookup_keys_total",
+            "Account pubkeys checked by getMultipleAccounts, labelled by commitment and lookup result"
+        ),
+        &["commitment", "result"],
     ).unwrap();
 
     /// Current size of the GPA cache in bytes.
@@ -225,6 +236,7 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         register!(CLOUDBREAK_API_INFLIGHT_REQUESTS);
         register!(CLOUDBREAK_API_BATCH_REQUESTS);
         register!(CLOUDBREAK_API_DB_POOL_CONNECTIONS);
+        register!(CLOUDBREAK_ACCOUNT_LOOKUP_KEYS_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_SIZE_BYTES);
         register!(CLOUDBREAK_GPA_CACHE_MAX_BYTES);
         register!(CLOUDBREAK_GPA_CACHE_EVICTIONS_TOTAL);

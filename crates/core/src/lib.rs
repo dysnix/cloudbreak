@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 
 use anyhow::Result as AnyhowResult;
 
+pub mod account_lookup;
 mod config;
 pub mod modules;
 pub mod shutdown;

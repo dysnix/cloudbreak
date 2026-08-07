@@ -8,8 +8,12 @@ use std::{
     time::Duration,
 };
 
-use cloudbreak_core::{IndexConfig, modules::account_owner_map::AccountOwnerMap};
-use cloudbreak_entity::{accounts, service_health, slots};
+use cloudbreak_core::{
+    IndexConfig,
+    account_lookup::{self as lookup_helpers, CONFIRMED_COMMITMENT, FINALIZED_COMMITMENT},
+    modules::account_owner_map::AccountOwnerMap,
+};
+use cloudbreak_entity::{account_lookup, accounts, service_health, slots};
 use sea_orm::{
     ActiveValue::{NotSet, Set},
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
@@ -106,10 +110,18 @@ pub fn insert_closed_accounts(
         let start_time = Instant::now();
 
         if accounts_owner_map.is_enabled() {
+            let lookup_pubkeys = pubkeys.clone();
             let result = accounts_owner_map.save_closed_accounts(pubkeys, slot).await;
             match result {
                 Ok(res) => {
                     tracing::debug!("saved {} closed accounts", res.rows_affected());
+                    if let Err(error) =
+                        upsert_lookup_tombstones(&db, lookup_pubkeys, CONFIRMED_COMMITMENT, slot)
+                            .await
+                    {
+                        tracing::error!(slot, ?error, "failed to cache confirmed closures");
+                        metrics::increment_db_errors();
+                    }
                 }
                 Err(e) => {
                     tracing::error!(target: "save_closed_accounts_with_map", "failed to save closed accounts with map: {}", e);
@@ -124,22 +136,30 @@ pub fn insert_closed_accounts(
                 .map(|batch| batch.to_vec())
                 .collect::<Vec<_>>();
             for batch in batches {
-                let query = db.execute(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    insert_closed_account_sql,
-                    vec![
-                        Value::Array(
-                            sea_orm::sea_query::ArrayType::Bytes,
-                            Some(Box::new(
-                                batch
-                                    .into_iter()
-                                    .map(|pubkey| Value::Bytes(Some(Box::new(pubkey))))
-                                    .collect(),
-                            )),
-                        ),
-                        Value::BigInt(Some(slot as i64)),
-                    ],
-                ));
+                let statement_pubkeys = batch
+                    .iter()
+                    .cloned()
+                    .map(|pubkey| Value::Bytes(Some(Box::new(pubkey))))
+                    .collect();
+                let query = async {
+                    let txn = db.begin().await?;
+                    let result = txn
+                        .execute(Statement::from_sql_and_values(
+                            sea_orm::DatabaseBackend::Postgres,
+                            insert_closed_account_sql,
+                            vec![
+                                Value::Array(
+                                    sea_orm::sea_query::ArrayType::Bytes,
+                                    Some(Box::new(statement_pubkeys)),
+                                ),
+                                Value::BigInt(Some(slot as i64)),
+                            ],
+                        ))
+                        .await?;
+                    upsert_lookup_tombstones(&txn, batch, CONFIRMED_COMMITMENT, slot).await?;
+                    txn.commit().await?;
+                    Ok::<_, sea_orm::DbErr>(result)
+                };
 
                 let result = timeout(query_timeout, query)
                     .await
@@ -333,13 +353,36 @@ pub async fn insert_slot(
     config: &IndexConfig,
 ) {
     let query_timeout = Duration::from_secs(config.database.finalize_slot_queries_timeout);
+    let query = insert_slot_connection(slot, block_time, commitment, healthy, db);
 
-    let block_time = block_time.unwrap_or_default().timestamp;
+    let result = timeout(query_timeout, query)
+        .await
+        .unwrap_or_else(|elapsed| {
+            tracing::error!("insert_slot timeout ERROR: {}", elapsed);
+            metrics::increment_db_errors();
+            Err(sea_orm::DbErr::RecordNotInserted)
+        });
 
-    let query = slots::Entity::insert(slots::ActiveModel {
+    match result {
+        Ok(()) => tracing::debug!("insert_slot: inserted slot {}", slot),
+        Err(e) => {
+            tracing::error!("insert_slot: failed to insert slot {}: {}", slot, e);
+            metrics::increment_db_errors();
+        }
+    }
+}
+
+async fn insert_slot_connection<C: ConnectionTrait>(
+    slot: u64,
+    block_time: Option<UnixTimestamp>,
+    commitment: CommitmentLevel,
+    healthy: bool,
+    db: &C,
+) -> Result<(), sea_orm::DbErr> {
+    slots::Entity::insert(slots::ActiveModel {
         slot: Set(slot as i64),
         commitment: Set(commitment as i32),
-        block_time: Set(block_time),
+        block_time: Set(block_time.unwrap_or_default().timestamp),
         // Stamp the current health so a freshly inserted row is consistent with the
         // live health state even if it is created after the last health transition.
         // `update_service_health` remains the sole authority for transitions on
@@ -357,23 +400,9 @@ pub async fn insert_slot(
             )
             .to_owned(),
     )
-    .exec_without_returning(db);
-
-    let result = timeout(query_timeout, query)
-        .await
-        .unwrap_or_else(|elapsed| {
-            tracing::error!("insert_slot timeout ERROR: {}", elapsed);
-            metrics::increment_db_errors();
-            Err(sea_orm::DbErr::RecordNotInserted)
-        });
-
-    match result {
-        Ok(res) => tracing::debug!("insert_slot: inserted slot {}", res),
-        Err(e) => {
-            tracing::error!("insert_slot: failed to insert slot {}: {}", slot, e);
-            metrics::increment_db_errors();
-        }
-    }
+    .exec_without_returning(db)
+    .await?;
+    Ok(())
 }
 
 /// Retained window of `recent_blockhashes` rows (~5 minutes of slots at mainnet cadence).
@@ -476,6 +505,7 @@ pub async fn get_chain_tips(db: &DatabaseConnection) -> ChainTips {
 pub async fn insert_accounts_chunk(
     db: &DatabaseConnection,
     chunk: Vec<accounts::ActiveModel>,
+    lookup_chunk: Vec<account_lookup::ActiveModel>,
     byte_size: usize,
     config: &IndexConfig,
 ) {
@@ -484,10 +514,15 @@ pub async fn insert_accounts_chunk(
     let start_time = Instant::now();
     let chunk_len = chunk.len();
 
-    let result = timeout(
-        query_timeout,
-        accounts::Entity::insert_many(chunk).exec_without_returning(db),
-    )
+    let result = timeout(query_timeout, async {
+        let txn = db.begin().await?;
+        accounts::Entity::insert_many(chunk)
+            .exec_without_returning(&txn)
+            .await?;
+        lookup_helpers::upsert(&txn, lookup_chunk).await?;
+        txn.commit().await?;
+        Ok::<(), sea_orm::DbErr>(())
+    })
     .await
     .unwrap_or_else(|elapsed| {
         tracing::error!("upsert_accounts_batched timeout ERROR: {}", elapsed);
@@ -496,7 +531,7 @@ pub async fn insert_accounts_chunk(
     });
 
     match result {
-        Ok(res) => tracing::debug!("upsert_accounts_batched: {}", res),
+        Ok(()) => tracing::debug!("upsert_accounts_batched: committed account + lookup rows"),
         Err(e) => {
             tracing::error!("upsert_accounts_batched ERROR: {}", e);
             metrics::increment_db_errors();
@@ -508,4 +543,93 @@ pub async fn insert_accounts_chunk(
         tracing::debug!(target: "slow_chunk", "slow chunk: len: {}, size: {}", chunk_len, byte_size);
     }
     metrics::record_chunk_processing(elapsed, "block");
+}
+
+async fn upsert_finalized_account_lookup_connection<C: ConnectionTrait>(
+    db: &C,
+    pubkeys: &[Vec<u8>],
+    slot: u64,
+) -> Result<(), sea_orm::DbErr> {
+    if pubkeys.is_empty() {
+        return Ok(());
+    }
+
+    let values = pubkeys
+        .iter()
+        .cloned()
+        .map(|pubkey| Value::Bytes(Some(Box::new(pubkey))))
+        .collect();
+    let sql = include_str!("db/upsertFinalizedAccountLookup.sql");
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        sql,
+        vec![
+            Value::Array(sea_orm::sea_query::ArrayType::Bytes, Some(Box::new(values))),
+            Value::BigInt(Some(slot as i64)),
+            Value::Int(Some(FINALIZED_COMMITMENT)),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+pub async fn advance_finalized_account_lookup_and_slot(
+    db: &DatabaseConnection,
+    updated_pubkeys: &[Vec<u8>],
+    closed_pubkeys: &[Vec<u8>],
+    slot: u64,
+    block_time: Option<UnixTimestamp>,
+    healthy: bool,
+    config: &IndexConfig,
+) -> Result<(), sea_orm::DbErr> {
+    let operation = async {
+        let txn = db.begin().await?;
+        for chunk in updated_pubkeys.chunks(1_000) {
+            upsert_finalized_account_lookup_connection(&txn, chunk, slot).await?;
+        }
+        for chunk in closed_pubkeys.chunks(1_000) {
+            lookup_helpers::upsert(
+                &txn,
+                chunk
+                    .iter()
+                    .cloned()
+                    .map(|pubkey| {
+                        lookup_helpers::tombstone(pubkey, FINALIZED_COMMITMENT, slot as i64)
+                    })
+                    .collect(),
+            )
+            .await?;
+        }
+        insert_slot_connection(slot, block_time, CommitmentLevel::Finalized, healthy, &txn).await?;
+        txn.commit().await?;
+        Ok::<(), sea_orm::DbErr>(())
+    };
+
+    match timeout(
+        Duration::from_secs(config.database.finalize_slot_queries_timeout),
+        operation,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(sea_orm::DbErr::Custom(format!(
+            "finalized lookup and slot transaction timed out: {error}"
+        ))),
+    }
+}
+
+pub async fn upsert_lookup_tombstones<C: ConnectionTrait>(
+    db: &C,
+    pubkeys: Vec<Vec<u8>>,
+    commitment: i32,
+    slot: u64,
+) -> Result<(), sea_orm::DbErr> {
+    lookup_helpers::upsert(
+        db,
+        pubkeys
+            .into_iter()
+            .map(|pubkey| lookup_helpers::tombstone(pubkey, commitment, slot as i64))
+            .collect(),
+    )
+    .await
 }

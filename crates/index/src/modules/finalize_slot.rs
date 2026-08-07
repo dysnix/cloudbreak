@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::{task::JoinSet, time::Instant};
-use yellowstone_grpc_proto::geyser::CommitmentLevel;
 
 use crate::indexer::AccountsReceivedPerBlock;
 use crate::modules::health::{HealthReason, ServiceHealth};
@@ -436,19 +435,32 @@ async fn finalize_slot(
         false
     };
 
-    let db_clone = db.clone();
-    let config_clone = config.clone();
-
-    // Mark the slot as finalized before starting the cleanup tasks for API queries consistency
-    db_queries::insert_slot(
-        slot,
-        updated_accounts.block_time,
-        CommitmentLevel::Finalized,
-        updated_accounts_during_startup.health.is_healthy(),
-        &db_clone,
-        &config_clone,
-    )
-    .await;
+    // Publish the account heads and finalized tip atomically. API requests must never observe
+    // a new finalized tip with old lookup rows (or vice versa).
+    loop {
+        match db_queries::advance_finalized_account_lookup_and_slot(
+            &db,
+            &updated_accounts.accounts,
+            &updated_accounts.closed_accounts,
+            slot,
+            updated_accounts.block_time,
+            updated_accounts_during_startup.health.is_healthy(),
+            config,
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(error) => {
+                tracing::error!(
+                    slot,
+                    ?error,
+                    "Failed to atomically advance finalized lookup and slot; retrying before cleanup"
+                );
+                metrics::increment_db_errors();
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
 
     // These are accounts that were in the slot but did not have an older version (which means
     //  they are completely new to our db)

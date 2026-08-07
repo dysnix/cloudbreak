@@ -16,7 +16,8 @@ WITH all_account_versions AS NOT MATERIALIZED (
         accounts.slot,
         accounts.executable,
         accounts.rent_epoch,
-        accounts.data
+        accounts.data,
+        accounts.write_version
     FROM accounts
     WHERE
         accounts.pubkey = ANY($1::bytea[])
@@ -29,7 +30,8 @@ WITH all_account_versions AS NOT MATERIALIZED (
         snapshot_accounts.slot,
         snapshot_accounts.executable,
         snapshot_accounts.rent_epoch,
-        snapshot_accounts.data
+        snapshot_accounts.data,
+        snapshot_accounts.write_version
     FROM snapshot_accounts
     WHERE
         snapshot_accounts.pubkey = ANY($1::bytea[])
@@ -44,7 +46,8 @@ latest_account AS (
         slot,
         executable,
         rent_epoch,
-        data
+        data,
+        write_version
     FROM all_account_versions
     ORDER BY pubkey ASC, slot DESC
 )
@@ -56,6 +59,8 @@ SELECT
     slot,
     executable,
     rent_epoch,
-    data
+    data,
+    write_version,
+    TRUE AS present
 FROM latest_account
 WHERE lamports > 0;

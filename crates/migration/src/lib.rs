@@ -22,6 +22,7 @@ mod m20260618_000000_create_auto_index_usage_table;
 mod m20260703_000000_create_recent_blockhashes_table;
 mod m20260709_000000_add_block_height_to_recent_blockhashes;
 mod m20260807_000000_create_snapshot_bootstrap_state;
+mod m20260808_000000_create_account_lookup;
 
 pub struct Migrator;
 
@@ -44,6 +45,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260703_000000_create_recent_blockhashes_table::Migration),
             Box::new(m20260709_000000_add_block_height_to_recent_blockhashes::Migration),
             Box::new(m20260807_000000_create_snapshot_bootstrap_state::Migration),
+            Box::new(m20260808_000000_create_account_lookup::Migration),
         ]
     }
 }

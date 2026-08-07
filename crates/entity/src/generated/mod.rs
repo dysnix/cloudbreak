@@ -7,6 +7,7 @@
 
 pub mod prelude;
 
+pub mod account_lookup;
 pub mod accounts;
 pub mod service_health;
 pub mod slots;

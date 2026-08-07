@@ -6,7 +6,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use cloudbreak_core::account_lookup::{
+    self as lookup_helpers, CONFIRMED_COMMITMENT, FINALIZED_COMMITMENT,
+};
+use cloudbreak_entity::account_lookup;
 use rust_decimal::prelude::ToPrimitive;
+use sea_orm::ActiveValue::{NotSet, Set};
 use sea_orm::sqlx::Row;
 use sea_orm::sqlx::{self};
 use solana_account::AccountSharedData;
@@ -102,14 +107,111 @@ pub async fn get_multiple_accounts(
     tracing::debug!(target: "gma_sql", "## sql: {}", sql_template);
 
     let pool = state.database.get_postgres_connection_pool();
+    let commitment_code = match commitment {
+        CommitmentLevel::Confirmed => CONFIRMED_COMMITMENT,
+        CommitmentLevel::Finalized => FINALIZED_COMMITMENT,
+        CommitmentLevel::Processed => CONFIRMED_COMMITMENT,
+    };
+    let commitment_label = match commitment_code {
+        CONFIRMED_COMMITMENT => "confirmed",
+        FINALIZED_COMMITMENT => "finalized",
+        _ => unreachable!("unsupported account lookup commitment"),
+    };
+
     let rows = timeout(state.queries_timeout, async {
         let span = tracing::info_span!("gma_db");
-        sqlx::query(sql_template)
-            .bind(&pubkey_bytes)
-            .bind(db_slot)
-            .fetch_all(pool)
-            .instrument(span)
-            .await
+        async {
+            if with_mint {
+                return sqlx::query(sql_template)
+                    .bind(&pubkey_bytes)
+                    .bind(db_slot)
+                    .fetch_all(pool)
+                    .await;
+            }
+
+            let lookup_result = sqlx::query(include_str!("../db/getMultipleAccountsLookup.sql"))
+                .bind(&pubkey_bytes)
+                .bind(commitment_code)
+                .bind(db_slot)
+                .fetch_all(pool)
+                .await;
+            // During a rolling upgrade the API can briefly start before the indexer's
+            // migration init container has created the lookup table. Keep serving from
+            // the canonical tables and begin caching automatically once it exists.
+            let mut rows = match lookup_result {
+                Ok(rows) => rows,
+                Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42P01") => {
+                    tracing::warn!(
+                        "account lookup table is not available yet; using canonical tables"
+                    );
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
+            };
+            let cached_pubkeys = rows
+                .iter()
+                .map(|row| row.get::<Vec<u8>, _>("pubkey"))
+                .collect::<std::collections::HashSet<_>>();
+            let missing_pubkeys = pubkey_bytes
+                .iter()
+                .filter(|pubkey| !cached_pubkeys.contains(*pubkey))
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+
+            metrics::CLOUDBREAK_ACCOUNT_LOOKUP_KEYS_TOTAL
+                .with_label_values(&[commitment_label, "hit"])
+                .inc_by(cached_pubkeys.len() as u64);
+            metrics::CLOUDBREAK_ACCOUNT_LOOKUP_KEYS_TOTAL
+                .with_label_values(&[commitment_label, "miss"])
+                .inc_by(missing_pubkeys.len() as u64);
+
+            if missing_pubkeys.is_empty() {
+                return Ok(rows);
+            }
+
+            let fallback_rows = sqlx::query(sql_template)
+                .bind(&missing_pubkeys)
+                .bind(db_slot)
+                .fetch_all(pool)
+                .await?;
+            let returned_pubkeys = fallback_rows
+                .iter()
+                .map(|row| row.get::<Vec<u8>, _>("pubkey"))
+                .collect::<std::collections::HashSet<_>>();
+            let mut lookup_rows = fallback_rows
+                .iter()
+                .map(|row| account_lookup::ActiveModel {
+                    pubkey: Set(row.get("pubkey")),
+                    commitment: Set(commitment_code),
+                    present: Set(true),
+                    owner: Set(row.get("owner")),
+                    lamports: Set(row.get("lamports")),
+                    account_slot: Set(row.get("slot")),
+                    executable: Set(row.get("executable")),
+                    rent_epoch: Set(row.get("rent_epoch")),
+                    data: Set(row.get("data")),
+                    write_version: Set(row.get("write_version")),
+                    updated_on: NotSet,
+                })
+                .collect::<Vec<_>>();
+            lookup_rows.extend(
+                missing_pubkeys
+                    .iter()
+                    .filter(|pubkey| !returned_pubkeys.contains(*pubkey))
+                    .cloned()
+                    .map(|pubkey| lookup_helpers::tombstone(pubkey, commitment_code, db_slot)),
+            );
+
+            if let Err(error) = lookup_helpers::upsert(&state.database, lookup_rows).await {
+                tracing::warn!(?error, "failed to populate account lookup cache");
+            }
+            rows.extend(fallback_rows);
+            Ok(rows)
+        }
+        .instrument(span)
+        .await
     })
     .await
     .map_err(|_elapsed| {
@@ -130,7 +232,10 @@ pub async fn get_multiple_accounts(
             tracing::error!("getMultipleAccounts: invalid pubkey bytes returned by DB");
             RpcError::InternalError
         })?;
-        row_by_pubkey.insert(row_pubkey, row);
+        let present = row.try_get::<bool, _>("present").unwrap_or(true);
+        if present && row.get::<i64, _>("lamports") > 0 {
+            row_by_pubkey.insert(row_pubkey, row);
+        }
     }
 
     let mut result: Vec<Option<UiAccount>> = Vec::with_capacity(parsed_pubkeys.len());

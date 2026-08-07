@@ -341,6 +341,7 @@ async fn reset_snapshot_work(db: &DatabaseConnection) -> Result<(), anyhow::Erro
         DROP INDEX IF EXISTS idx_snapshot_accounts_pubkey_slot;
         DROP INDEX IF EXISTS idx_snapshot_accounts_token_delegate;
         TRUNCATE TABLE snapshot_accounts;
+        TRUNCATE TABLE account_lookup;
         CREATE UNLOGGED TABLE temp_snapshot_account_versions (
             pubkey BYTEA NOT NULL,
             slot BIGINT NOT NULL,
