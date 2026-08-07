@@ -334,6 +334,43 @@ async fn process_single_request(
                 };
             }
         }
+        "getProgramAccountsPaginated" => {
+            let start_time = Instant::now();
+            let program: String = match extract_param(&rpc_request.params, 0) {
+                Ok(program) => program,
+                Err(error) => return make_error_response(id, -32602, error),
+            };
+            let config: Option<methods::program_paginated::RpcProgramAccountsPaginatedConfig> =
+                match extract_param(&rpc_request.params, 1) {
+                    Ok(config) => config,
+                    Err(error) if error.starts_with("Missing parameter") => None,
+                    Err(error) => return make_error_response(id, -32602, error),
+                };
+
+            let result =
+                methods::program_paginated::get_program_accounts_paginated(state, program, config)
+                    .await;
+            let status_label = if result.is_ok() { "success" } else { "error" };
+            if let Err(error) = &result {
+                tracing::error!(
+                    target: "api_request_errors_count",
+                    "getProgramAccountsPaginated error: {:?}",
+                    error
+                );
+            }
+            metrics::CLOUDBREAK_API_REQUESTS_TOTAL
+                .with_label_values(&["gPAPaginated", status_label])
+                .inc();
+
+            let json_response = json_serialize_response(id, result).await;
+            metrics::CLOUDBREAK_API_REQUEST_DURATION_MS
+                .with_label_values(&[
+                    "gPAPaginated",
+                    metrics::bytes_bucket(json_response.0.len() as u64),
+                ])
+                .observe(start_time.elapsed().as_millis() as f64);
+            json_response
+        }
         "getTokenAccountsByMint" => {
             let gpa_global_start_time = Instant::now();
 
