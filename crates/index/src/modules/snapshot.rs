@@ -3,9 +3,10 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use std::sync::{Arc, Mutex};
-use cloudbreak_core::{
-    IndexConfig, SnapshotConfig, modules::account_owner_map::AccountOwnerMap,
+use cloudbreak_core::{IndexConfig, SnapshotConfig, modules::account_owner_map::AccountOwnerMap};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use crate::metrics;
@@ -68,25 +69,37 @@ pub async fn process_snapshot_if_needed(
     tokio::spawn(async move {
         let _guard = metrics::TokioTaskCounterGuard::new("snapshot_processing");
 
-        let handle = cloudbreak_snapshot::run(
-            SnapshotConfig {
-                accounts_file_concurency: snapshot_config.accounts_file_concurency,
-                database: config.database,
-                tracker_endpoint: snapshot_config.tracker_endpoint,
-                metrics: config.metrics,
-                programs: config.programs,
-                pg_indexes: snapshot_config.pg_indexes,
-            },
-            Some(slot),
-            Some(metrics::METRICS_REGISTRY.clone()),
-            Some(finalize_slot_buffer_size.clone()),
-            accounts_owner_map,
-        )
-        .await;
+        let run_config = SnapshotConfig {
+            accounts_file_concurency: snapshot_config.accounts_file_concurency,
+            database: config.database,
+            tracker_endpoint: snapshot_config.tracker_endpoint,
+            metrics: config.metrics,
+            programs: config.programs,
+            pg_indexes: snapshot_config.pg_indexes,
+        };
 
-        if let Err(e) = handle {
-            tracing::error!("Failed to process snapshot: {:?}", e);
-            panic!("Failed to process snapshot: {:?}", e);
+        let mut attempt = 1_u64;
+        loop {
+            match cloudbreak_snapshot::run(
+                run_config.clone(),
+                Some(slot),
+                Some(metrics::METRICS_REGISTRY.clone()),
+                Some(finalize_slot_buffer_size.clone()),
+                accounts_owner_map.clone(),
+            )
+            .await
+            {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::error!(
+                        attempt,
+                        ?error,
+                        "Failed to process snapshot; retrying in 10 seconds"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+            }
         }
 
         *snapshot_processing_state_clone

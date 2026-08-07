@@ -3,6 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use cloudbreak_core::{Result, SnapshotConfig, modules::account_owner_map::AccountOwnerMap};
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use solana_accounts_db::accounts_file::AccountsFile;
 use std::{
@@ -13,9 +14,6 @@ use tokio::{sync::mpsc::Sender, task::JoinSet};
 use tokio::{task::JoinHandle, time::Instant};
 use yellowstone_grpc_proto::geyser::{
     SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
-};
-use cloudbreak_core::{
-    Result, SnapshotConfig, modules::account_owner_map::AccountOwnerMap,
 };
 
 use crate::{
@@ -74,22 +72,31 @@ pub async fn run(
         accounts_owner_map.clone(),
     );
 
-    // Process incremental snapshot only if needed
+    // Process the full and incremental snapshots concurrently, but always join both
+    // workers before returning. Dropping a still-running JoinHandle detaches it,
+    // which would let a retry reset scratch tables while the previous attempt is
+    // still writing to them.
     if let Some(incremental_snapshot_data) = snapshot_pair.incremental_snapshot {
-        download_and_process_snapshot(
+        let incremental_snapshot_handle = download_and_process_snapshot(
             snapshot_pair.downloading_endpoint.clone(),
             incremental_snapshot_data,
             SnapshotType::Incremental,
             &database,
             config.clone(),
             accounts_owner_map.clone(),
-        )
-        .await??;
+        );
+
+        let (full_result, incremental_result) =
+            tokio::join!(full_snapshot_handle, incremental_snapshot_handle);
+
+        incremental_result??;
 
         tracing::info!(target: "incremental_snapshot_completed", "Incremental snapshot completed successfully in {} secs", start_time.elapsed().as_secs_f64());
-    }
 
-    full_snapshot_handle.await??;
+        full_result??;
+    } else {
+        full_snapshot_handle.await??;
+    }
 
     tracing::info!(target: "full_snapshot_completed", "Full snapshot completed successfully in {} secs", start_time.elapsed().as_secs_f64());
 
