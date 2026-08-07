@@ -8,20 +8,31 @@ WITH tracked AS MATERIALIZED (
     FROM account_lookup
     WHERE commitment = $3::integer AND pubkey = ANY($1::bytea[])
 ),
-all_versions AS NOT MATERIALIZED (
-    SELECT pubkey, owner, lamports, slot, executable, rent_epoch, data, write_version
-    FROM accounts
-    WHERE pubkey IN (SELECT pubkey FROM tracked) AND slot <= $2::bigint
-    UNION ALL
-    SELECT pubkey, owner, lamports, slot, executable, rent_epoch, data, write_version
-    FROM snapshot_accounts
-    WHERE pubkey IN (SELECT pubkey FROM tracked) AND slot <= $2::bigint
-),
 latest AS (
-    SELECT DISTINCT ON (pubkey)
-        pubkey, owner, lamports, slot, executable, rent_epoch, data, write_version
-    FROM all_versions
-    ORDER BY pubkey, slot DESC, write_version DESC
+    SELECT
+        tracked.pubkey,
+        current.owner,
+        current.lamports,
+        current.slot,
+        current.executable,
+        current.rent_epoch,
+        current.data,
+        current.write_version
+    FROM tracked
+    CROSS JOIN LATERAL (
+        SELECT owner, lamports, slot, executable, rent_epoch, data, write_version
+        FROM (
+            SELECT owner, lamports, slot, executable, rent_epoch, data, write_version
+            FROM accounts
+            WHERE accounts.pubkey = tracked.pubkey AND slot <= $2::bigint
+            UNION ALL
+            SELECT owner, lamports, slot, executable, rent_epoch, data, write_version
+            FROM snapshot_accounts
+            WHERE snapshot_accounts.pubkey = tracked.pubkey AND slot <= $2::bigint
+        ) versions
+        ORDER BY slot DESC, write_version DESC
+        LIMIT 1
+    ) current
 )
 INSERT INTO account_lookup (
     pubkey, commitment, present, owner, lamports, account_slot,
