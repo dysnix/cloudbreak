@@ -3,76 +3,55 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
--- getMultipleAccounts (jsonParsed variant). Same per-input-pubkey LATERAL
--- pattern as getMultipleAccounts.sql, plus a deduplicated mint LEFT JOIN
--- so we look up each distinct mint exactly once.
+-- getMultipleAccounts (jsonParsed variant). Same set-based latest-account
+-- selection as getMultipleAccounts.sql, plus a deduplicated mint LEFT JOIN so
+-- we look up each distinct mint exactly once.
 --
 -- $1 = bytea[] input pubkeys (order doesn't matter)
 -- $2 = bigint bound on slot from commitment
 
-WITH input AS (
-    SELECT DISTINCT pubkey
-    FROM unnest($1::bytea[]) AS t (pubkey)
+WITH all_account_versions AS NOT MATERIALIZED (
+    SELECT
+        accounts.pubkey,
+        accounts.owner,
+        accounts.lamports,
+        accounts.slot,
+        accounts.executable,
+        accounts.rent_epoch,
+        accounts.data,
+        accounts.token_mint
+    FROM accounts
+    WHERE
+        accounts.pubkey = ANY($1::bytea[])
+        AND accounts.slot <= $2::bigint
+    UNION ALL
+    SELECT
+        snapshot_accounts.pubkey,
+        snapshot_accounts.owner,
+        snapshot_accounts.lamports,
+        snapshot_accounts.slot,
+        snapshot_accounts.executable,
+        snapshot_accounts.rent_epoch,
+        snapshot_accounts.data,
+        snapshot_accounts.token_mint
+    FROM snapshot_accounts
+    WHERE
+        snapshot_accounts.pubkey = ANY($1::bytea[])
+        AND snapshot_accounts.slot <= $2::bigint
 ),
 
 latest_account AS (
-    SELECT
-        input.pubkey,
-        latest_unified.owner,
-        latest_unified.lamports,
-        latest_unified.slot,
-        latest_unified.executable,
-        latest_unified.rent_epoch,
-        latest_unified.data,
-        latest_unified.token_mint
-    FROM input
-    LEFT JOIN LATERAL ( -- noqa: ST05
-        SELECT
-            unified.owner,
-            unified.lamports,
-            unified.slot,
-            unified.executable,
-            unified.rent_epoch,
-            unified.data,
-            unified.token_mint
-        FROM ( -- noqa: ST05
-            (
-                SELECT
-                    accounts.owner,
-                    accounts.lamports,
-                    accounts.slot,
-                    accounts.executable,
-                    accounts.rent_epoch,
-                    accounts.data,
-                    accounts.token_mint
-                FROM accounts
-                WHERE
-                    accounts.pubkey = input.pubkey
-                    AND accounts.slot <= $2::bigint
-                ORDER BY accounts.slot DESC
-                LIMIT 1
-            )
-            UNION ALL
-            (
-                SELECT
-                    snapshot_accounts.owner,
-                    snapshot_accounts.lamports,
-                    snapshot_accounts.slot,
-                    snapshot_accounts.executable,
-                    snapshot_accounts.rent_epoch,
-                    snapshot_accounts.data,
-                    snapshot_accounts.token_mint
-                FROM snapshot_accounts
-                WHERE
-                    snapshot_accounts.pubkey = input.pubkey
-                    AND snapshot_accounts.slot <= $2::bigint
-                ORDER BY snapshot_accounts.slot DESC
-                LIMIT 1
-            )
-        ) AS unified
-        ORDER BY unified.slot DESC
-        LIMIT 1
-    ) AS latest_unified ON TRUE
+    SELECT DISTINCT ON (pubkey)
+        pubkey,
+        owner,
+        lamports,
+        slot,
+        executable,
+        rent_epoch,
+        data,
+        token_mint
+    FROM all_account_versions
+    ORDER BY pubkey ASC, slot DESC
 ),
 
 -- Distinct mints needed for jsonParsed enrichment only for live token accounts.
