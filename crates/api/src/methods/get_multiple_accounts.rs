@@ -96,12 +96,6 @@ pub async fn get_multiple_accounts(
         .map(|pubkey| pubkey.to_bytes().to_vec())
         .collect();
     let db_slot = i64::try_from(latest_slot).map_err(|_| RpcError::InternalError)?;
-    let (slice_offset, slice_length) = data_slice.map_or((None, None), |slice| {
-        (
-            Some(i64::try_from(slice.offset).unwrap_or(i64::MAX)),
-            Some(i64::try_from(slice.length).unwrap_or(i64::MAX)),
-        )
-    });
 
     // Keep the query text stable so SQLx can reuse its per-connection prepared-statement cache.
     // The tracing span still records query latency without injecting a unique traceparent comment.
@@ -110,25 +104,12 @@ pub async fn get_multiple_accounts(
     let pool = state.database.get_postgres_connection_pool();
     let rows = timeout(state.queries_timeout, async {
         let span = tracing::info_span!("gma_db");
-        async {
-            if with_mint {
-                sqlx::query(sql_template)
-                    .bind(&pubkey_bytes)
-                    .bind(db_slot)
-                    .fetch_all(pool)
-                    .await
-            } else {
-                sqlx::query(sql_template)
-                    .bind(&pubkey_bytes)
-                    .bind(db_slot)
-                    .bind(slice_offset)
-                    .bind(slice_length)
-                    .fetch_all(pool)
-                    .await
-            }
-        }
-        .instrument(span)
-        .await
+        sqlx::query(sql_template)
+            .bind(&pubkey_bytes)
+            .bind(db_slot)
+            .fetch_all(pool)
+            .instrument(span)
+            .await
     })
     .await
     .map_err(|_elapsed| {
@@ -184,10 +165,6 @@ pub async fn get_multiple_accounts(
             .to_u64()
             .unwrap_or(0);
         let data: Vec<u8> = row.get("data");
-        let original_data_len = row
-            .get::<i64, _>("data_len")
-            .try_into()
-            .map_err(|_| RpcError::InternalError)?;
 
         let additional_mint_data: Option<AccountAdditionalDataV3> =
             if with_mint && is_token_program(&owner) {
@@ -203,24 +180,23 @@ pub async fn get_multiple_accounts(
                 None
             };
 
-        check_account_data_len_for_encoding(encoding, data_slice, original_data_len, pubkey)?;
-
         let account_shared_data = AccountSharedData::create_from_existing_shared_data(
             lamports,
-            Arc::new(data),
+            Arc::new(data.clone()),
             owner,
             executable,
             rent_epoch,
         );
 
-        let mut ui_account = encode_ui_account(
+        check_account_data_len_for_encoding(encoding, data_slice, data.len(), pubkey)?;
+
+        let ui_account = encode_ui_account(
             pubkey,
             &account_shared_data,
             encoding,
             additional_mint_data,
-            with_mint.then_some(data_slice).flatten(),
+            data_slice,
         );
-        ui_account.space = Some(original_data_len as u64);
 
         result.push(Some(ui_account));
     }

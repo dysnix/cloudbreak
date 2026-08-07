@@ -112,7 +112,6 @@ SELECT
     latest_account.executable,
     latest_account.rent_epoch,
     latest_account.data,
-    OCTET_LENGTH(latest_account.data)::bigint AS data_len,
     mint.mint_data
 FROM latest_account
 LEFT JOIN mint ON latest_account.token_mint = mint.pubkey
