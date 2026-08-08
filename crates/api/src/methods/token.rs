@@ -5,6 +5,7 @@
 
 use crate::error::RpcError;
 use crate::http::{CloudbreakApiResponse, CloudbreakRpcState};
+use crate::methods::get_multiple_accounts::fetch_accounts_without_mint;
 use crate::methods::program::{self, GpaResponse};
 use crate::methods::{LEGACY_TOKEN_PROGRAM_ID, SqlDataSliceFilter, is_token_program};
 use crate::metrics::GpaMetricsData;
@@ -36,6 +37,7 @@ use spl_token_2022::extension::{BaseStateWithExtensions, StateWithExtensions};
 use spl_token_2022::state::Mint;
 use spl_token_2022_interface::extension::interest_bearing_mint::InterestBearingConfig;
 use spl_token_2022_interface::extension::scaled_ui_amount::ScaledUiAmountConfig;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,7 +55,7 @@ fn prepared_gtabo_sql(program_bytes: &[u8]) -> String {
     // predicate even if it later chooses a generic prepared plan. There are
     // only two valid program IDs, so this still produces only two stable query
     // texts. Slot and wallet remain bind parameters.
-    include_str!("../db/getTokenAccountsByOwner.sql")
+    include_str!("../db/getTokenAccountsByOwnerCore.sql")
         .replace("$1", &format!("'\\x{}'::bytea", hex::encode(program_bytes)))
         .replace("$2", "$1")
         .replace(
@@ -375,6 +377,51 @@ pub async fn get_token_accounts_by_owner_or_delegate(
         Err(RpcError::InternalError)
     })?;
 
+    let mint_data_by_pubkey = if use_prepared_gtabo {
+        let mint_pubkeys = batch
+            .iter()
+            .filter_map(|row| row.try_get::<Vec<u8>, _>("token_mint").ok())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mint_lookup_start = Instant::now();
+        let mint_rows = timeout(
+            state.queries_timeout,
+            fetch_accounts_without_mint(state, &mint_pubkeys, latest_slot, commitment),
+        )
+        .await
+        .map_err(|_| {
+            tracing::error!("getTokenAccountsByOwner batched mint lookup timed out");
+            RpcError::InternalError
+        })?
+        .map_err(|error| {
+            tracing::error!(?error, "getTokenAccountsByOwner batched mint lookup failed");
+            RpcError::InternalError
+        })?;
+        db_query_total_ms += mint_lookup_start.elapsed();
+
+        let mut mint_data = HashMap::with_capacity(mint_rows.len());
+        for row in mint_rows {
+            if !row.try_get::<bool, _>("present").unwrap_or(true)
+                || row.get::<i64, _>("lamports") <= 0
+            {
+                continue;
+            }
+            let owner: Vec<u8> = row.get("owner");
+            if owner != program_bytes {
+                continue;
+            }
+            let pubkey: Vec<u8> = row.get("pubkey");
+            let Ok(pubkey) = Pubkey::try_from(pubkey.as_slice()) else {
+                continue;
+            };
+            mint_data.insert(pubkey, row.get("data"));
+        }
+        Some(mint_data)
+    } else {
+        None
+    };
+
     let encode_start_time = Instant::now();
 
     // Will measure the total time taken for `encode_ui_account()`
@@ -395,6 +442,7 @@ pub async fn get_token_accounts_by_owner_or_delegate(
                 encoding,
                 data_slice,
                 &filter_mint_data,
+                mint_data_by_pubkey.as_ref(),
                 block_time,
                 &mut response_bytes,
             )?;
@@ -576,6 +624,7 @@ fn proces_token_row(
     encoding: UiAccountEncoding,
     data_slice: Option<UiDataSliceConfig>,
     filter_mint_data: &Option<Vec<u8>>,
+    mint_data_by_pubkey: Option<&HashMap<Pubkey, Vec<u8>>>,
     block_time: i64,
     response_bytes: &mut u64,
 ) -> Result<RpcKeyedAccount, RpcError> {
@@ -609,7 +658,11 @@ fn proces_token_row(
         // decimals for WSOL.
         parse_additional_mint_data(
             &mint_pubkey,
-            row_mint_data.as_deref().unwrap_or(&[]),
+            mint_data_by_pubkey
+                .and_then(|mint_data| mint_data.get(&mint_pubkey))
+                .map(Vec::as_slice)
+                .or(row_mint_data.as_deref())
+                .unwrap_or(&[]),
             block_time,
         )
     };
@@ -685,6 +738,8 @@ mod tests {
         assert!(sql.contains("accounts.slot <= $1"));
         assert!(!sql.contains("accounts.owner = $"));
         assert!(sql.contains("ORDER BY program_accounts.pubkey, program_accounts.slot DESC"));
+        assert!(!sql.contains("LEFT JOIN LATERAL"));
+        assert!(!sql.contains("needed_mints"));
         assert!(!sql.contains("max_slot AS"));
         assert!(!sql.contains("{accounts_filters}"));
         assert!(!sql.contains("{snapshot_filters}"));
