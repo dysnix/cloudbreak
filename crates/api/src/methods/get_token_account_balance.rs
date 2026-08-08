@@ -3,8 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use sea_orm::sqlx::Row;
-use sea_orm::sqlx::{self};
+use sea_orm::sqlx::{self, Row};
 use solana_account_decoder::parse_token::token_amount_to_ui_amount_v3;
 use solana_account_decoder_client_types::token::UiTokenAmount;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
@@ -15,9 +14,10 @@ use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
+use crate::methods::get_multiple_accounts::fetch_accounts_without_mint;
 use crate::methods::token::parse_additional_mint_data;
 use crate::methods::{is_token_program, resolve_commitment};
-use crate::{db_query, metrics};
+use crate::metrics;
 
 #[tracing::instrument(name = "get_token_account_balance_rpc", skip_all, fields(pubkey = %pubkey))]
 pub async fn get_token_account_balance(
@@ -40,18 +40,38 @@ pub async fn get_token_account_balance(
 
     let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 
-    let sql_template = include_str!("../db/getTokenAccountBalance.sql");
-    let pubkey_hex = format!("'\\x{}'::bytea", hex::encode(pubkey.as_ref()));
-    let sql = sql_template.replace("$1", &pubkey_hex);
-    let sql = sql.replace("$2", &latest_slot.to_string());
-    let sql = db_query::add_trace_traceparent_to_query(&sql);
-
-    tracing::debug!(target: "get_token_account_balance_sql", "## sql: {}", sql);
-
-    let pool = state.database.get_postgres_connection_pool();
-    let rows = timeout(state.queries_timeout, async {
+    let pubkey_bytes = vec![pubkey.to_bytes().to_vec()];
+    let (rows, mint_rows) = timeout(state.queries_timeout, async {
         let span = tracing::info_span!("get_token_account_balance_db");
-        sqlx::raw_sql(&sql).fetch_all(pool).instrument(span).await
+        async {
+            let rows =
+                fetch_accounts_without_mint(state, &pubkey_bytes, latest_slot, commitment).await?;
+            let mint_pubkey = rows.first().and_then(|row| {
+                let present = row.try_get::<bool, _>("present").unwrap_or(true);
+                let lamports = row.get::<i64, _>("lamports");
+                let owner_bytes: Vec<u8> = row.get("owner");
+                let owner = Pubkey::try_from(owner_bytes.as_slice()).ok()?;
+                let data: Vec<u8> = row.get("data");
+                (present && lamports > 0 && is_token_program(&owner) && data.len() >= 32)
+                    .then(|| Pubkey::try_from(&data[..32]).ok())
+                    .flatten()
+            });
+            let mint_rows = match mint_pubkey {
+                Some(mint_pubkey) if mint_pubkey != spl_token_interface::native_mint::id() => {
+                    fetch_accounts_without_mint(
+                        state,
+                        &[mint_pubkey.to_bytes().to_vec()],
+                        latest_slot,
+                        commitment,
+                    )
+                    .await?
+                }
+                _ => Vec::new(),
+            };
+            Ok::<_, sqlx::Error>((rows, mint_rows))
+        }
+        .instrument(span)
+        .await
     })
     .await
     .map_err(|_elapsed| {
@@ -70,6 +90,13 @@ pub async fn get_token_account_balance(
         });
     };
 
+    let present = row.try_get::<bool, _>("present").unwrap_or(true);
+    if !present || row.get::<i64, _>("lamports") <= 0 {
+        return Err(RpcError::AccountNotFound {
+            pubkey: pubkey.to_string(),
+        });
+    }
+
     let owner_bytes: Vec<u8> = row.get("owner");
     let owner = Pubkey::try_from(owner_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
 
@@ -86,36 +113,30 @@ pub async fn get_token_account_balance(
         });
     }
 
-    // Amount: u64 LE at bytes 64..72 of the token account data. The SQL guarantees
-    // exactly 8 bytes for token-owned accounts (and 8 zero bytes for anything else,
-    // which we've already rejected above).
-    let amount_bytes: Vec<u8> = row.get("amount");
-    let amount_array: [u8; 8] = amount_bytes.as_slice().try_into().map_err(|_| {
+    let data: Vec<u8> = row.get("data");
+    let (mint_pubkey, amount) = parse_token_account_fields(&data).ok_or_else(|| {
         tracing::error!(
-            "getTokenAccountBalance: unexpected amount length {} for pubkey {}",
-            amount_bytes.len(),
+            "getTokenAccountBalance: token account data is only {} bytes for pubkey {}",
+            data.len(),
             pubkey
         );
         RpcError::InternalError
     })?;
-    let amount = u64::from_le_bytes(amount_array);
-
-    // Mint pubkey from the generated token_mint column (bytes 0..32 of data).
-    let mint_pubkey_bytes: Vec<u8> = row.try_get("token_mint").map_err(|e| {
-        tracing::error!(
-            "getTokenAccountBalance: missing token_mint for pubkey {}: {}",
-            pubkey,
-            e
-        );
-        RpcError::InternalError
-    })?;
-    let mint_pubkey =
-        Pubkey::try_from(mint_pubkey_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
 
     // Pass mint_data (or empty) unconditionally so the WSOL native_mint short-circuit
     // can hardcode decimals=9 even when the mint account itself isn't in our DB —
     // same trick we use in gAI / gTABO.
-    let mint_data: Vec<u8> = row.try_get("mint_data").ok().unwrap_or_default();
+    let mint_data = mint_rows
+        .first()
+        .filter(|row| {
+            let present = row.try_get::<bool, _>("present").unwrap_or(true);
+            let lamports = row.get::<i64, _>("lamports");
+            let owner_bytes: Vec<u8> = row.get("owner");
+            let owner = Pubkey::try_from(owner_bytes.as_slice()).ok();
+            present && lamports > 0 && owner.as_ref().is_some_and(is_token_program)
+        })
+        .map(|row| row.get::<Vec<u8>, _>("data"))
+        .unwrap_or_default();
     let additional_mint_data = parse_additional_mint_data(&mint_pubkey, &mint_data, block_time);
 
     let additional_data = additional_mint_data
@@ -134,4 +155,27 @@ pub async fn get_token_account_balance(
         },
         value: ui_token_amount,
     })
+}
+
+fn parse_token_account_fields(data: &[u8]) -> Option<(Pubkey, u64)> {
+    let mint = Pubkey::try_from(data.get(..32)?).ok()?;
+    let amount = u64::from_le_bytes(data.get(64..72)?.try_into().ok()?);
+    Some((mint, amount))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_token_account_fields;
+
+    #[test]
+    fn token_account_fields_require_mint_and_amount_bytes() {
+        let mut data = vec![0_u8; 72];
+        data[..32].copy_from_slice(&[7_u8; 32]);
+        data[64..72].copy_from_slice(&42_u64.to_le_bytes());
+
+        let (mint, amount) = parse_token_account_fields(&data).expect("valid token account");
+        assert_eq!(mint.to_bytes(), [7_u8; 32]);
+        assert_eq!(amount, 42);
+        assert_eq!(parse_token_account_fields(&data[..71]), None);
+    }
 }

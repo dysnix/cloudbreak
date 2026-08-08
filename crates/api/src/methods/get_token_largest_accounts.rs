@@ -16,9 +16,10 @@ use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
+use crate::methods::get_multiple_accounts::fetch_accounts_without_mint;
 use crate::methods::token::parse_additional_mint_data;
 use crate::methods::{is_token_program, resolve_commitment};
-use crate::{db_query, metrics};
+use crate::metrics;
 
 #[tracing::instrument(name = "get_token_largest_accounts_rpc", skip_all, fields(pubkey = %mint))]
 pub async fn get_token_largest_accounts(
@@ -41,19 +42,10 @@ pub async fn get_token_largest_accounts(
 
     let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 
-    let mint_sql = include_str!("../db/getAccountInfo.sql");
-    let mint_hex = format!("'\\x{}'::bytea", hex::encode(pubkey.as_ref()));
-    let mint_sql = mint_sql.replace("$1", &mint_hex);
-    let mint_sql = mint_sql.replace("$2", &latest_slot.to_string());
-    let mint_sql = db_query::add_trace_traceparent_to_query(&mint_sql);
-
-    tracing::debug!(target: "get_token_mint_sql", "## sql: {}", mint_sql);
-
-    let pool = state.database.get_postgres_connection_pool();
+    let mint_pubkey_bytes = vec![pubkey.to_bytes().to_vec()];
     let mint_rows = timeout(state.queries_timeout, async {
         let span = tracing::info_span!("get_token_mint_db");
-        sqlx::raw_sql(&mint_sql)
-            .fetch_all(pool)
+        fetch_accounts_without_mint(state, &mint_pubkey_bytes, latest_slot, commitment)
             .instrument(span)
             .await
     })
@@ -72,6 +64,12 @@ pub async fn get_token_largest_accounts(
             pubkey: pubkey.to_string(),
         });
     };
+    let present = mint_row.try_get::<bool, _>("present").unwrap_or(true);
+    if !present || mint_row.get::<i64, _>("lamports") <= 0 {
+        return Err(RpcError::AccountNotFound {
+            pubkey: pubkey.to_string(),
+        });
+    }
     let owner_bytes: Vec<u8> = mint_row.get("owner");
     let owner = Pubkey::try_from(owner_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
     if !state.indexer_filter.is_program_selected(&owner) {
@@ -95,15 +93,18 @@ pub async fn get_token_largest_accounts(
         })?;
 
     let sql_template = include_str!("../db/getTokenLargestAccounts.sql");
-    let sql = sql_template.replace("$1", &mint_hex);
-    let sql = sql.replace("$2", &latest_slot.to_string());
-    let sql = db_query::add_trace_traceparent_to_query(&sql);
+    tracing::debug!(target: "get_token_largest_accounts_sql", "## sql: {}", sql_template);
 
-    tracing::debug!(target: "get_token_largest_accounts_sql", "## sql: {}", sql);
-
+    let pool = state.database.get_postgres_connection_pool();
+    let db_slot = i64::try_from(latest_slot).map_err(|_| RpcError::InternalError)?;
     let holder_rows = timeout(state.queries_timeout, async {
         let span = tracing::info_span!("get_token_largest_accounts_db");
-        sqlx::raw_sql(&sql).fetch_all(pool).instrument(span).await
+        sqlx::query(sql_template)
+            .bind(pubkey.to_bytes().to_vec())
+            .bind(db_slot)
+            .fetch_all(pool)
+            .instrument(span)
+            .await
     })
     .await
     .map_err(|_elapsed| {

@@ -4,7 +4,6 @@
  */
 
 use sea_orm::sqlx::Row;
-use sea_orm::sqlx::{self};
 use solana_commitment_config::CommitmentLevel;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcContextConfig;
@@ -14,8 +13,9 @@ use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
+use crate::methods::get_multiple_accounts::fetch_accounts_without_mint;
 use crate::methods::resolve_commitment;
-use crate::{db_query, metrics};
+use crate::metrics;
 
 #[tracing::instrument(name = "get_balance_rpc", skip_all, fields(pubkey = %pubkey))]
 pub async fn get_balance(
@@ -39,18 +39,22 @@ pub async fn get_balance(
         .transpose()?
         .unwrap_or(CommitmentLevel::Finalized);
 
-    let sql_template = include_str!("../db/getBalance.sql");
-    let pubkey_hex = format!("'\\x{}'::bytea", hex::encode(pubkey.as_ref()));
-    let sql = sql_template.replace("$1", &pubkey_hex);
-    let sql = sql.replace("$2", &(commitment as i32).to_string());
-    let sql = db_query::add_trace_traceparent_to_query(&sql);
+    let (context_slot, _) = state.latest_slot_and_block_time(commitment).await?;
 
-    tracing::debug!(target: "get_balance_sql", "## sql: {}", sql);
+    if let Some(min_context_slot) = config.min_context_slot
+        && context_slot < min_context_slot
+    {
+        return Err(RpcError::RpcSlotBehindMinContextSlot {
+            rpc_slot: context_slot,
+        });
+    }
 
-    let pool = state.database.get_postgres_connection_pool();
+    let pubkey_bytes = vec![pubkey.to_bytes().to_vec()];
     let rows = timeout(state.queries_timeout, async {
         let span = tracing::info_span!("get_balance_db");
-        sqlx::raw_sql(&sql).fetch_all(pool).instrument(span).await
+        fetch_accounts_without_mint(state, &pubkey_bytes, context_slot, commitment)
+            .instrument(span)
+            .await
     })
     .await
     .map_err(|_elapsed| {
@@ -62,30 +66,7 @@ pub async fn get_balance(
         RpcError::InternalError
     })?;
 
-    let row = rows.first().ok_or_else(|| {
-        tracing::error!(
-            "getBalance: slots table missing entry for commitment {:?}",
-            commitment
-        );
-        RpcError::InternalError
-    })?;
-
-    let context_slot = row.get::<i64, _>("context_slot") as u64;
-
-    if let Some(min_context_slot) = config.min_context_slot
-        && context_slot < min_context_slot
-    {
-        return Err(RpcError::RpcSlotBehindMinContextSlot {
-            rpc_slot: context_slot,
-        });
-    }
-
-    // `owner` and `lamports` are nullable when the LEFT JOIN finds no
-    // matching account row (account not found or closed at all relevant slots).
-    let owner_bytes: Option<Vec<u8>> = row.try_get("owner").ok();
-    let lamports: Option<i64> = row.try_get("lamports").ok();
-
-    let (Some(owner_bytes), Some(lamports)) = (owner_bytes, lamports) else {
+    let Some(row) = rows.first() else {
         return Ok(RpcResponse {
             context: RpcResponseContext {
                 slot: context_slot,
@@ -94,6 +75,20 @@ pub async fn get_balance(
             value: 0,
         });
     };
+
+    let present = row.try_get::<bool, _>("present").unwrap_or(true);
+    let lamports = row.get::<i64, _>("lamports");
+    if !present || lamports <= 0 {
+        return Ok(RpcResponse {
+            context: RpcResponseContext {
+                slot: context_slot,
+                api_version: None,
+            },
+            value: 0,
+        });
+    }
+
+    let owner_bytes: Vec<u8> = row.get("owner");
 
     let owner = Pubkey::try_from(owner_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
 

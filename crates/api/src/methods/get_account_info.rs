@@ -21,6 +21,7 @@ use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
+use crate::methods::get_multiple_accounts::fetch_accounts_without_mint;
 use crate::methods::token::{check_account_data_len_for_encoding, parse_additional_mint_data};
 use crate::methods::{is_token_program, resolve_commitment};
 use crate::{db_query, metrics};
@@ -61,24 +62,33 @@ pub async fn get_account_info(
     let data_slice = config.data_slice;
     let with_mint = encoding == UiAccountEncoding::JsonParsed;
 
-    // Pick which SQL to run depending on whether jsonParsed needs the mint JOIN.
-    let sql_template = if with_mint {
-        include_str!("../db/getAccountInfoWithMintData.sql")
-    } else {
-        include_str!("../db/getAccountInfo.sql")
-    };
+    // jsonParsed needs the mint JOIN. All raw encodings can share the maintained
+    // point-lookup table with getMultipleAccounts and getBalance.
+    let sql = with_mint.then(|| {
+        let sql_template = include_str!("../db/getAccountInfoWithMintData.sql");
+        let pubkey_hex = format!("'\\x{}'::bytea", hex::encode(pubkey.as_ref()));
+        let sql = sql_template.replace("$1", &pubkey_hex);
+        let sql = sql.replace("$2", &latest_slot.to_string());
+        db_query::add_trace_traceparent_to_query(&sql)
+    });
 
-    let pubkey_hex = format!("'\\x{}'::bytea", hex::encode(pubkey.as_ref()));
-    let sql = sql_template.replace("$1", &pubkey_hex);
-    let sql = sql.replace("$2", &latest_slot.to_string());
-    let sql = db_query::add_trace_traceparent_to_query(&sql);
-
-    tracing::debug!(target: "gai_sql", "## sql: {}", sql);
+    if let Some(sql) = &sql {
+        tracing::debug!(target: "gai_sql", "## sql: {}", sql);
+    }
 
     let pool = state.database.get_postgres_connection_pool();
+    let pubkey_bytes = vec![pubkey.to_bytes().to_vec()];
     let rows = timeout(state.queries_timeout, async {
         let span = tracing::info_span!("gai_db");
-        sqlx::raw_sql(&sql).fetch_all(pool).instrument(span).await
+        async {
+            if let Some(sql) = &sql {
+                sqlx::raw_sql(sql).fetch_all(pool).await
+            } else {
+                fetch_accounts_without_mint(state, &pubkey_bytes, latest_slot, commitment).await
+            }
+        }
+        .instrument(span)
+        .await
     })
     .await
     .map_err(|_elapsed| {
@@ -100,6 +110,16 @@ pub async fn get_account_info(
             value: None,
         });
     };
+
+    if !row.try_get::<bool, _>("present").unwrap_or(true) || row.get::<i64, _>("lamports") <= 0 {
+        return Ok(RpcResponse {
+            context: RpcResponseContext {
+                slot: latest_slot,
+                api_version: None,
+            },
+            value: None,
+        });
+    }
 
     let owner_bytes: Vec<u8> = row.get("owner");
     let owner = Pubkey::try_from(owner_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
