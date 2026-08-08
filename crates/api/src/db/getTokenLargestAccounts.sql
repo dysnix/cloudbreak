@@ -14,6 +14,10 @@ WITH all_versions AS (
     FROM accounts
     WHERE
         accounts.token_mint = $1
+        -- Repeat the partial-index predicate here so PostgreSQL can prune to
+        -- the two token partitions and use their token_mint indexes.
+        AND (accounts.owner = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea      -- Tokenkeg  -- noqa: LT05
+             OR accounts.owner = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea)  -- Token-2022  -- noqa: LT05
         AND accounts.slot <= $2
     UNION ALL
     SELECT
@@ -26,6 +30,8 @@ WITH all_versions AS (
     FROM snapshot_accounts
     WHERE
         snapshot_accounts.token_mint = $1
+        AND (snapshot_accounts.owner = '\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea      -- Tokenkeg  -- noqa: LT05
+             OR snapshot_accounts.owner = '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea)  -- Token-2022  -- noqa: LT05
         AND snapshot_accounts.slot <= $2
 ),
 

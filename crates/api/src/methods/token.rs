@@ -618,3 +618,18 @@ pub fn check_account_data_len_for_encoding(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn json_parsed_owner_query_fetches_each_latest_mint_once() {
+        let sql = include_str!("../db/getTokenAccountsByOwner.sql");
+
+        assert!(sql.contains("LEFT JOIN LATERAL"));
+        assert!(sql.contains("accounts.pubkey = needed_mints.token_mint"));
+        assert!(sql.contains("snapshot_accounts.pubkey = needed_mints.token_mint"));
+        assert!(sql.contains("ORDER BY mint_versions.slot DESC"));
+        assert!(!sql.contains("all_mint_versions AS"));
+        assert!(!sql.contains("mint_max_slot AS"));
+    }
+}

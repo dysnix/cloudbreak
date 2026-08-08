@@ -143,3 +143,23 @@ pub async fn get_token_largest_accounts(
         value,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn holder_query_exposes_token_owner_predicate_to_partition_planner() {
+        let sql = include_str!("../db/getTokenLargestAccounts.sql");
+        let ingestion_query = sql
+            .split("latest_per_pubkey AS")
+            .next()
+            .expect("all_versions CTE");
+
+        assert_eq!(ingestion_query.matches("AND (accounts.owner =").count(), 1);
+        assert_eq!(
+            ingestion_query
+                .matches("AND (snapshot_accounts.owner =")
+                .count(),
+            1
+        );
+    }
+}

@@ -77,50 +77,39 @@ needed_mints AS (
     WHERE token_mint IS NOT NULL
 ),
 
--- Gather all mint account versions from both tables
-all_mint_versions AS NOT MATERIALIZED (
-    SELECT
-        accounts.pubkey,
-        accounts.data,
-        accounts.slot
-    FROM accounts
-    INNER JOIN needed_mints ON accounts.pubkey = needed_mints.token_mint
-    WHERE
-        accounts.owner = $1
-        AND accounts.slot <= $2
-    UNION ALL
-    SELECT
-        snapshot_accounts.pubkey,
-        snapshot_accounts.data,
-        snapshot_accounts.slot
-    FROM snapshot_accounts
-    INNER JOIN
-        needed_mints
-        ON snapshot_accounts.pubkey = needed_mints.token_mint
-    WHERE
-        snapshot_accounts.owner = $1
-        AND snapshot_accounts.slot <= $2
-),
-
--- Get latest slot per mint
-mint_max_slot AS NOT MATERIALIZED (
-    SELECT
-        pubkey,
-        MAX(slot) AS slot
-    FROM all_mint_versions
-    GROUP BY pubkey
-),
-
--- Deduplicated mints
+-- Fetch each needed mint once. The former all_mint_versions CTE was consumed
+-- twice (to find MAX(slot), then to fetch the row), which made PostgreSQL
+-- vastly overestimate this part of the query and enable expensive JIT
+-- compilation even for owners with only a few token accounts.
 mints AS NOT MATERIALIZED (
-    SELECT DISTINCT ON (all_mint_versions.pubkey)
-        all_mint_versions.pubkey,
-        all_mint_versions.data AS mint_data
-    FROM all_mint_versions
-    INNER JOIN mint_max_slot
-        ON
-            all_mint_versions.pubkey = mint_max_slot.pubkey
-            AND all_mint_versions.slot = mint_max_slot.slot
+    SELECT
+        needed_mints.token_mint AS pubkey,
+        latest_mint.mint_data
+    FROM needed_mints
+    LEFT JOIN LATERAL (
+        SELECT mint_versions.data AS mint_data
+        FROM (
+            SELECT
+                accounts.data,
+                accounts.slot
+            FROM accounts
+            WHERE
+                accounts.owner = $1
+                AND accounts.pubkey = needed_mints.token_mint
+                AND accounts.slot <= $2
+            UNION ALL
+            SELECT
+                snapshot_accounts.data,
+                snapshot_accounts.slot
+            FROM snapshot_accounts
+            WHERE
+                snapshot_accounts.owner = $1
+                AND snapshot_accounts.pubkey = needed_mints.token_mint
+                AND snapshot_accounts.slot <= $2
+        ) AS mint_versions
+        ORDER BY mint_versions.slot DESC
+        LIMIT 1
+    ) AS latest_mint ON TRUE
 )
 
 SELECT
