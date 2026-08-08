@@ -4,10 +4,13 @@
  */
 
 use crate::error::RpcError;
+use crate::http::CloudbreakRpcState;
+use crate::methods::get_multiple_accounts::fetch_accounts_without_mint;
 use crate::methods::is_token_program;
+use cloudbreak_core::modules::rpc_filter_type::{RpcFilterType, RpcProgramAccountsConfig};
 use sea_orm::sqlx::Row;
 use sea_orm::{DatabaseConnection, sqlx};
-use cloudbreak_core::modules::rpc_filter_type::{RpcFilterType, RpcProgramAccountsConfig};
+use solana_commitment_config::CommitmentLevel;
 use solana_pubkey::Pubkey;
 use std::time::Duration;
 use tokio::time::{Instant, timeout};
@@ -64,17 +67,14 @@ pub async fn get_mint(
     queries_timeout: Duration,
 ) -> Option<Vec<u8>> {
     let start_time = Instant::now();
-    let mint_hex = format!("'\\x{}'::bytea", hex::encode(&mint));
-    let token_program_hex = format!("'\\x{}'::bytea", hex::encode(token_program.to_bytes()));
-
     let pool = db.get_postgres_connection_pool();
-
-    let sql = include_str!("../db/getMintDataWithProgram.sql").replace("$1", &mint_hex);
-    let sql = sql.replace("$2", slot.to_string().as_str());
-    let sql = sql.replace("$3", &token_program_hex);
+    let db_slot = i64::try_from(slot).ok()?;
 
     let rows = timeout(queries_timeout, async {
-        sqlx::raw_sql(&sql)
+        sqlx::query(include_str!("../db/getMintDataWithProgram.sql"))
+            .bind(mint)
+            .bind(db_slot)
+            .bind(token_program.to_bytes().to_vec())
             .fetch_all(pool)
             .await
             .map_err(|e| {
@@ -101,4 +101,43 @@ pub async fn get_mint(
     );
 
     Some(mint_data)
+}
+
+/// Fetch a live token mint from only the two token-program partitions. If the
+/// account is not there, use the generic maintained lookup so callers preserve
+/// the distinction between a missing account and a non-token account.
+pub async fn fetch_token_mint_account(
+    state: &CloudbreakRpcState,
+    mint: &Pubkey,
+    slot: u64,
+    commitment: CommitmentLevel,
+) -> Result<Vec<sqlx::postgres::PgRow>, sqlx::Error> {
+    let db_slot = i64::try_from(slot).map_err(|error| {
+        sqlx::Error::Protocol(format!("slot does not fit in PostgreSQL bigint: {error}"))
+    })?;
+    let mint_bytes = mint.to_bytes().to_vec();
+    let rows = sqlx::query(include_str!("../db/getTokenMintAccount.sql"))
+        .bind(&mint_bytes)
+        .bind(db_slot)
+        .fetch_all(state.database.get_postgres_connection_pool())
+        .await?;
+
+    if rows.is_empty() {
+        fetch_accounts_without_mint(state, &[mint_bytes], slot, commitment).await
+    } else {
+        Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn token_mint_lookup_exposes_owner_predicates_to_partition_planner() {
+        let sql = include_str!("../db/getTokenMintAccount.sql");
+
+        assert_eq!(sql.matches("(accounts.owner =").count(), 1);
+        assert_eq!(sql.matches("(snapshot_accounts.owner =").count(), 1);
+        assert!(sql.contains("accounts.pubkey = $1"));
+        assert!(sql.contains("snapshot_accounts.pubkey = $1"));
+    }
 }

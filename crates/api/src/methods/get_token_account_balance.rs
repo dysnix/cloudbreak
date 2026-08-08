@@ -15,6 +15,7 @@ use tracing::Instrument;
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
 use crate::methods::get_multiple_accounts::fetch_accounts_without_mint;
+use crate::methods::mint::fetch_token_mint_account;
 use crate::methods::token::parse_additional_mint_data;
 use crate::methods::{is_token_program, resolve_commitment};
 use crate::metrics;
@@ -58,13 +59,7 @@ pub async fn get_token_account_balance(
             });
             let mint_rows = match mint_pubkey {
                 Some(mint_pubkey) if mint_pubkey != spl_token_interface::native_mint::id() => {
-                    fetch_accounts_without_mint(
-                        state,
-                        &[mint_pubkey.to_bytes().to_vec()],
-                        latest_slot,
-                        commitment,
-                    )
-                    .await?
+                    fetch_token_mint_account(state, &mint_pubkey, latest_slot, commitment).await?
                 }
                 _ => Vec::new(),
             };

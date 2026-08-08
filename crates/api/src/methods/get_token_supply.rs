@@ -16,7 +16,7 @@ use tracing::Instrument;
 
 use crate::error::RpcError;
 use crate::http::CloudbreakRpcState;
-use crate::methods::get_multiple_accounts::fetch_accounts_without_mint;
+use crate::methods::mint::fetch_token_mint_account;
 use crate::methods::token::parse_additional_mint_data;
 use crate::methods::{is_token_program, resolve_commitment};
 use crate::metrics;
@@ -42,10 +42,9 @@ pub async fn get_token_supply(
 
     let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 
-    let pubkey_bytes = vec![pubkey.to_bytes().to_vec()];
     let rows = timeout(state.queries_timeout, async {
         let span = tracing::info_span!("get_token_supply_db");
-        fetch_accounts_without_mint(state, &pubkey_bytes, latest_slot, commitment)
+        fetch_token_mint_account(state, &pubkey, latest_slot, commitment)
             .instrument(span)
             .await
     })
