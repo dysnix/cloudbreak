@@ -3,11 +3,11 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use cloudbreak_core::{ApiConfig, EnvironmentInfo, TryLoadConfig};
 use futures::future;
 use sea_orm::{ConnectOptions, Database};
 use std::sync::Arc;
 use std::time::Duration;
-use cloudbreak_core::{ApiConfig, EnvironmentInfo, TryLoadConfig};
 
 use crate::{
     http::CloudbreakRpcState,
@@ -139,6 +139,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         stakes_cache,
         max_multiple_accounts,
         simulation_supported,
+        config.server.account_lookup_fill_max_concurrency.get(),
     );
 
     info!("Server is starting...");

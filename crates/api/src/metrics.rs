@@ -124,6 +124,16 @@ lazy_static::lazy_static! {
         &["commitment", "result"],
     ).unwrap();
 
+    /// Outcomes for response-independent point-lookup cache fills. Saturated
+    /// work is deliberately skipped and retried by a later cache miss.
+    pub static ref CLOUDBREAK_ACCOUNT_LOOKUP_FILLS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "cloudbreak_account_lookup_fills_total",
+            "Background account lookup cache fills, labelled by outcome"
+        ),
+        &["status"],
+    ).unwrap();
+
     /// Current size of the GPA cache in bytes.
     pub static ref CLOUDBREAK_GPA_CACHE_SIZE_BYTES: IntGauge = IntGauge::new(
         "cloudbreak_gpa_cache_size_bytes",
@@ -237,6 +247,7 @@ pub fn setup_metrics(config: &ApiConfig) -> anyhow::Result<()> {
         register!(CLOUDBREAK_API_BATCH_REQUESTS);
         register!(CLOUDBREAK_API_DB_POOL_CONNECTIONS);
         register!(CLOUDBREAK_ACCOUNT_LOOKUP_KEYS_TOTAL);
+        register!(CLOUDBREAK_ACCOUNT_LOOKUP_FILLS_TOTAL);
         register!(CLOUDBREAK_GPA_CACHE_SIZE_BYTES);
         register!(CLOUDBREAK_GPA_CACHE_MAX_BYTES);
         register!(CLOUDBREAK_GPA_CACHE_EVICTIONS_TOTAL);

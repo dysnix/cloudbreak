@@ -42,21 +42,52 @@ pub async fn get_token_largest_accounts(
 
     let (latest_slot, block_time) = state.latest_slot_and_block_time(commitment).await?;
 
-    let mint_rows = timeout(state.queries_timeout, async {
-        let span = tracing::info_span!("get_token_mint_db");
-        fetch_token_mint_account(state, &pubkey, latest_slot, commitment)
-            .instrument(span)
-            .await
-    })
-    .await
-    .map_err(|_elapsed| {
-        tracing::error!("getTokenLargestAccounts mint lookup timed out");
-        RpcError::InternalError
-    })?
-    .map_err(|e| {
-        tracing::error!("Database query error: {}", e);
-        RpcError::InternalError
-    })?;
+    let sql_template = include_str!("../db/getTokenLargestAccounts.sql");
+    tracing::debug!(target: "get_token_largest_accounts_sql", "## sql: {}", sql_template);
+    let pool = state.database.get_postgres_connection_pool();
+    let db_slot = i64::try_from(latest_slot).map_err(|_| RpcError::InternalError)?;
+
+    // Neither query depends on the other's result. Running them together
+    // removes one sequential database round trip from the common valid-mint
+    // path while preserving the same validation and error behavior below.
+    let mint_lookup = async {
+        timeout(state.queries_timeout, async {
+            let span = tracing::info_span!("get_token_mint_db");
+            fetch_token_mint_account(state, &pubkey, latest_slot, commitment)
+                .instrument(span)
+                .await
+        })
+        .await
+        .map_err(|_elapsed| {
+            tracing::error!("getTokenLargestAccounts mint lookup timed out");
+            RpcError::InternalError
+        })?
+        .map_err(|e| {
+            tracing::error!("Database query error: {}", e);
+            RpcError::InternalError
+        })
+    };
+    let holder_lookup = async {
+        timeout(state.queries_timeout, async {
+            let span = tracing::info_span!("get_token_largest_accounts_db");
+            sqlx::query(sql_template)
+                .bind(pubkey.to_bytes().to_vec())
+                .bind(db_slot)
+                .fetch_all(pool)
+                .instrument(span)
+                .await
+        })
+        .await
+        .map_err(|_elapsed| {
+            tracing::error!("getTokenLargestAccounts holder query timed out");
+            RpcError::InternalError
+        })?
+        .map_err(|e| {
+            tracing::error!("Database query error: {}", e);
+            RpcError::InternalError
+        })
+    };
+    let (mint_rows, holder_rows) = tokio::try_join!(mint_lookup, holder_lookup)?;
 
     let Some(mint_row) = mint_rows.first() else {
         return Err(RpcError::AccountNotFound {
@@ -90,30 +121,6 @@ pub async fn get_token_largest_accounts(
         .ok_or_else(|| RpcError::MintDataNotFound {
             mint: pubkey.to_string(),
         })?;
-
-    let sql_template = include_str!("../db/getTokenLargestAccounts.sql");
-    tracing::debug!(target: "get_token_largest_accounts_sql", "## sql: {}", sql_template);
-
-    let pool = state.database.get_postgres_connection_pool();
-    let db_slot = i64::try_from(latest_slot).map_err(|_| RpcError::InternalError)?;
-    let holder_rows = timeout(state.queries_timeout, async {
-        let span = tracing::info_span!("get_token_largest_accounts_db");
-        sqlx::query(sql_template)
-            .bind(pubkey.to_bytes().to_vec())
-            .bind(db_slot)
-            .fetch_all(pool)
-            .instrument(span)
-            .await
-    })
-    .await
-    .map_err(|_elapsed| {
-        tracing::error!("getTokenLargestAccounts holder query timed out");
-        RpcError::InternalError
-    })?
-    .map_err(|e| {
-        tracing::error!("Database query error: {}", e);
-        RpcError::InternalError
-    })?;
 
     let mut value = Vec::with_capacity(holder_rows.len());
     for row in &holder_rows {

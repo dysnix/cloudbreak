@@ -12,12 +12,13 @@ use crate::{db_query, metrics};
 
 use futures::StreamExt;
 use rust_decimal::prelude::ToPrimitive;
+use sea_orm::DatabaseConnection;
 use sea_orm::sqlx::postgres::PgRow;
 use sea_orm::sqlx::{self, Row};
-use sea_orm::DatabaseConnection;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};
 
+use cloudbreak_core::modules::rpc_filter_type::{RpcFilterType, RpcProgramAccountsConfig};
 use solana_account::AccountSharedData;
 use solana_account_decoder::parse_account_data::{
     AccountAdditionalDataV3, SplTokenAdditionalDataV2,
@@ -27,7 +28,6 @@ use solana_account_decoder::{
 };
 use solana_commitment_config::CommitmentLevel;
 use solana_pubkey::Pubkey;
-use cloudbreak_core::modules::rpc_filter_type::{RpcFilterType, RpcProgramAccountsConfig};
 use solana_rpc_client_api::config::RpcAccountInfoConfig;
 use solana_rpc_client_api::response::{
     Response as RpcResponse, RpcKeyedAccount, RpcResponseContext,
@@ -46,6 +46,24 @@ use tracing::Instrument;
 pub enum TokenQueryType {
     GetTokenAccountsByOwner,
     GetTokenAccountsByDelegate,
+}
+
+fn prepared_gtabo_sql(program_bytes: &[u8]) -> String {
+    // Keep the token program literal so PostgreSQL can prove the partial-index
+    // predicate even if it later chooses a generic prepared plan. There are
+    // only two valid program IDs, so this still produces only two stable query
+    // texts. Slot and wallet remain bind parameters.
+    include_str!("../db/getTokenAccountsByOwner.sql")
+        .replace("$1", &format!("'\\x{}'::bytea", hex::encode(program_bytes)))
+        .replace("$2", "$1")
+        .replace(
+            "-- {accounts_filters}",
+            "AND accounts.token_owner = $2::bytea",
+        )
+        .replace(
+            "-- {snapshot_filters}",
+            "AND snapshot_accounts.token_owner = $2::bytea",
+        )
 }
 
 impl TokenQueryType {
@@ -189,6 +207,16 @@ pub async fn get_token_accounts_by_owner_or_delegate(
         .parse::<solana_pubkey::Pubkey>()
         .map_err(|_| RpcError::InvalidParams)?;
 
+    // The dominant direct gTABO shape has a stable query structure. Keep its
+    // values as bind parameters so SQLx can reuse the prepared statement on
+    // each pool connection. Delegate, mint-filter, and gPA-derived requests
+    // retain the flexible dynamic-filter path below.
+    let use_prepared_gtabo = matches!(query_type, TokenQueryType::GetTokenAccountsByOwner)
+        && matches!(&filter, TokenAccountsFilter::ProgramId(_))
+        && additional_filters.is_none()
+        && config.as_ref().and_then(|config| config.encoding)
+            == Some(UiAccountEncoding::JsonParsed);
+
     let commitment = config
         .as_ref()
         .and_then(|config| config.commitment)
@@ -240,7 +268,7 @@ pub async fn get_token_accounts_by_owner_or_delegate(
     }
 
     // Load sql and add dynamic filters to it
-    let sql = if let Some(encoding) = config.as_ref().map(|config| config.encoding) {
+    let sql_template = if let Some(encoding) = config.as_ref().map(|config| config.encoding) {
         // If we already have the mint data, we don't need to join any additional mint data
         if encoding == Some(UiAccountEncoding::JsonParsed) && filter_mint_data.is_none() {
             include_str!("../db/getTokenAccountsByOwner.sql")
@@ -251,22 +279,34 @@ pub async fn get_token_accounts_by_owner_or_delegate(
         include_str!("../db/getProgramAccounts.sql")
     };
 
-    let sql = sql.replace("-- {accounts_filters}", &accounts_filters);
-    let sql = sql.replace("-- {snapshot_filters}", &snapshot_filters);
-    let sql = sql.replace("$2", latest_slot.to_string().as_str());
-
     let program_bytes = program.as_ref().to_vec();
-    let sql = sql.replace(
-        "$1",
-        &format!("'\\x{}'::bytea", hex::encode(&program_bytes)),
-    );
-
-    let sql = db_query::add_trace_traceparent_to_query(&sql);
+    let sql = if use_prepared_gtabo {
+        prepared_gtabo_sql(&program_bytes)
+    } else {
+        let sql = sql_template.replace("-- {accounts_filters}", &accounts_filters);
+        let sql = sql.replace("-- {snapshot_filters}", &snapshot_filters);
+        let sql = sql.replace("$2", latest_slot.to_string().as_str());
+        let sql = sql.replace(
+            "$1",
+            &format!("'\\x{}'::bytea", hex::encode(&program_bytes)),
+        );
+        db_query::add_trace_traceparent_to_query(&sql)
+    };
 
     tracing::debug!(target: "gpa_sql", "## sql: {}", sql);
     let pool = db.get_postgres_connection_pool();
 
-    let mut rows = sqlx::raw_sql(&sql).fetch(pool);
+    let mut rows: futures::stream::BoxStream<'_, Result<PgRow, sqlx::Error>> = if use_prepared_gtabo
+    {
+        let db_slot = i64::try_from(latest_slot).map_err(|_| RpcError::InternalError)?;
+        sqlx::query(&sql)
+            .bind(db_slot)
+            .bind(owner_or_delegate.to_bytes().to_vec())
+            .fetch(pool)
+            .boxed()
+    } else {
+        sqlx::raw_sql(&sql).fetch(pool).boxed()
+    };
 
     let encoding = config
         .as_ref()
@@ -621,6 +661,9 @@ pub fn check_account_data_len_for_encoding(
 
 #[cfg(test)]
 mod tests {
+    use super::prepared_gtabo_sql;
+    use crate::methods::LEGACY_TOKEN_PROGRAM_ID;
+
     #[test]
     fn json_parsed_owner_query_fetches_each_latest_mint_once() {
         let sql = include_str!("../db/getTokenAccountsByOwner.sql");
@@ -631,5 +674,19 @@ mod tests {
         assert!(sql.contains("ORDER BY mint_versions.slot DESC"));
         assert!(!sql.contains("all_mint_versions AS"));
         assert!(!sql.contains("mint_max_slot AS"));
+    }
+
+    #[test]
+    fn direct_owner_query_is_fully_parameterized_and_uses_single_latest_sort() {
+        let sql = prepared_gtabo_sql(LEGACY_TOKEN_PROGRAM_ID.as_ref());
+
+        assert!(sql.contains("accounts.token_owner = $2::bytea"));
+        assert!(sql.contains("snapshot_accounts.token_owner = $2::bytea"));
+        assert!(sql.contains("accounts.slot <= $1"));
+        assert!(!sql.contains("accounts.owner = $"));
+        assert!(sql.contains("ORDER BY program_accounts.pubkey, program_accounts.slot DESC"));
+        assert!(!sql.contains("max_slot AS"));
+        assert!(!sql.contains("{accounts_filters}"));
+        assert!(!sql.contains("{snapshot_filters}"));
     }
 }

@@ -3,14 +3,18 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use crate::error::RpcError;
 use crate::http::server::HttpHandlerResponse;
 use crate::http::server::ResponseBody;
 use crate::modules::cache::GpaProcessor;
 use crate::modules::vote_accounts_cache::SharedStakesSnapshot;
-use crate::error::RpcError;
 use crate::query_tracker_client::QueryTrackerClient;
 use crate::slot_syncronizer::SlotSyncronizerData;
 use agave_feature_set::FeatureSet;
+use cloudbreak_core::{
+    AccountSelectorConfig, ProcessedCommitmentBehavior, UnhealthyResponseBehavior,
+};
+use cloudbreak_entity::slots;
 use hyper::StatusCode;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
@@ -18,9 +22,8 @@ use solana_commitment_config::CommitmentLevel;
 use solana_rpc_client_api::response::Response as RpcResponse;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
-use cloudbreak_core::{AccountSelectorConfig, ProcessedCommitmentBehavior, UnhealthyResponseBehavior};
-use cloudbreak_entity::slots;
 
 #[derive(Clone)]
 pub struct CachedFeatureSet {
@@ -52,6 +55,7 @@ pub struct CloudbreakRpcState {
     pub max_multiple_accounts: usize,
     pub simulation_supported: bool,
     pub feature_set_cache: Arc<RwLock<Option<CachedFeatureSet>>>,
+    account_lookup_fill_semaphore: Arc<Semaphore>,
 }
 
 impl CloudbreakRpcState {
@@ -73,6 +77,7 @@ impl CloudbreakRpcState {
         stakes_cache: SharedStakesSnapshot,
         max_multiple_accounts: usize,
         simulation_supported: bool,
+        account_lookup_fill_max_concurrency: usize,
     ) -> Self {
         Self {
             database,
@@ -92,7 +97,17 @@ impl CloudbreakRpcState {
             max_multiple_accounts,
             simulation_supported,
             feature_set_cache: Arc::new(RwLock::new(None)),
+            account_lookup_fill_semaphore: Arc::new(Semaphore::new(
+                account_lookup_fill_max_concurrency,
+            )),
         }
+    }
+
+    pub fn try_account_lookup_fill_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.account_lookup_fill_semaphore
+            .clone()
+            .try_acquire_owned()
+            .ok()
     }
 
     /// Builds a [`RpcError::NodeUnhealthy`], baking in whether it should be
@@ -100,7 +115,8 @@ impl CloudbreakRpcState {
     /// response layer can decide the HTTP status purely from the error.
     pub fn node_unhealthy(&self) -> RpcError {
         RpcError::NodeUnhealthy {
-            service_unavailable: self.unhealthy_response == UnhealthyResponseBehavior::HttpUnavailable,
+            service_unavailable: self.unhealthy_response
+                == UnhealthyResponseBehavior::HttpUnavailable,
         }
     }
 

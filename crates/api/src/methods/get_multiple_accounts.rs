@@ -6,8 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use cloudbreak_core::account_lookup::{
-    self as lookup_helpers, CONFIRMED_COMMITMENT, FINALIZED_COMMITMENT,
+use cloudbreak_core::{
+    AccountSelectorConfig,
+    account_lookup::{self as lookup_helpers, CONFIRMED_COMMITMENT, FINALIZED_COMMITMENT},
 };
 use cloudbreak_entity::account_lookup;
 use rust_decimal::prelude::ToPrimitive;
@@ -15,8 +16,7 @@ use sea_orm::ActiveValue::{NotSet, Set};
 use sea_orm::sqlx::Row;
 use sea_orm::sqlx::{self};
 use solana_account::AccountSharedData;
-use solana_account_decoder::parse_account_data::AccountAdditionalDataV3;
-use solana_account_decoder::{UiAccountEncoding, encode_ui_account};
+use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig, encode_ui_account};
 use solana_account_decoder_client_types::UiAccount;
 use solana_commitment_config::CommitmentLevel;
 use solana_pubkey::Pubkey;
@@ -30,6 +30,81 @@ use crate::http::CloudbreakRpcState;
 use crate::methods::token::{check_account_data_len_for_encoding, parse_additional_mint_data};
 use crate::methods::{is_token_program, resolve_commitment};
 use crate::metrics;
+
+const GMA_BLOCKING_ENCODING_MIN_BYTES: usize = 64 * 1024;
+
+struct AccountForEncoding {
+    owner: Pubkey,
+    lamports: u64,
+    executable: bool,
+    rent_epoch: u64,
+    data: Arc<Vec<u8>>,
+    mint_data: Vec<u8>,
+}
+
+fn should_offload_encoding(encoding: UiAccountEncoding, account_data_bytes: usize) -> bool {
+    encoding == UiAccountEncoding::Base64Zstd
+        || account_data_bytes >= GMA_BLOCKING_ENCODING_MIN_BYTES
+}
+
+fn encode_accounts(
+    parsed_pubkeys: Vec<Pubkey>,
+    row_by_pubkey: HashMap<Pubkey, AccountForEncoding>,
+    indexer_filter: Arc<AccountSelectorConfig>,
+    encoding: UiAccountEncoding,
+    data_slice: Option<UiDataSliceConfig>,
+    block_time: i64,
+) -> Result<Vec<Option<UiAccount>>, RpcError> {
+    let mut result = Vec::with_capacity(parsed_pubkeys.len());
+
+    for pubkey in &parsed_pubkeys {
+        let Some(row) = row_by_pubkey.get(pubkey) else {
+            result.push(None);
+            continue;
+        };
+
+        if !indexer_filter.is_program_selected(&row.owner) {
+            tracing::error!(
+                target: "gma_indexer_filter",
+                pubkey = %pubkey,
+                owner = %row.owner,
+                "getMultipleAccounts: skipping account because owner is excluded by the current indexer filter"
+            );
+            result.push(None);
+            continue;
+        }
+
+        let additional_mint_data = if encoding == UiAccountEncoding::JsonParsed
+            && is_token_program(&row.owner)
+            && row.data.len() >= 32
+        {
+            let mint_pubkey =
+                Pubkey::try_from(&row.data[..32]).map_err(|_| RpcError::InternalError)?;
+            parse_additional_mint_data(&mint_pubkey, &row.mint_data, block_time)
+        } else {
+            None
+        };
+
+        check_account_data_len_for_encoding(encoding, data_slice, row.data.len(), pubkey)?;
+
+        let account_shared_data = AccountSharedData::create_from_existing_shared_data(
+            row.lamports,
+            Arc::clone(&row.data),
+            row.owner,
+            row.executable,
+            row.rent_epoch,
+        );
+        result.push(Some(encode_ui_account(
+            pubkey,
+            &account_shared_data,
+            encoding,
+            additional_mint_data,
+            data_slice,
+        )));
+    }
+
+    Ok(result)
+}
 
 pub(crate) async fn fetch_accounts_without_mint(
     state: &CloudbreakRpcState,
@@ -125,8 +200,29 @@ pub(crate) async fn fetch_accounts_without_mint(
             .map(|pubkey| lookup_helpers::tombstone(pubkey, commitment_code, db_slot)),
     );
 
-    if let Err(error) = lookup_helpers::upsert(&state.database, lookup_rows).await {
-        tracing::warn!(?error, "failed to populate account lookup cache");
+    if let Some(permit) = state.try_account_lookup_fill_permit() {
+        metrics::CLOUDBREAK_ACCOUNT_LOOKUP_FILLS_TOTAL
+            .with_label_values(&["scheduled"])
+            .inc();
+        let database = state.database.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            match lookup_helpers::upsert(&database, lookup_rows).await {
+                Ok(()) => metrics::CLOUDBREAK_ACCOUNT_LOOKUP_FILLS_TOTAL
+                    .with_label_values(&["success"])
+                    .inc(),
+                Err(error) => {
+                    metrics::CLOUDBREAK_ACCOUNT_LOOKUP_FILLS_TOTAL
+                        .with_label_values(&["error"])
+                        .inc();
+                    tracing::warn!(?error, "failed to populate account lookup cache");
+                }
+            }
+        });
+    } else {
+        metrics::CLOUDBREAK_ACCOUNT_LOOKUP_FILLS_TOTAL
+            .with_label_values(&["saturated"])
+            .inc();
     }
     rows.extend(fallback_rows);
     Ok(rows)
@@ -235,88 +331,67 @@ pub async fn get_multiple_accounts(
         RpcError::InternalError
     })?;
 
-    // Build a (pubkey -> row) lookup. The SQL only returns rows for input pubkeys
-    // that exist AND are live (lamports > 0).
-    let mut row_by_pubkey: HashMap<Pubkey, &_> = HashMap::with_capacity(rows.len());
-    for row in &rows {
+    // Decode each SQL row once and retain account data behind an Arc. This
+    // avoids copying every payload again when AccountSharedData is created and
+    // lets repeated request pubkeys share the same backing allocation.
+    let mut row_by_pubkey = HashMap::with_capacity(rows.len());
+    let mut account_data_bytes = 0usize;
+    for row in rows {
         let pubkey_bytes: Vec<u8> = row.get("pubkey");
         let row_pubkey = Pubkey::try_from(pubkey_bytes.as_slice()).map_err(|_| {
             tracing::error!("getMultipleAccounts: invalid pubkey bytes returned by DB");
             RpcError::InternalError
         })?;
         let present = row.try_get::<bool, _>("present").unwrap_or(true);
-        if present && row.get::<i64, _>("lamports") > 0 {
-            row_by_pubkey.insert(row_pubkey, row);
-        }
-    }
-
-    let mut result: Vec<Option<UiAccount>> = Vec::with_capacity(parsed_pubkeys.len());
-
-    for pubkey in &parsed_pubkeys {
-        // Missing in the map = account doesn't exist (or its latest version is closed).
-        let Some(&row) = row_by_pubkey.get(pubkey) else {
-            result.push(None);
+        let lamports = row.get::<i64, _>("lamports");
+        if !present || lamports <= 0 {
             continue;
-        };
+        }
 
         let owner_bytes: Vec<u8> = row.get("owner");
         let owner =
             Pubkey::try_from(owner_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
-
-        // Per-position indexer-filter check: if the owner is excluded, we return None at that position and log a tracing error.
-        if !state.indexer_filter.is_program_selected(&owner) {
-            tracing::error!(
-                target: "gma_indexer_filter",
-                pubkey = %pubkey,
-                owner = %owner,
-                "getMultipleAccounts: skipping account because owner is excluded by the current indexer filter"
-            );
-            result.push(None);
-            continue;
-        }
-
-        let lamports = row.get::<i64, _>("lamports") as u64;
         let executable: bool = row.get("executable");
         let rent_epoch = row
             .get::<rust_decimal::Decimal, _>("rent_epoch")
             .to_u64()
             .unwrap_or(0);
         let data: Vec<u8> = row.get("data");
-
-        let additional_mint_data: Option<AccountAdditionalDataV3> =
-            if with_mint && is_token_program(&owner) {
-                if data.len() >= 32 {
-                    let mint_pubkey =
-                        Pubkey::try_from(&data[..32]).map_err(|_| RpcError::InternalError)?;
-                    let mint_data: Vec<u8> = row.try_get("mint_data").ok().unwrap_or_default();
-                    parse_additional_mint_data(&mint_pubkey, &mint_data, block_time)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-        let account_shared_data = AccountSharedData::create_from_existing_shared_data(
-            lamports,
-            Arc::new(data.clone()),
-            owner,
-            executable,
-            rent_epoch,
+        account_data_bytes = account_data_bytes.saturating_add(data.len());
+        row_by_pubkey.insert(
+            row_pubkey,
+            AccountForEncoding {
+                owner,
+                lamports: lamports as u64,
+                executable,
+                rent_epoch,
+                data: Arc::new(data),
+                mint_data: row.try_get("mint_data").ok().unwrap_or_default(),
+            },
         );
-
-        check_account_data_len_for_encoding(encoding, data_slice, data.len(), pubkey)?;
-
-        let ui_account = encode_ui_account(
-            pubkey,
-            &account_shared_data,
-            encoding,
-            additional_mint_data,
-            data_slice,
-        );
-
-        result.push(Some(ui_account));
     }
+
+    let indexer_filter = Arc::clone(&state.indexer_filter);
+    let encode = move || {
+        encode_accounts(
+            parsed_pubkeys,
+            row_by_pubkey,
+            indexer_filter,
+            encoding,
+            data_slice,
+            block_time,
+        )
+    };
+    let result = if should_offload_encoding(encoding, account_data_bytes) {
+        tokio::task::spawn_blocking(encode)
+            .await
+            .map_err(|error| {
+                tracing::error!(?error, "getMultipleAccounts encoding task failed");
+                RpcError::InternalError
+            })??
+    } else {
+        encode()?
+    };
 
     Ok(RpcResponse {
         context: RpcResponseContext {
@@ -325,4 +400,22 @@ pub async fn get_multiple_accounts(
         },
         value: result,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offloads_compressed_or_large_account_encoding() {
+        assert!(should_offload_encoding(UiAccountEncoding::Base64Zstd, 1));
+        assert!(should_offload_encoding(
+            UiAccountEncoding::Base64,
+            GMA_BLOCKING_ENCODING_MIN_BYTES
+        ));
+        assert!(!should_offload_encoding(
+            UiAccountEncoding::Base64,
+            GMA_BLOCKING_ENCODING_MIN_BYTES - 1
+        ));
+    }
 }

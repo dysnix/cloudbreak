@@ -12,6 +12,7 @@ use solana_pubkey::Pubkey;
 use std::borrow::Cow;
 use std::fs;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::time::Duration;
 use toml::from_str;
@@ -514,6 +515,11 @@ pub struct ServerConfig {
         default = "ServerConfig::default_max_multiple_accounts"
     )]
     pub max_multiple_accounts: usize,
+    #[serde(
+        rename = "account-lookup-fill-max-concurrency",
+        default = "ServerConfig::default_account_lookup_fill_max_concurrency"
+    )]
+    pub account_lookup_fill_max_concurrency: NonZeroUsize,
 }
 
 impl ServerConfig {
@@ -535,6 +541,10 @@ impl ServerConfig {
 
     pub const fn default_max_multiple_accounts() -> usize {
         100
+    }
+
+    pub const fn default_account_lookup_fill_max_concurrency() -> NonZeroUsize {
+        NonZeroUsize::new(2).expect("account lookup fill concurrency must be non-zero")
     }
 }
 
@@ -1104,5 +1114,14 @@ mod tests {
         assert_eq!(c.index_min_idle, Duration::from_secs(86400));
         assert_eq!(c.index_min_age_grace, Duration::from_secs(3600));
         assert_eq!(c.index_eviction_interval, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn account_lookup_fill_concurrency_is_bounded_and_nonzero() {
+        let defaults: ServerConfig = toml::from_str("").unwrap();
+        assert_eq!(defaults.account_lookup_fill_max_concurrency.get(), 2);
+
+        let invalid = toml::from_str::<ServerConfig>("account-lookup-fill-max-concurrency = 0");
+        assert!(invalid.is_err());
     }
 }
